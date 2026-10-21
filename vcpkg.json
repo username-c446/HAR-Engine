@@ -1,0 +1,11 @@
+{
+  "dependencies": [
+    "ffmpeg",
+    "libpng",
+    "openal-soft",
+    "glad",
+    "enet",
+    "lua",
+    "sdl2"
+  ]
+}
