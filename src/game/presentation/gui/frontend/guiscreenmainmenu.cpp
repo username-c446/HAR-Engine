@@ -1405,9 +1405,16 @@ void CGuiScreenMainMenu::OnMpOverlayConfirm()
     // CONTROLLER_SELECT reaching this handler, so there is no stray first
     // SELECT to swallow. Confirm immediately on Enter.
 
-    // Exit the overlay and start the network match. An empty IP is allowed:
-    // Host starts on the default port (3737); Join would need an address, which
-    // is validated in StartMultiplayerJoin.
+    // For Join, require a non-empty server address: with an empty IP ENet would
+    // resolve "0.0.0.0" and the connection would just hang or fail, so instead
+    // of leaving to gameplay we stay in the overlay until the player types one.
+    // Host with an empty field is valid (starts on the default port 3737).
+    if( m_mpOverlaySelection == 1 && m_mpIpBuffer[0] == '\0' )
+    {
+        return; // stay in the field
+    }
+
+    // Exit the overlay and start the network match.
     this->EndMultiplayerOverlay();
 
     if( m_mpOverlaySelection == 0 )
