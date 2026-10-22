@@ -127,7 +127,8 @@ void CGuiScreenController::HandleMessage
                 {
                 case (CGuiMenuPrompt::RESPONSE_YES):
                     {
-                        GetInputManager()->GetController(m_currentControllerID)->LoadDefaults();
+                        UserController* pC = GetInputManager()->GetController(m_currentControllerID);
+                        if( pC != NULL ) pC->LoadDefaults();
                         this->InitIntro();
                         this->ReloadScreen();
 
@@ -170,6 +171,7 @@ void CGuiScreenController::HandleMessage
                         // convert to Gamesetting specific items.
                         int menuItem = param1-NUM_CHARACTERCONTROL_LABELS-NUM_VEHICLECONTROL_LABELS;
                         UserController* pController = GetInputManager()->GetController( m_currentControllerID );
+                        if( pController == NULL ) { break; }
 
                         switch( menuItem ) 
                         {
@@ -605,9 +607,9 @@ void CGuiScreenController::RemapButton( eControllerColumn column, int menuItem )
     if( m_currentTextLabel )
         m_currentTextLabel->SetColour(DEFAULT_INPUTMAPPED_ITEM_COLOUR);
 
-    GetInputManager()->GetController(m_currentControllerID)->RemapButton( column,
-                                                                          GetVirtualKey(m_currentPage, menuItem),
-                                                                          this );
+    UserController* pRemapC = GetInputManager()->GetController(m_currentControllerID);
+    if( pRemapC != NULL )
+        pRemapC->RemapButton( column, GetVirtualKey(m_currentPage, menuItem), this );
     GetInputManager()->GetFEMouse()->SetSelectable( false );
     m_bMapInput = true;
 }
@@ -631,6 +633,7 @@ void CGuiScreenController::InitIntro()
     InitPageLabels(MENU_PAGE_VEHICLECONTROLS);
 
     UserController* pController = GetInputManager()->GetController( m_currentControllerID );
+    if( pController == NULL ) return;
     GuiMenuItem* pMenuItem = NULL;
     // This is the real menuItem index.
     int menuItem = m_menuGroupStartIndex[MENU_PAGE_GAMESETTINGS];
@@ -766,7 +769,8 @@ void CGuiScreenController::OnButtonMapped( const char* szNewInput, eControllerTy
         UpdatePageLabels( m_currentPage, szText ); 
         
         //Disable the tutorials if controls are changed.
-        GetInputManager()->GetController(0)->SetTutorialDisabled( true );
+        UserController* pTl = GetInputManager()->GetController(0);
+        if( pTl != NULL ) pTl->SetTutorialDisabled( true );
         GetTutorialManager()->EnableTutorialMode( false );
     }
 
@@ -836,6 +840,7 @@ void CGuiScreenController::UpdatePageLabels( eMenuPages page, const char* szNewI
 void CGuiScreenController::InitPageLabels( eMenuPages page )
 {
     UserController* pController = GetInputManager()->GetController(m_currentControllerID);
+    if( pController == NULL ) return;
 
     switch( page )
     {
