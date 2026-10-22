@@ -42,7 +42,7 @@ public:
     void BeginLayer(const char* name, uint32_t version, bool visible, bool editable, uint8_t alpha);
     void EndLayer();
 
-    void BeginGroup(const char* name, uint32_t version);
+    void BeginGroup(const char* name, uint32_t version, uint32_t alpha);
     void EndGroup();
 
     // Text (MULTITEXT). version>16 adds the drop-shadow block, matching the loader.

@@ -86,7 +86,6 @@
 #include <network/NetworkMatchManager.h>
 #include <network/NetworkConsoleCommands.h>
 #include <network/MissionSyncState.h>
-#include <network/LobbyRuntimeTest.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
 #include <console/console.h>
@@ -616,9 +615,10 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     // ready (registration earlier in OnStart hung on startup).
     RegisterNetworkConsoleCommands();
 
-    // Runtime check that the live Scrooby loader reads a P3DWriter-generated
-    // .p3d. Runs at the end of OnStart where the console is confirmed ready.
-    LobbyRuntimeTest::Run();
+    // [DISABLED] LobbyRuntimeTest::Run() — the live Scrooby::App->LoadProject
+    // call during active gameplay replaces the running project and causes an
+    // access violation, so it is removed from the startup path. Readability of
+    // generated .p3d is covered by unit tests instead.
 }
 
 //=============================================================================

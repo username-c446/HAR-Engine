@@ -1082,7 +1082,6 @@
   <ItemGroup>
 <ClCompile Include="..\game\ai\actionbuttonhandler.cpp" />
     <ClCompile Include="..\game\network\PlayerNetworkState.cpp" />
-    <ClCompile Include="..\game\network\LobbyRuntimeTest.cpp" />
     <ClCompile Include="..\game\network\RemotePlayerManager.cpp" />
     <ClCompile Include="..\game\network\RemotePlayerWorldView.cpp" />
     <ClCompile Include="..\game\network\RemoteVehicleWorldView.cpp" />

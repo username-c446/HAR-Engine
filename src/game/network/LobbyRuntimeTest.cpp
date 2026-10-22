@@ -61,7 +61,7 @@ namespace LobbyRuntimeTest
         w.EndScreen();
         w.BeginPage("RuntimeLobbyPage", 1, 640, 480);
         w.BeginLayer("main", 1, true, true, 255);
-        w.BeginGroup("title_grp", 1);
+        w.BeginGroup("title_grp", 1, 0);
         w.WriteText("Title", 17, 100, 40, 440, 40, 0, 0, 0xFFFFFFFF,
             0, 0.0f, "HudTextStyle", true, 0xFF000000, 1, 2, 0);
         w.AddTextHardCodedString("Multiplayer Lobby");

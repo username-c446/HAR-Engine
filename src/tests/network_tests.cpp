@@ -971,7 +971,7 @@ namespace NetworkTests
             const char* images[] = { "cursor.png" };
             w.WriteSprite("cursor", 1, 0, 0, 32, 32, 0, 0, 0xFFFFFFFF, 0, 0.0f, images, 1);
             w.EndSprite();
-            w.BeginGroup("textgrp", 1);
+            w.BeginGroup("textgrp", 1, 0);
             w.WriteText("Title", 17, 10, 10, 200, 30, 0, 0, 0xFFFFFFFF,
                 0, 0.0f, "HudTextStyle", true, 0xFF000000, 1, 2, 0);
             w.AddTextHardCodedString("Hello");

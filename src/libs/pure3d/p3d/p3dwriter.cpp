@@ -174,11 +174,12 @@ void P3DWriter::EndLayer()
     EndChunk();
 }
 
-void P3DWriter::BeginGroup(const char* name, uint32_t version)
+void P3DWriter::BeginGroup(const char* name, uint32_t version, uint32_t alpha)
 {
     BeginChunk(GROUP);
     WriteString(name);
     WriteU32(version);
+    WriteU32(alpha);
 }
 
 void P3DWriter::EndGroup()
