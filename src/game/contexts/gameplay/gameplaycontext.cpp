@@ -86,6 +86,7 @@
 #include <network/NetworkMatchManager.h>
 #include <network/NetworkConsoleCommands.h>
 #include <network/MissionSyncState.h>
+#include <network/LobbyRuntimeTest.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
 #include <console/console.h>
@@ -614,6 +615,10 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     // Register multiplayer console commands once the console is guaranteed
     // ready (registration earlier in OnStart hung on startup).
     RegisterNetworkConsoleCommands();
+
+    // Runtime check that the live Scrooby loader reads a P3DWriter-generated
+    // .p3d. Runs at the end of OnStart where the console is confirmed ready.
+    LobbyRuntimeTest::Run();
 }
 
 //=============================================================================
