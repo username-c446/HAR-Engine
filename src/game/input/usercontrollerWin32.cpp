@@ -1181,6 +1181,22 @@ void UserController::LoadConfig( ConfigString& config )
             }
         }
     }
+
+    // The keyboard defaults for the primary controller (E=DoAction, F=GetOutCar)
+    // may be missing from configs saved before these bindings existed. Restore
+    // them here so interaction/exit-from-car always have a keyboard binding,
+    // without overriding any explicit user remap.
+    if( m_controllerId == 0 )
+    {
+        if( m_pController[KEYBOARD]->GetMap( DIK_E, DIR_UP, MAP_CHARACTER ) == Input::INVALID_CONTROLLERID )
+        {
+            SetMap( SLOT_PRIMARY, InputManager::DoAction, KEYBOARD, DIK_E );
+        }
+        if( m_pController[KEYBOARD]->GetMap( DIK_F, DIR_UP, MAP_VEHICLE ) == Input::INVALID_CONTROLLERID )
+        {
+            SetMap( SLOT_PRIMARY, InputManager::GetOutCar, KEYBOARD, DIK_F );
+        }
+    }
 }
 
 void UserController::SaveConfig( ConfigString& config )
