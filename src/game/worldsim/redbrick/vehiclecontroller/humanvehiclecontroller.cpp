@@ -122,7 +122,10 @@ float HumanVehicleController::GetBrake( void ) const
 float HumanVehicleController::GetSteering( bool& isWheel ) const
 {
 #ifdef RAD_WIN32
-    isWheel = GetInputManager()->GetController(mControllerId)->IsWheel();
+    if( mControllerId >= 0 && mControllerId < (int) Input::MaxControllers )
+    {
+        isWheel = GetInputManager()->GetController( mControllerId )->IsWheel();
+    }
 #endif
 	return mpMappable->GetButton( VehicleMappable::Steer )->GetValue();
 }
@@ -202,8 +205,11 @@ void HumanVehicleController::Update( float timeins )
 #if defined(RAD_WIN32)
     UserController* uc = NULL;
 
-    //Set up the output points to default settings.
-    uc = GetInputManager()->GetController( mControllerId );
+    // Set up the output points to default settings.
+    if( mControllerId >= 0 && mControllerId < (int) Input::MaxControllers )
+    {
+        uc = GetInputManager()->GetController( mControllerId );
+    }
 
     SetupRumbleFeatures( uc );
 

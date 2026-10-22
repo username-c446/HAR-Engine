@@ -91,6 +91,7 @@
 // Project Includes
 //========================================
 #include <input/inputmanager.h>
+#include <presentation/gui/utility/textinputhook.h>
 #include <main/win32platform.h>
 #include <main/commandlineoptions.h>
 #include <main/game.h>
@@ -315,6 +316,12 @@ bool Win32Platform::InitializeWindow()
     SDL_GetWindowGammaRamp( mWnd, DesktopGammaRamp[0], DesktopGammaRamp[1], DesktopGammaRamp[2] );
 
     SDL_DisableScreenSaver();
+
+    // Enable SDL text input so SDL_TEXTINPUT events are delivered to the
+    // window; the multiplayer overlay's TextInputHook needs them to type an
+    // IP/port. Without this, SDL never sends SDL_TEXTINPUT and the on-screen
+    // input field stays dead.
+    SDL_StartTextInput();
 
     return true;
 }
@@ -1894,6 +1901,28 @@ int SDLCALL Win32Platform::WndProc( void * userdata, SDL_Event * event )
             	return 0;
             default: break;
             }
+
+            // Route Backspace to the active text-input consumer (if any).
+            if (event->type == SDL_KEYDOWN &&
+                event->key.keysym.sym == SDLK_BACKSPACE &&
+                TextInputHook::HasActiveConsumer())
+            {
+                if (TextInputHook::HasActiveConsumer())
+                {
+                    TextInputHook::ReportBackspace();
+                }
+            }
+            break; // do NOT fall through to SDL_TEXTINPUT: keysym data is invalid there
+        }
+
+    case SDL_TEXTINPUT:
+        {
+            // Route typed UTF-8 characters to the active text-input consumer.
+            if (TextInputHook::HasActiveConsumer())
+            {
+                TextInputHook::ReportText(event->text.text);
+            }
+            break;
         }
 
     case SDL_MOUSEMOTION:  

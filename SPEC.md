@@ -306,20 +306,94 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 - Все изменяемые возможности должны иметь юнит/интеграционные тесты
   (`src/tests/network_tests.cpp`; проект Tests.vcxproj, пакет `Tests.dll`).
-- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 28/28 зелёных.
+- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 30/30 зелёных.
 - Сборка полной игры: `MSBuild.exe src/srr2/SRR2.vcxproj
   /p:Configuration=DebugWindows /p:Platform=x64
   /p:WindowsTargetPlatformVersion=10.0.22621.0`.
 
 ---
 
-## 14. План (TODO, вернёмся)
+## 14. Вход в мультиплеер из главного меню (C7)
 
-- **C7** — UI-лобби (свои экраны). Отложено до появления генератора .p3d / UI-слоя.
+**Интеграция без генерации нового frontend.p3d** — пункт «MULTIPLAYER»
+добавляется кодом в существующее главное меню (`CGuiScreenMainMenu`).
+
+- `guiscreenmainmenu.h`: в `eMainMenuSelection` вставлен `MAIN_MENU_MULTIPLAYER`
+  (теперь пункт между `MAIN_MENU_MINI_GAME` и `QUIT_GAME`). Строка подписи
+  назначается в `InitMenu()` через `mainMenuText->SetString(MAIN_MENU_MULTIPLAYER, "MULTIPLAYER")`
+  (в TextBible для нового слота нет локализованной строки).
+- Выбор пункта (`MAIN_MENU_MULTIPLAYER` в `GUI_MSG_MENU_SELECTION_MADE`) →
+  `OnMultiplayerSelected()` → `StartMultiplayerOverlay()`.
+- В оверлее `GUI_MSG_CONTROLLER_UP/DOWN` переключают `Host`/`Join`,
+  `GUI_MSG_CONTROLLER_SELECT` подтверждает (`OnMpOverlayConfirm` → Host/Join).
+
+### Ввод IP через `TextInputHook`
+- `src/game/presentation/gui/utility/textinputhook.{h,cpp}` — глобальный хук
+  текстового ввода: `SetActive(OnChar, OnBackspace)`/`ClearActive()`,
+  `HasActiveConsumer()`. Единственный активный потребитель.
+- В `win32platform.cpp` в SDL-цикл вставлены вызовы: `SDL_TEXTINPUT` →
+  `TextInputHook::ReportText(...)`, `SDLK_BACKSPACE` → `ReportBackspace()`.
+- Экран меню регистрирует статик-обработчики `OnMpOverlayChar`/`OnMpOverlayBackspace`,
+  буфер `m_mpIpBuffer[64]`; `UpdateMpOverlayDisplay()` рисует промпт Host/Join + IP.
+
+### Переход в геймплей MP (host/join) — важные подводные камни
+`StartMultiplayerHost`/`StartMultiplayerJoin` должны полностью повторить путь
+«New Game», иначе мир/персонаж/контроллер не готовы:
+1. `NetworkMatchManager::StartHost(port)` / `JoinHost(ip, port)` — сеть (до входа
+   в геймплей; сервер/клиент стартует сразу).
+2. `GetInputManager()->RegisterControllerID(0, 0)` + `SetPrimaryController(0)` —
+   без этого `GetControllerIDforPlayer(0)` == -1 → краш в
+   `guimanageringame.cpp` (вход в геймплей) и нет управления персонажем.
+3. `if (IsGameLoaded()) ResetGame() + ClearRewards()` — сброс загруженного
+   сохранения, иначе при выходе из игры ассерт `simutility.cpp:153`
+   (SimEnvironment не выгрузился из-за посторонних ph-объектов сохранения) и
+   не работает клавиша взаимодействия.
+4. `GetCharacterSheetManager()->SetCurrentMission(L1, M1)` — без этого мир
+   загружается без спавна играбельного персонажа (нет управления после кат-сцены).
+5. Вход — штатным `GUI_MSG_QUIT_FRONTEND, 1` (он ставит `GameplayManager`);
+   прямой `SetContext(CONTEXT_LOADING_GAMEPLAY)` НЕ использовать — в этом
+   контексте `GetGameplayManager()` ещё NULL → AV.
+
+### Защита от выхода контроллера за границы (деградация)
+- `humanvehiclecontroller.cpp`: `GetController(mControllerId)` в
+  `GetSteering`/`Update` обёрнут в `if (mControllerId >= 0 && < MaxControllers)`.
+- `guimanageringame.cpp` (опрос подключения): guarded `controllerID != -1`.
+- Все вызовы `GetController` в этих местах больше не триггерят
+  `rAssert(controllerIndex < MaxControllers)` в `inputmanager.cpp`.
+
+### Краш-хендлер (`win32main.cpp`)
+- `SetUnhandledExceptionFilter(CrashHandler)` + хуки `abort`/`terminate`/
+  pure-virtual (`_set_purecall_handler`, `set_terminate`, `signal(SIGABRT)`).
+- Пишет символьный стек (DbgHelp) в `crash.log` в рабочей папке, не полагаясь
+  на окно ошибки. `WriteCrashDump(reason)` — доступен для точечной диагностики
+  (временный вызов в `GetController` при out-of-range индексе).
+
+### Известный недочёт
+Оверлей ввода IP — это отдельный видимый трёхстрочный промпт
+(`MULTIPLAYER HOST` / `Address: IP` / `[Enter=... Esc=back]`), нарисованный на
+скрытом тексте `MainMenu` страницы (заданы `SetBoundingBoxSize`/`SetPositionOfCenter`
+и `SetIndex(0)`; `UpdateMpOverlayDisplay` пишет через `SetString(0, buf)`).
+Пункты меню не трогаются, поэтому навигация не ломается. Открытие оверлея идёт
+через `GUI_MSG_MENU_SELECTION_MADE`, а не через SELECT в обработчике, поэтому
+`m_mpOverlayIgnoreFirstSelect` был удалён — Enter подтверждает с первого нажатия.
+Пустой IP при Host = дефолтный порт 3737; при Join с пустым адресом join не
+стартует (бесшовно возвращается). Визуально это всё ещё не диалоговое окно с
+полем ввода, а промпт поверх меню — дальнейшая проработка в TODO.
 
 ---
 
-## 15. Правило на будущее
+## 15. План (TODO, вернёмся)
+
+- **C7 (UI-лобби, улучшение)** — сделать отдельное видимое поле ввода IP/порта
+  в оверлее Host/Join (сейчас это промпт внутри текста пункта меню). Возможно,
+  своими экранами после генератора .p3d / UI-слоя.
+- **MP-стабильность** — проверить вход host/join в игре end-to-end (персонаж
+  управляется, клавиша взаимодействия работает, выход без ассертов), сетевой
+  матч между двумя копиями.
+
+---
+
+## 16. Правило на будущее
 
 **Перед любой разработкой и в ходе — сверяйся с этим документом.** Если фича
 уже описана, не создавай её заново и не добавляй дублирующий транспорт/пакет

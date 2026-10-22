@@ -304,8 +304,15 @@ float InputManager::GetValue( unsigned int controllerIndex, unsigned int inputIn
 }
 
 // Returns a const pointer to the controller at controller index.
+void WriteCrashDump( const char* reason ); // defined in main/win32main.cpp
 UserController* InputManager::GetController( unsigned int controllerIndex )
 {
+    if ( controllerIndex >= Input::MaxControllers )
+    {
+        // rAssert halts before the else branch is reached, so log the calling
+        // stack here (before the assert) when the index is out of range.
+        WriteCrashDump( "GetController out of range" );
+    }
     rAssert( controllerIndex < Input::MaxControllers );
     if ( controllerIndex < Input::MaxControllers )
     {

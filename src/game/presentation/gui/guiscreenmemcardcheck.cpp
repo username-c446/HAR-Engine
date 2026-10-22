@@ -35,11 +35,13 @@
 // Global Data, Local Data, Local Classes
 //===========================================================================
 
-#ifndef RAD_E3
-    // This will enable auto-loading the most recent saved game immediately
-    // after the memory card check.
-    //
-    #define ENABLE_AUTOLOAD_AFTER_MEMCHECK
+#if 0 // disabled: auto-loading the most recent save asserts in ConfigString parse during frontend entry
+    #ifndef RAD_E3
+        // This will enable auto-loading the most recent saved game immediately
+        // after the memory card check.
+        //
+        #define ENABLE_AUTOLOAD_AFTER_MEMCHECK
+    #endif
 #endif
 
 enum eMemCardCheckMessage

@@ -1420,6 +1420,7 @@
     <ClCompile Include="..\game\presentation\gui\utility\numerictext.cpp" />
     <ClCompile Include="..\game\presentation\gui\utility\scrollingtext.cpp" />
     <ClCompile Include="..\game\presentation\gui\utility\slider.cpp" />
+    <ClCompile Include="..\game\presentation\gui\utility\textinputhook.cpp" />
     <ClCompile Include="..\game\presentation\gui\utility\specialfx.cpp" />
     <ClCompile Include="..\game\presentation\gui\utility\teletypetext.cpp" />
     <ClCompile Include="..\game\presentation\gui\utility\transitions.cpp" />

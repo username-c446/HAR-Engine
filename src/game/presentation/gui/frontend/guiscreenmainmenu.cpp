@@ -24,6 +24,9 @@
 #include <presentation/gui/guiscreenmemorycard.h>
 #include <presentation/gui/guimanager.h>
 #include <presentation/gui/guiscreenprompt.h>
+#include <presentation/gui/utility/textinputhook.h>
+#include <network/networkmatchmanager.h>
+#include <console/console.h>
 
 #include <constants/movienames.h>
 #include <data/gamedatamanager.h>
@@ -35,8 +38,13 @@
 #include <mission/rewards/rewardsmanager.h>
 #include <render/rendermanager/rendermanager.h>
 #include <render/rendermanager/renderlayer.h>
+#include <gameflow/gameflow.h>
+#include <contexts/contextenum.h>
+#include <mission/gameplaymanager.h>
 
 #include <p3d/view.hpp>
+
+CGuiScreenMainMenu* CGuiScreenMainMenu::spMpOverlayOwner = NULL;
 
 #include <raddebug.hpp>     // Foundation
 #include <radtime.hpp>
@@ -45,6 +53,7 @@
 #include <p3d/anim/multicontroller.hpp>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <group.h>
 #include <layer.h>
 #include <page.h>
@@ -165,8 +174,13 @@ CGuiScreenMainMenu::CGuiScreenMainMenu
     m_homer( NULL ),
     m_raceCar( NULL ),
     m_homerIdleAnim( NULL ),
-    m_tvFrame( NULL )
+    m_tvFrame( NULL ),
+    m_mpOverlayActive( false ),
+    m_mpOverlaySelection( 0 ),
+    m_mpOverlayText( NULL )
 {
+    m_mpIpBuffer[0] = '\0';
+    spMpOverlayOwner = this;
 MEMTRACK_PUSH_GROUP( "CGUIScreenMainMenu" );
     memset( m_glowingItems, 0, sizeof( m_glowingItems ) );
 
@@ -556,11 +570,30 @@ void CGuiScreenMainMenu::HandleMessage
 
                 break;
             }
+            case GUI_MSG_CONTROLLER_UP:
+            case GUI_MSG_CONTROLLER_DOWN:
+            {
+                // In the multiplayer overlay, switch between Host and Join.
+                if( m_mpOverlayActive )
+                {
+                    m_mpOverlaySelection = (m_mpOverlaySelection == 0) ? 1 : 0;
+                    this->UpdateMpOverlayDisplay();
+                }
+                else
+                {
+                    // Let the base menu handle it for standard navigation.
+                    CGuiScreen::HandleMessage( message, param1, param2 );
+                }
+                break;
+            }
             case GUI_MSG_CONTROLLER_SELECT:
             {
-                if( !this->IsButtonVisible( BUTTON_ICON_ACCEPT ) )
+                // If the multiplayer overlay is active, Enter confirms the
+                // connection (Host or Join) using the typed IP.
+                if( m_mpOverlayActive )
                 {
-                    return;
+                    this->OnMpOverlayConfirm();
+                    break;
                 }
 #ifdef RAD_DEMO
                 if( m_pMenu->GetSelectionValue( MENU_ITEM_MAIN_MENU ) == MAIN_MENU_PLAY_LEVEL_2 ||
@@ -642,6 +675,20 @@ void CGuiScreenMainMenu::HandleMessage
                     case MAIN_MENU_MINI_GAME:
                     {
                         this->OnMiniGameSelected();
+
+                        break;
+                    }
+                    case MAIN_MENU_MULTIPLAYER:
+                    {
+                        // If the overlay is already open, ignore repeat
+                        // selections (e.g. a second mouse click) so they don't
+                        // re-open it; the player types into the field instead.
+                        if( m_mpOverlayActive )
+                        {
+                            break;
+                        }
+                        // Enter the multiplayer lobby/setup flow.
+                        this->OnMultiplayerSelected();
 
                         break;
                     }
@@ -748,6 +795,17 @@ CGuiScreenMainMenu::InitMenu()
 
     m_pMenu->SetSelectionValue( MENU_ITEM_MAIN_MENU,
                                 isGameLoaded ? MAIN_MENU_RESUME_GAME : MAIN_MENU_NEW_GAME );
+
+    // Give the "Multiplayer" entry a display string (by default the front-end
+    // TextBible does not contain a localized string for this new slot).
+    Scrooby::Text* mainMenuText = dynamic_cast<Scrooby::Text*>(
+        m_pMenu->GetMenuItem( MENU_ITEM_MAIN_MENU )->GetItem() );
+    if( mainMenuText != NULL )
+    {
+        HeapMgr()->PushHeap( GMA_LEVEL_FE );
+        mainMenuText->SetString( MAIN_MENU_MULTIPLAYER, "MULTIPLAYER" );
+        HeapMgr()->PopHeap( GMA_LEVEL_FE );
+    }
 #endif // !RAD_DEMO
 }
 
@@ -1339,6 +1397,213 @@ CGuiScreenMainMenu::OnMiniGameSelected()
     m_pParent->HandleMessage( GUI_MSG_QUIT_FRONTEND, 2 ); // 2 = mini-game
 
     this->StartTransitionAnimation( 880, 913 );
+}
+
+void CGuiScreenMainMenu::OnMpOverlayConfirm()
+{
+    // The overlay is opened from GUI_MSG_MENU_SELECTION_MADE, not from a
+    // CONTROLLER_SELECT reaching this handler, so there is no stray first
+    // SELECT to swallow. Confirm immediately on Enter.
+
+    // Exit the overlay and start the network match. An empty IP is allowed:
+    // Host starts on the default port (3737); Join would need an address, which
+    // is validated in StartMultiplayerJoin.
+    this->EndMultiplayerOverlay();
+
+    if( m_mpOverlaySelection == 0 )
+    {
+        // Host a server on the typed port (default 3737).
+        int port = atoi( m_mpIpBuffer[0] != '\0' ? m_mpIpBuffer : "3737" );
+        this->StartMultiplayerHost( static_cast<unsigned short>( port ) );
+    }
+    else
+    {
+        // Join the typed "ip[:port]" (default port 3737).
+        char ip[64];
+        unsigned short port = 3737;
+        ip[0] = '\0';
+        const char* colon = strchr( m_mpIpBuffer, ':' );
+        if( colon != NULL )
+        {
+            size_t len = (size_t)( colon - m_mpIpBuffer );
+            if( len >= sizeof(ip) ) len = sizeof(ip) - 1;
+            memcpy( ip, m_mpIpBuffer, len );
+            ip[len] = '\0';
+            port = static_cast<unsigned short>( atoi( colon + 1 ) );
+        }
+        else
+        {
+            strncpy( ip, m_mpIpBuffer, sizeof(ip) - 1 );
+            ip[sizeof(ip)-1] = '\0';
+        }
+        this->StartMultiplayerJoin( ip, port );
+    }
+}
+
+void CGuiScreenMainMenu::OnMultiplayerSelected()
+{
+    this->StartMultiplayerOverlay();
+}
+
+void CGuiScreenMainMenu::StartMultiplayerHost( unsigned short port )
+{
+    NetworkMatchManager* mgr = NetworkMatchManager::GetInstance();
+    if( mgr == NULL ) mgr = NetworkMatchManager::CreateInstance();
+    if( mgr == NULL ) return;
+
+    if( !mgr->StartHost( port ) )
+    {
+        GetConsole()->Printf( "multiplayer: failed to start host on port %u", port );
+        return;
+    }
+    GetConsole()->Printf( "multiplayer: hosting on port %u", port );
+
+    // Register the primary controller for player 0 so the player actually gets
+    // input once gameplay starts. On PC the controller array is indexed 0..3;
+    // player 0 always maps to controller 0 (same as the "skipfe" path).
+    GetInputManager()->RegisterControllerID( 0, 0 );
+    GetGuiSystem()->SetPrimaryController( 0 );
+
+    // Reset any loaded save so the multiplayer session starts from a clean
+    // state (mirrors OnNewGameSelected): otherwise stale world physics/sim can
+    // break interaction and the SimEnvironment shutdown assert on exit.
+    if( GetGameDataManager()->IsGameLoaded() )
+    {
+        GetGameDataManager()->ResetGame();
+        GetRewardsManager()->ClearRewards();
+    }
+
+    // Set the current mission exactly like "New Game" does, otherwise the world
+    // loads without spawning the playable character (no control after intro).
+    GetCharacterSheetManager()->SetCurrentMission( RenderEnums::L1, RenderEnums::M1 );
+
+    // Quit the front-end, which sets up the MissionManager gameplay path the
+    // same way "New Game"/"Resume Game" do (GetGameplayManager is otherwise
+    // still NULL while we are in the front-end context).
+    m_pParent->HandleMessage( GUI_MSG_QUIT_FRONTEND, 1 );
+    this->StartTransitionAnimation( 200, 230 );
+}
+
+void CGuiScreenMainMenu::StartMultiplayerJoin( const char* ip, unsigned short port )
+{
+    NetworkMatchManager* mgr = NetworkMatchManager::GetInstance();
+    if( mgr == NULL ) mgr = NetworkMatchManager::CreateInstance();
+    if( mgr == NULL ) return;
+
+    if( !mgr->JoinHost( ip, port ) )
+    {
+        GetConsole()->Printf( "multiplayer: could not join %s:%u", ip, port );
+        return;
+    }
+    GetConsole()->Printf( "multiplayer: joining %s:%u ...", ip, port );
+
+    // Register the primary controller for player 0 so the player gets input
+    // once gameplay starts. Player 0 maps to controller 0 (see "skipfe" path).
+    GetInputManager()->RegisterControllerID( 0, 0 );
+    GetGuiSystem()->SetPrimaryController( 0 );
+
+    // Reset any loaded save for a clean multiplayer session (mirrors
+    // OnNewGameSelected) to avoid stale physics/sim breaking interaction or
+    // the SimEnvironment shutdown assert on exit.
+    if( GetGameDataManager()->IsGameLoaded() )
+    {
+        GetGameDataManager()->ResetGame();
+        GetRewardsManager()->ClearRewards();
+    }
+
+    // Set the current mission like "New Game" so the player character spawns
+    // and is controllable after the intro.
+    GetCharacterSheetManager()->SetCurrentMission( RenderEnums::L1, RenderEnums::M1 );
+
+    // Quit the front-end through the standard gameplay path (same as New/Resume
+    // Game) so GetGameplayManager is set up by the front-end manager before the
+    // gameplay context runs.
+    m_pParent->HandleMessage( GUI_MSG_QUIT_FRONTEND, 1 );
+    this->StartTransitionAnimation( 200, 230 );
+}
+
+void
+CGuiScreenMainMenu::StartMultiplayerOverlay()
+{
+    // Draw the host/join prompt on the hidden "MainMenu" page text. It is a
+    // separate Scrooby text (NOT a menu item), so writing to it does not break
+    // menu navigation. Grow its bounding box and move it to a clean strip near
+    // the bottom centre so the prompt is readable and does not overlap the
+    // items.
+    Scrooby::Text* overlayText = NULL;
+    Scrooby::Page* page = ( m_pScroobyScreen != NULL ) ? m_pScroobyScreen->GetPage( "MainMenu" ) : NULL;
+    if( page != NULL )
+    {
+        overlayText = dynamic_cast<Scrooby::Text*>( page->GetText( "MainMenu" ) );
+        if( overlayText != NULL )
+        {
+            overlayText->SetVisible( true );
+            overlayText->SetIndex( 0 );
+            overlayText->SetBoundingBoxSize( 720, 160 );
+            overlayText->SetHorizontalJustification( Scrooby::Centre );
+            overlayText->SetVerticalJustification( Scrooby::Centre );
+            overlayText->SetPositionOfCenter( 400, 240 );
+        }
+    }
+    if( overlayText == NULL ) return;
+
+    m_mpOverlayActive = true;
+    m_mpOverlaySelection = 0; // start at Host
+    m_mpIpBuffer[0] = '\0';
+    m_mpOverlayText = overlayText;
+
+    // Register this screen as the active text-input consumer.
+    TextInputHook::SetActive(
+        &CGuiScreenMainMenu::OnMpOverlayChar,
+        &CGuiScreenMainMenu::OnMpOverlayBackspace );
+
+    this->UpdateMpOverlayDisplay();
+}
+
+void
+CGuiScreenMainMenu::EndMultiplayerOverlay()
+{
+    if( m_mpOverlayActive && TextInputHook::HasActiveConsumer() )
+    {
+        TextInputHook::ClearActive();
+    }
+    m_mpOverlayActive = false;
+}
+
+void CGuiScreenMainMenu::UpdateMpOverlayDisplay()
+{
+    // Show current selection and the typed IP.
+    char buf[128];
+    const char* mode = (m_mpOverlaySelection == 0) ? "HOST" : "JOIN";
+    const char* ip = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
+    const char* action = (m_mpOverlaySelection == 0) ? "start" : "connect";
+    sprintf( buf, "MULTIPLAYER %s\nAddress: %s\n[Enter=%s   Esc=back]", mode, ip, action );
+    if( m_mpOverlayText != NULL )
+    {
+        m_mpOverlayText->SetString( 0, buf );
+    }
+}
+
+void CGuiScreenMainMenu::OnMpOverlayChar( const char* utf8Char )
+{
+    if( spMpOverlayOwner == NULL ) return;
+    // Append up to the buffer limit.
+    size_t len = strlen( utf8Char );
+    if( len == 0 ) return;
+    if( strlen( spMpOverlayOwner->m_mpIpBuffer ) + len >= sizeof( spMpOverlayOwner->m_mpIpBuffer ) ) return;
+    strcat( spMpOverlayOwner->m_mpIpBuffer, utf8Char );
+    spMpOverlayOwner->UpdateMpOverlayDisplay();
+}
+
+void CGuiScreenMainMenu::OnMpOverlayBackspace()
+{
+    if( spMpOverlayOwner == NULL ) return;
+    size_t len = strlen( spMpOverlayOwner->m_mpIpBuffer );
+    if( len > 0 )
+    {
+        spMpOverlayOwner->m_mpIpBuffer[ len - 1 ] = '\0';
+    }
+    spMpOverlayOwner->UpdateMpOverlayDisplay();
 }
 
 #ifdef RAD_WIN32

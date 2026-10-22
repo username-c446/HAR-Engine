@@ -1067,7 +1067,8 @@ void CGuiManagerInGame::HandleMessage
             if( message == GUI_MSG_UPDATE )
             {
                 int controllerID = GetInputManager()->GetControllerIDforPlayer( 0 );
-                if( !GetInputManager()->GetController( controllerID )->IsConnected() )
+                if( controllerID != -1 &&
+                    !GetInputManager()->GetController( controllerID )->IsConnected() )
                 {
                     bool setState = !m_controllerPromptShown;
                     this->OnControllerDisconnected( controllerID );

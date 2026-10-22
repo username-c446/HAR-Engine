@@ -62,6 +62,16 @@ protected:
     void UpdateRunning( unsigned int elapsedTime );
     void UpdateOutro( unsigned int elapsedTime );
 
+    // Multiplayer host/join overlay (custom, code-driven).
+    void StartMultiplayerOverlay();
+    void EndMultiplayerOverlay();
+    void OnMpOverlayConfirm();
+    void StartMultiplayerHost( unsigned short port );
+    void StartMultiplayerJoin( const char* ip, unsigned short port );
+    void UpdateMpOverlayDisplay();
+    static void OnMpOverlayChar( const char* utf8Char );
+    static void OnMpOverlayBackspace();
+
 private:
     enum eMainMenuSelection
     {
@@ -74,6 +84,7 @@ private:
         MAIN_MENU_CARD_GALLERY,
         MAIN_MENU_OPTIONS,
         MAIN_MENU_MINI_GAME,
+        MAIN_MENU_MULTIPLAYER,
   #ifdef RAD_WIN32
         MAIN_MENU_QUIT_GAME,
   #endif
@@ -93,6 +104,7 @@ private:
 
     void OnResumeGameSelected();
     void OnMiniGameSelected();
+    void OnMultiplayerSelected();
 
 #ifdef RAD_WIN32
     void OnQuitGameSelected();
@@ -117,6 +129,14 @@ private:
     Scrooby::Layer* m_tvFrame;
 
     Scrooby::Pure3dObject* m_glowingItems[ NUM_MAIN_MENU_SELECTIONS ];
+
+    // Multiplayer overlay state.
+    bool m_mpOverlayActive;
+    int  m_mpOverlaySelection;   // 0 = Host, 1 = Join
+    char m_mpIpBuffer[64];       // typed IP/port string
+    Scrooby::Text* m_mpOverlayText;
+
+    static CGuiScreenMainMenu* spMpOverlayOwner;
 
 };
 

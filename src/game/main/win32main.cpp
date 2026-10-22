@@ -17,11 +17,20 @@
 //========================================
 // Standard Library
 #include <string.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <exception>
 // Foundation Tech
 #include <raddebug.hpp>
 #include <radobject.hpp>
 // file reading before radtech
 #include <stdio.h>
+
+#if defined(RAD_WIN32)
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment( lib, "dbghelp.lib" )
+#endif
 
 //========================================
 // Project Includes
@@ -45,6 +54,140 @@ static void LogOutputFunction(void* userdata, int category, SDL_LogPriority prio
     rDebugPrintf("[SDL] %s\n", message);
 }
 
+#if defined(RAD_WIN32)
+static LONG WINAPI CrashHandler( EXCEPTION_POINTERS* pExceptionInfo )
+{
+    FILE* pFile = fopen( "crash.log", "w" );
+    if( pFile != NULL )
+    {
+        fprintf( pFile, "CRASH CODE: 0x%08lX at 0x%p\n",
+                 pExceptionInfo->ExceptionRecord->ExceptionCode,
+                 pExceptionInfo->ExceptionRecord->ExceptionAddress );
+
+        HANDLE hProcess = GetCurrentProcess();
+        SymInitialize( hProcess, NULL, TRUE );
+
+        STACKFRAME64 frame;
+        memset( &frame, 0, sizeof( frame ) );
+        frame.AddrPC.Offset = pExceptionInfo->ContextRecord->Rip;
+        frame.AddrPC.Mode = AddrModeFlat;
+        frame.AddrStack.Offset = pExceptionInfo->ContextRecord->Rsp;
+        frame.AddrStack.Mode = AddrModeFlat;
+        frame.AddrFrame.Offset = pExceptionInfo->ContextRecord->Rbp;
+        frame.AddrFrame.Mode = AddrModeFlat;
+
+        const DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
+        for( int i = 0; i < 32; i++ )
+        {
+            if( !StackWalk64( machineType, hProcess, GetCurrentThread(),
+                              &frame, pExceptionInfo->ContextRecord, NULL,
+                              SymFunctionTableAccess64, SymGetModuleBase64, NULL ) )
+            {
+                break;
+            }
+            if( frame.AddrPC.Offset == 0 )
+            {
+                break;
+            }
+
+            char symbolBuf[ sizeof( IMAGEHLP_SYMBOL64 ) + 256 ] = { 0 };
+            IMAGEHLP_SYMBOL64* pSym = ( IMAGEHLP_SYMBOL64* ) symbolBuf;
+            pSym->SizeOfStruct = sizeof( IMAGEHLP_SYMBOL64 );
+            pSym->MaxNameLength = 255;
+
+            DWORD64 displacement = 0;
+            char name[ 256 ] = "<unknown>";
+            if( SymGetSymFromAddr64( hProcess, frame.AddrPC.Offset, &displacement, pSym ) )
+            {
+                strncpy( name, pSym->Name, sizeof( name ) - 1 );
+            }
+
+            IMAGEHLP_LINE64 line = { 0 };
+            line.SizeOfStruct = sizeof( IMAGEHLP_LINE64 );
+            DWORD lineDisplacement = 0;
+            if( SymGetLineFromAddr64( hProcess, frame.AddrPC.Offset, &lineDisplacement, &line ) )
+            {
+                fprintf( pFile, "  #%02d  0x%016I64X  %s +0x%I64X  [%s:%lu]\n",
+                         i, frame.AddrPC.Offset, name, displacement, line.FileName, line.LineNumber );
+            }
+            else
+            {
+                fprintf( pFile, "  #%02d  0x%016I64X  %s +0x%I64X\n",
+                         i, frame.AddrPC.Offset, name, displacement );
+            }
+        }
+        fclose( pFile );
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The crash path may go through the C runtime (abort/terminate/pure virtual)
+// which SetUnhandledExceptionFilter does NOT catch. Dump a stack there too.
+void WriteCrashDump( const char* reason )
+{
+    FILE* pFile = fopen( "crash.log", "w" );
+    if( pFile == NULL ) return;
+    fprintf( pFile, "CRASH CODE: %s\n", reason );
+
+    HANDLE hProcess = GetCurrentProcess();
+    SymInitialize( hProcess, NULL, TRUE );
+
+    CONTEXT context;
+    RtlCaptureContext( &context );
+
+    STACKFRAME64 frame;
+    memset( &frame, 0, sizeof( frame ) );
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+
+    const DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
+    for( int i = 0; i < 32; i++ )
+    {
+        if( !StackWalk64( machineType, hProcess, GetCurrentThread(), &frame, &context,
+                          NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL ) )
+        {
+            break;
+        }
+        if( frame.AddrPC.Offset == 0 ) break;
+
+        char symbolBuf[ sizeof( IMAGEHLP_SYMBOL64 ) + 256 ] = { 0 };
+        IMAGEHLP_SYMBOL64* pSym = ( IMAGEHLP_SYMBOL64* ) symbolBuf;
+        pSym->SizeOfStruct = sizeof( IMAGEHLP_SYMBOL64 );
+        pSym->MaxNameLength = 255;
+
+        DWORD64 displacement = 0;
+        char name[ 256 ] = "<unknown>";
+        if( SymGetSymFromAddr64( hProcess, frame.AddrPC.Offset, &displacement, pSym ) )
+        {
+            strncpy( name, pSym->Name, sizeof( name ) - 1 );
+        }
+
+        fprintf( pFile, "  #%02d  0x%016I64X  %s +0x%I64X\n",
+                 i, frame.AddrPC.Offset, name, displacement );
+    }
+    fclose( pFile );
+}
+
+static void CrashHandlerAbort( int /*signum*/ )
+{
+    WriteCrashDump( "abort()" );
+}
+
+static void __cdecl CrashHandlerTerminate()
+{
+    WriteCrashDump( "terminate()" );
+}
+
+static void __cdecl CrashHandlerPureCall()
+{
+    WriteCrashDump( "pure virtual call (R6025)" );
+}
+#endif
+
 //=============================================================================
 // Function:    WinMain
 //=============================================================================
@@ -64,6 +207,21 @@ int main( int argc, char *argv[] )
     CommandLineOptions::InitDefaults();
     ProcessCommandLineArguments( argc, argv );
     ProcessCommandLineArgumentsFromFile();
+
+#if defined(RAD_WIN32)
+    // Install an unhandled-exception filter so an unexpected crash (e.g. a
+    // pure-virtual call / access violation during multiplayer entry) writes a
+    // symbolicated stack to crash.log instead of silently dying.
+    SetUnhandledExceptionFilter( CrashHandler );
+    SymSetOptions( SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS );
+
+    // Routines that bypass the SEH filter (abort/terminate/pure virtual) must
+    // be hooked too, otherwise the failure exits silently with no diagnostic.
+    _set_abort_behavior( 0, _WRITE_ABORT_MSG );
+    signal( SIGABRT, CrashHandlerAbort );
+    set_terminate( CrashHandlerTerminate );
+    _set_purecall_handler( CrashHandlerPureCall );
+#endif
     
     //
     // Initialize SDL subsystems
