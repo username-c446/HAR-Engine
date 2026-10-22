@@ -551,40 +551,75 @@ void CGuiSystem::Update( unsigned int elapsedTime )
         }
     }
 
-    // TEST-HARNESS: automatic front-end driver (disabled by default). Set
-    // SRR2_AUTOMENU=1 to run it. Deterministically presses Select/Back/Down on
-    // a timer so an automated run can sweep the menu and any screen and surface
-    // crashes/crashes without human testing. Intentionally kept (gated off) for
-    // future automated UI tests.
+// TEST-HARNESS: automatic front-end driver (disabled by default). Set
+    // SRR2_AUTOMENU=1 to run it. Deterministically steps through the front-end:
+    // - while NOT on the main menu (id 14): keep pressing BACK until we return
+    //   to it (this correctly unwinds sub-screens that are several levels deep,
+    //   e.g. OPTIONS -> DISPLAY -> back to OPTIONS -> back to main menu);
+    // - while ON the main menu: press RIGHT to advance the menu value, then
+    //   SELECT to enter the corresponding sub-screen. This sweeps every
+    //   sub-screen entry from the main menu, surfacing crashes/rAsserts.
+    // Intentionally kept (gated off) for future automated UI tests.
     if( getenv("SRR2_AUTOMENU") != NULL )
     {
         static unsigned int accum = 0;
-        static int phase = 0;       // 0=select, 1=back
         static int step = 0;
         static int warmup = 0;
         accum += elapsedTime;
-        // Defer until the front-end is actually up (avoid clobbering boot/load).
-        if( warmup < 60 )
+        const int MAIN_MENU_ID = 14;
+        const int CONTROLLER_ID = 25;
+        CGuiManager* curMgr = this->GetCurrentManager();
+        int curScr = curMgr ? (int)curMgr->GetCurrentScreen() : -1;
+        static bool jumped = false;
+        static int mainSeen = 0;    // how many ticks the main menu has been stable
+        static int probe = 0;       // proceed deeper into the mapping screen
+        FILE* f = fopen( "mp_dbg.log", "a" );
+        if( f ){ fprintf( f, "SYSAUTO step=%d screen=%d acc=%u mainSeen=%d\n",
+                          step, curScr, accum, mainSeen ); fclose(f); }
+
+        // Wait for the main menu to be STABLE (it often appears just for a
+        // frame during the intro transition; jumping then loses the screen).
+        if( curScr == MAIN_MENU_ID && !jumped )
         {
-            warmup++;
-        }
-        else if( accum >= 1600 )
-        {
-            accum = 0;
-            FILE* f = fopen( "mp_dbg.log", "a" );
-            if( f ){ fprintf( f, "SYSAUTO step=%d phase=%d\n", step, phase ); fclose(f); }
-            if( phase == 0 )
+            mainSeen++;
+            if( mainSeen >= 3 )     // ~3 stable ticks on the main menu
             {
-                this->HandleMessage( GUI_MSG_CONTROLLER_SELECT, 0 );
-                phase = 1;
-            }
-            else
-            {
-                this->HandleMessage( GUI_MSG_CONTROLLER_BACK, 0 );
-                this->HandleMessage( GUI_MSG_CONTROLLER_DOWN, 0 );
-                phase = 0;
+                jumped = true;
+                probe = 0;
+                this->GotoScreen( CONTROLLER_ID, 0, 0, 0 );
                 step++;
             }
+            accum = 0;
+        }
+        else if( jumped && accum >= 1200 )
+        {
+            accum = 0;
+            if( curScr == CONTROLLER_ID )
+            {
+                // On the controller screen: drive toward the mapping path that
+                // reaches GetInputName (select a key to remap), then back out.
+                probe++;
+                this->HandleMessage( GUI_MSG_CONTROLLER_SELECT, 0 );
+                this->HandleMessage( GUI_MSG_CONTROLLER_RIGHT, 0 );
+                this->HandleMessage( GUI_MSG_CONTROLLER_SELECT, 0 );
+                if( probe >= 4 )
+                {
+                    this->HandleMessage( GUI_MSG_CONTROLLER_BACK, 0 );
+                    probe = 0;
+                    jumped = false;   // re-enter the main menu, then jump again
+                    mainSeen = 0;
+                }
+            }
+            else if( curScr != MAIN_MENU_ID )
+            {
+                // Still unwinding from the jump transition.
+                this->HandleMessage( GUI_MSG_CONTROLLER_BACK, 0 );
+            }
+            // else: on the main menu again — reset so we jump once more.
+        }
+        else if( warmup < 60 )
+        {
+            warmup++;
         }
     }
 }

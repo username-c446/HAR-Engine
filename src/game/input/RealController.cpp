@@ -135,22 +135,27 @@ bool RealController::IsBannedInput( int dxKey ) const
 
 const char* RealController::GetInputName( int dxKey ) const
 {
-    if( IsValidInput( dxKey ) )
+    if( IsValidInput( dxKey ) && m_radController != NULL )
     {
         for( int i = 0; i < m_numInputPoints; i++ )
         {
             if( GetDICode( i ) == dxKey )
             {
                 IRadControllerInputPoint* pInputPoint = m_radController->GetInputPointByIndex( i );
-                rAssert( pInputPoint != NULL );
+                if( pInputPoint == NULL )
+                {
+                    break;
+                }
 
                 return pInputPoint->GetName();
             }
         }
     }
 
-    rAssert( false );
-    return NULL;
+    // Degrade gracefully instead of asserting: an unmapped *valid* key (or a
+    // briefly-NULL controller) must not halt the front-end. Callers render the
+    // result as a label; an empty string is safe.
+    return "";
 }
 
 void RealController::AddInputPoints( IRadControllerInputPoint* pInputPoint )
