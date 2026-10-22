@@ -35,7 +35,7 @@ EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Static Files", "Static Files", "{A2CAF4F9-FA97-4AFA-BDC3-30FBCB3ED4BB}"
 	ProjectSection(SolutionItems) = preProject
 		.gitignore = .gitignore
-		README.md = README.md
+		README.md = docs\README.md
 		TODO.md = TODO.md
 		vcpkg-configuration.json = vcpkg-configuration.json
 		vcpkg.json = vcpkg.json

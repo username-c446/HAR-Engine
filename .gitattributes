@@ -58,3 +58,8 @@
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
 *.rcf filter=lfs diff=lfs merge=lfs -text
+###############################################################################
+# Markdown docs (multilingual, stored in docs/) — keep LF, text diff workable.
+###############################################################################
+*.md      text eol=lf
+docs/*.md text eol=lf

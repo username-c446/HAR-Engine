@@ -191,6 +191,12 @@ assets
 .local/
 tool-output/
 
+# Private assistant instructions / notes (never commit — AI-personal, not pushed)
+AI_INSTRUCTIONS.md
+AI_*.md
+notes/
+assistant-notes/
+
 # Local test build artifacts (src/tests/*/x64/*)
 src/tests/**/x64/
 src/tests/**/*.ilk
