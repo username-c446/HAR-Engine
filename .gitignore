@@ -186,6 +186,11 @@ src/libs/sim/obj/
 # temp
 assets
 
+# Local assistant / tool state (never commit)
+.gigatool/
+.local/
+tool-output/
+
 # Local test build artifacts (src/tests/*/x64/*)
 src/tests/**/x64/
 src/tests/**/*.ilk
