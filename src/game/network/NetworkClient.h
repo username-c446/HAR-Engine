@@ -5,9 +5,11 @@
 #endif
 #include "RemotePlayerManager.h"
 #include "PlayerNetworkState.h"
+#include "MissionSyncState.h"
 #include "NetworkPacket.h"
 #include "ENetInit.h"
 #include <enet/enet.h>
+#include <map>
 #include <vector>
 
 class NetworkClient
@@ -25,6 +27,7 @@ public:
     unsigned short GetClientId() const { return m_clientId; }
 
     void SendPlayerState(const PlayerNetworkState& state);
+    void SendMissionState(const MissionSyncState& state);
     void SendHello();
     void SendAuth(const char* password);
     void SetPassword(const char* password);
@@ -48,6 +51,10 @@ public:
     struct JoinLeaveEvent { unsigned short clientId; bool joined; };
     // Appends all pending events to out and clears the pending buffer.
     void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);
+
+    // Remote players' mission progress as relayed by the server (for the
+    // "playing together" case). Indexed by network client id.
+    const std::map<unsigned short, MissionSyncState>& GetRemoteMissionStates() const { return m_remoteMissionStates; }
 
 private:
     void HandlePacket(const char* data, size_t size);
@@ -73,4 +80,5 @@ private:
     std::vector<unsigned short> m_authoritativePlayers; // server-approved entity list
     std::vector<unsigned short> m_prevAuthoritativePlayers;
     std::vector<JoinLeaveEvent> m_pendingEvents; // join/leave notifications
+    std::map<unsigned short, MissionSyncState> m_remoteMissionStates; // relayed mission progress
 };

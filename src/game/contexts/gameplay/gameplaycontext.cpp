@@ -58,6 +58,7 @@
 #include <meta/triggervolumetracker.h>
 
 #include <mission/gameplaymanager.h>
+#include <mission/mission.h>
 #include <mission/charactersheet/charactersheetmanager.h>
 
 #include <presentation/presentation.h>
@@ -84,6 +85,8 @@
 
 #include <network/NetworkMatchManager.h>
 #include <network/NetworkConsoleCommands.h>
+#include <network/MissionSyncState.h>
+#include <network/LobbyRuntimeTest.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
 #include <console/console.h>
@@ -168,6 +171,26 @@ namespace
             outState.vehicleSpeed = 0.0f;
             outState.inVehicle = 0;
         }
+        return true;
+    }
+
+    // Local mission-state provider: reports the local player's current mission,
+    // stage and objective so co-op partners can track progress together.
+    bool GameplayMissionStateProvider( MissionSyncState& outState )
+    {
+        // GameplayManager owns the current mission. Guarded against absence.
+        GameplayManager* gm = GetGameplayManager();
+        if ( gm == NULL ) return false;
+        Mission* mission = gm->GetCurrentMission();
+        MissionSyncState state;
+        state.Clear();
+        if ( mission != NULL )
+        {
+            state.missionIndex = gm->GetCurrentMissionIndex();
+            state.stageIndex = mission->GetCurrentStageIndex();
+            state.inMission = 1;
+        }
+        outState = state;
         return true;
     }
 
@@ -345,11 +368,16 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     //
     PlayingContext::OnStart( previousContext );
 
+    // Runtime check that the live Scrooby loader reads a P3DWriter-generated
+    // .p3d (proves our asset generator's output is loadable). One-time, safe.
+    LobbyRuntimeTest::Run();
+
     // Initialise the multiplayer match controller and feed it the local player's
     // live state. It stays idle until host/join is invoked.
     RegisterNetworkConsoleCommands();
     NetworkMatchManager* pMatchMgr = NetworkMatchManager::CreateInstance();
     pMatchMgr->SetLocalStateProvider( &GameplayLocalStateProvider );
+    pMatchMgr->SetMissionStateProvider( &GameplayMissionStateProvider );
 
     // Auto-start a match from the command line (-host <port> / -join <ip:port>).
     // Useful for scripted/testing launches of host and client copies.

@@ -5,6 +5,7 @@ NetworkMatchManager* NetworkMatchManager::spInstance = nullptr;
 NetworkMatchManager::NetworkMatchManager()
     : m_hostPort(0)
     , m_localStateProvider(nullptr)
+    , m_missionStateProvider(nullptr)
     , m_hostMaxPlayers(0)
 {
     m_hostPassword[0] = '\0';
@@ -125,6 +126,12 @@ void NetworkMatchManager::Update()
             && m_localStateProvider != nullptr
             && m_localStateProvider(localState)) {
             m_client->SendPlayerState(localState);
+        }
+        MissionSyncState localMission;
+        if (m_client->IsServerReady()
+            && m_missionStateProvider != nullptr
+            && m_missionStateProvider(localMission)) {
+            m_client->SendMissionState(localMission);
         }
     }
 }

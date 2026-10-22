@@ -22,7 +22,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(VCInstallDir)Auxiliary\VS\UnitTest\include;..\game\network;$(ProjectDir)..\..\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(VCInstallDir)Auxiliary\VS\UnitTest\include;..\game\network;..\libs\pure3d;$(ProjectDir)..\..\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
     </ClCompile>
     <Link>
@@ -33,11 +33,13 @@
   <ItemGroup>
     <ClCompile Include="tests.cpp" />
     <ClCompile Include="network_tests.cpp" />
+    <ClCompile Include="..\libs\pure3d\p3d\p3dwriter.cpp" />
     <ClCompile Include="..\game\network\NetworkServer.cpp" />
     <ClCompile Include="..\game\network\NetworkClient.cpp" />
     <ClCompile Include="..\game\network\NetworkMatchManager.cpp" />
     <ClCompile Include="..\game\network\PlayerNetworkState.cpp" />
     <ClCompile Include="..\game\network\MissionSyncManager.cpp" />
+    <ClCompile Include="..\game\network\MissionSyncState.cpp" />
     <ClCompile Include="..\game\network\RemotePlayerManager.cpp" />
     <ClCompile Include="..\game\network\RemotePlayerWorldView.cpp" />
     <ClCompile Include="..\game\network\RemoteVehicleWorldView.cpp" />

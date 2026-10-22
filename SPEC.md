@@ -26,7 +26,8 @@
 | `RemotePlayerWorldView.{h,cpp}` | Визуализация удалённых пеших игроков + интерполяция |
 | `RemoteVehicleWorldView.{h,cpp}` | Визуализация «призраков» машин удалённых водителей |
 | `ServerModManager.{h,cpp}` | Серверные Lua-моды (хуки допуска/валидации) |
-| `MissionSyncManager.{h,cpp}` | Задел на синхронизацию стадии/цели миссии |
+| `MissionSyncManager.{h,cpp}` | Синхронизация миссии/стадии/цели между клиентами (co-op-прогресс) |
+| `MissionSyncState.{h,cpp}` | Сериализуемое состояние миссии (миссия/стадия/цель) |
 | `NetworkConsoleCommands.{h,cpp}` | Консольные команды `host`/`join`/`match` |
 | `ENetInit.h` | RAII-счётчик ссылок ENet |
 
@@ -62,6 +63,7 @@
 | 6 | `PING` | C→S | Heartbeat + замер RTT |
 | 7 | `PONG` | S→C | Ответ на ping |
 | 8 | `AUTH` | C→S | Пароль для защищённого хоста |
+| 9 | `MISSION_STATE` | C→S→C | Прогресс миссии/стадии/цели (релей, для co-op) |
 
 > Примечание: `PACKET_VEHICLE_STATE` объявлен в enum, но текущая реализация
 > переносит транспортные данные внутри `PLAYER_STATE` (см. §6), т.е. пакет 5
@@ -269,15 +271,34 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 ---
 
-## 12. Точки интеграции в игровой цикл (`gameplaycontext.cpp`)
+## 12. Синхронизация миссии (A3, co-op)
+
+Миссии становятся **совместными только когда игроки проходят их вместе**, а не
+принудительно для всех. Механика — релей прогресса миссии, как у `PLAYER_STATE`:
+
+- **Состояние:** `MissionSyncState` (миссия/стадия/цель + флаг `inMission`),
+  сериализация как у `PlayerNetworkState`.
+- **Локально:** `GameplayMissionStateProvider` в `gameplaycontext.cpp` читает
+  текущую миссию через `GameplayManager::GetCurrentMission()` /
+  `GetCurrentStageIndex()` и шлёт по сети (клиент → сервер → остальные).
+- **Сервер:** принимает `PACKET_MISSION_STATE`, хранит по клиенту в
+  `m_missionStates`, ретранслирует остальным (без gate-валидации — ход миссии
+  решает хост).
+- **Клиент:** `GetRemoteMissionStates()` отдаёт `map<clientId, MissionSyncState>`
+  для UI «кто в какой миссии».
+- `MissionSyncManager` агрегирует локальный + удалённые прогрессы,
+  тестируем.
+
+## 13. Точки интеграции в игровой цикл (`gameplaycontext.cpp`)
 
 Порядок в `GameplayContext::OnUpdate` внутри матча:
-1. `pMatch->Update()` — сеть.
+1. `pMatch->Update()` — сеть (и отправка состояния миссии через месседж-провайдер).
 2. `GetRemotePlayerWorldView()->Sync(...)` → `Update(elapsedTime)` — пешие.
 3. `ForEachPlayer` → `RemoteVehicleWorldView::SyncDriver` → `Prune` → `Update` — машины.
 4. `DrainJoinLeaveEvents` → консольные сообщения.
 
-В `OnStart`: автостарт матча из CLI, `SetSink` для обоих WorldView'ов.
+В `OnStart`: автостарт матча из CLI, `SetSink` для обоих WorldView'ов,
+`SetMissionStateProvider` для локального прогресса миссии.
 
 ---
 
@@ -285,7 +306,7 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 - Все изменяемые возможности должны иметь юнит/интеграционные тесты
   (`src/tests/network_tests.cpp`; проект Tests.vcxproj, пакет `Tests.dll`).
-- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 25/25 зелёных.
+- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 28/28 зелёных.
 - Сборка полной игры: `MSBuild.exe src/srr2/SRR2.vcxproj
   /p:Configuration=DebugWindows /p:Platform=x64
   /p:WindowsTargetPlatformVersion=10.0.22621.0`.
@@ -294,9 +315,6 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 ## 14. План (TODO, вернёмся)
 
-- **A3** — Согласование жизненного цикла миссии/мира между клиентами
-  (все в одной миссии; общие триггеры целей). Задел: `MissionSyncManager`
-  (`SyncStage` / `SyncObjective`).
 - **C7** — UI-лобби (свои экраны). Отложено до появления генератора .p3d / UI-слоя.
 
 ---

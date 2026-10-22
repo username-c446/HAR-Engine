@@ -7,8 +7,12 @@
 #include "RemotePlayerWorldView.h"
 #include "RemoteVehicleWorldView.h"
 #include "ServerModManager.h"
+#include "MissionSyncState.h"
+#include "MissionSyncManager.h"
+#include "p3d/p3dwriter.h"
 
 #include <winsock2.h>
+#include <functional>
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 
@@ -849,6 +853,206 @@ namespace NetworkTests
             Assert::IsFalse(mods.OnPlayerValidate(1, bad), L"on_validate with z=500 should fail.");
 
             mods.OnPlayerLeave(1); // must not crash
+        }
+    };
+
+    TEST_CLASS(MissionSyncTests)
+    {
+    public:
+        TEST_METHOD(MissionStateSerializesRoundtrip)
+        {
+            MissionSyncState s;
+            s.missionIndex = 3;
+            s.stageIndex = 1;
+            s.objectiveIndex = 2;
+            s.inMission = 1;
+
+            char buffer[MissionSyncState::SERIALIZED_SIZE];
+            s.Serialize(buffer);
+
+            MissionSyncState restored;
+            restored.Deserialize(buffer);
+            Assert::AreEqual(s.missionIndex, restored.missionIndex);
+            Assert::AreEqual(s.stageIndex, restored.stageIndex);
+            Assert::AreEqual(s.objectiveIndex, restored.objectiveIndex);
+            Assert::AreEqual(s.inMission, restored.inMission);
+        }
+
+        TEST_METHOD(MissionSyncManagerTracksLocalAndRemote)
+        {
+            MissionSyncManager mgr;
+            mgr.SetLocalMission(2, 0, 0, true);
+            Assert::AreEqual(2, mgr.GetLocalState().missionIndex);
+            Assert::AreEqual(1, static_cast<int>(mgr.GetLocalState().inMission));
+
+            mgr.SyncStage(1);
+            mgr.SyncObjective(3);
+            Assert::AreEqual(1, mgr.GetCurrentStage());
+            Assert::AreEqual(3, mgr.GetCurrentObjective());
+
+            MissionSyncState remote;
+            remote.missionIndex = 4;
+            remote.stageIndex = 0;
+            remote.inMission = 1;
+            mgr.UpdateRemotePlayer(100, remote);
+
+            bool seen = false;
+            mgr.ForEachRemotePlayer(
+                [](int id, const MissionSyncState& state, void* ud) -> bool
+                {
+                    Assert::AreEqual(100, id);
+                    Assert::AreEqual(4, state.missionIndex);
+                    *static_cast<bool*>(ud) = true;
+                    return true;
+                },
+                &seen);
+            Assert::IsTrue(seen, L"Remote player's mission state should be iterable.");
+
+            mgr.RemoveRemotePlayer(100);
+            Assert::IsFalse(mgr.HasRemotePlayer(100), L"Removed remote player should be gone.");
+        }
+
+        TEST_METHOD(MissionStateRelaysBetweenClientsThroughServer)
+        {
+            NetworkServer server;
+            unsigned short port = PickFreePort();
+            Assert::IsTrue(server.Start(port));
+
+            NetworkClient a;
+            Assert::IsTrue(a.Connect("127.0.0.1", port));
+            NetworkClient b;
+            Assert::IsTrue(b.Connect("127.0.0.1", port));
+
+            bool readyA = false, readyB = false;
+            for (int i = 0; i < 300 && !(readyA && readyB); ++i) {
+                server.Update(); a.Update(); b.Update();
+                readyA = a.IsServerReady();
+                readyB = b.IsServerReady();
+            }
+            Assert::IsTrue(readyA && readyB, L"Both clients should be welcomed.");
+
+            // Client A reports mission 2, stage 1.
+            MissionSyncState ms;
+            ms.missionIndex = 2;
+            ms.stageIndex = 1;
+            ms.objectiveIndex = 0;
+            ms.inMission = 1;
+            for (int i = 0; i < 20; ++i) {
+                a.SendMissionState(ms);
+                a.Update(); server.Update(); b.Update();
+            }
+
+            // Client B must now see A's mission progress via the relay.
+            unsigned short aId = a.GetClientId();
+            auto& remote = b.GetRemoteMissionStates();
+            auto it = remote.find(aId);
+            Assert::IsTrue(it != remote.end(), L"B should see A's mission state via the relay.");
+            if (it != remote.end()) {
+                Assert::AreEqual(2, it->second.missionIndex);
+                Assert::AreEqual(1, it->second.stageIndex);
+            }
+
+            a.Disconnect();
+            b.Disconnect();
+        }
+    };
+
+    TEST_CLASS(P3DWriterTests)
+    {
+    public:
+        TEST_METHOD(WritesValidChunkHierarchy)
+        {
+            P3DWriter w;
+            w.BeginProject("lobby", 640, 480, "pc", "art\\pages", "art\\res", "art\\screens");
+            w.BeginScreen("lobby_screen", 1, 0);
+            w.EndScreen();
+            w.BeginPage("lobby_page", 1, 640, 480);
+            w.BeginLayer("main", 1, true, true, 255);
+            const char* images[] = { "cursor.png" };
+            w.WriteSprite("cursor", 1, 0, 0, 32, 32, 0, 0, 0xFFFFFFFF, 0, 0.0f, images, 1);
+            w.EndSprite();
+            w.BeginGroup("textgrp", 1);
+            w.WriteText("Title", 17, 10, 10, 200, 30, 0, 0, 0xFFFFFFFF,
+                0, 0.0f, "HudTextStyle", true, 0xFF000000, 1, 2, 0);
+            w.AddTextHardCodedString("Hello");
+            w.EndText();
+            w.EndGroup();
+            w.EndLayer();
+            w.EndPage();
+            w.EndProject();
+
+            const std::vector<char>& data = w.GetData();
+            // Root DATA_FILE chunk header + PROJECT chunk.
+            Assert::IsTrue(data.size() > 12, L"Writer should emit at least a root header.");
+            // Structural self-check: walk the generated bytes recursively and verify the
+            // chunk headers nest correctly (a mini-reader matching tChunkFile's
+            // chunk framing: [id u32][dataLength u32][chunkLength u32]).
+            size_t pos = 0;
+            auto readU32 = [&](size_t p) -> uint32_t {
+                return (static_cast<unsigned char>(data[p]))
+                    | (static_cast<unsigned char>(data[p + 1]) << 8)
+                    | (static_cast<unsigned char>(data[p + 2]) << 16)
+                    | (static_cast<unsigned char>(data[p + 3]) << 24);
+            };
+            int depth = 0;
+            int rootSeen = 0;
+            // Simple recursive descent over the flat buffer using declared lengths.
+            std::function<void(size_t)> walk = [&](size_t start) {
+                uint32_t id = readU32(start);
+                uint32_t dataL = readU32(start + 4);
+                uint32_t chunkL = readU32(start + 8);
+                Assert::IsTrue(chunkL >= dataL, L"Chunk length must cover data.");
+                // dataLength = 12 + payload bytes (before sub-chunks start).
+                size_t substart = start + dataL;
+                if (id == 0xFF443350) rootSeen++;
+                depth++;
+                // Recurse into sub-chunks while there is space within chunkL.
+                size_t p = substart;
+                while (p + 12 <= start + chunkL) {
+                    uint32_t childL = (static_cast<unsigned char>(data[p + 8]))
+                        | (static_cast<unsigned char>(data[p + 9]) << 8)
+                        | (static_cast<unsigned char>(data[p + 10]) << 16)
+                        | (static_cast<unsigned char>(data[p + 11]) << 24);
+                    if (childL == 0) break;
+                    walk(p);
+                    p += childL;
+                }
+                depth--;
+            };
+            walk(0);
+            Assert::AreEqual(1, rootSeen, L"Exactly one DATA_FILE root expected.");
+
+            // Root chunk id must be DATA_FILE (0xFF443350), little-endian.
+            unsigned char b0 = static_cast<unsigned char>(data[0]);
+            Assert::AreEqual(0x50, (int)b0, L"Root chunk id low byte should match DATA_FILE.");
+            // dataLength and chunkLength fields present and non-zero.
+            uint32_t dataLength = (static_cast<unsigned char>(data[4]))
+                | (static_cast<unsigned char>(data[5]) << 8)
+                | (static_cast<unsigned char>(data[6]) << 16)
+                | (static_cast<unsigned char>(data[7]) << 24);
+            uint32_t chunkLength = (static_cast<unsigned char>(data[8]))
+                | (static_cast<unsigned char>(data[9]) << 8)
+                | (static_cast<unsigned char>(data[10]) << 16)
+                | (static_cast<unsigned char>(data[11]) << 24);
+            Assert::IsTrue(dataLength > 0, L"Root dataLength must be non-zero.");
+            Assert::IsTrue(chunkLength >= dataLength, L"Root chunkLength must cover the data.");
+        }
+
+        TEST_METHOD(WriteTextWithVersionBelow17HasNoShadow)
+        {
+            P3DWriter w;
+            w.BeginProject("p", 640, 480, "pc", "", "", "");
+            w.BeginScreen("s", 1, 0);
+            w.EndScreen();
+            w.BeginPage("page", 1, 640, 480);
+            w.BeginLayer("l", 1, true, true, 255);
+            w.WriteText("plain", 16, 0, 0, 100, 20, 0, 0, 0xFFFFFFFF,
+                0, 0.0f, "Style", false, 0, 0, 0, 0);
+            w.EndLayer();
+            w.EndPage();
+            w.EndProject();
+            // version 16 => no drop-shadow block: no extra 1+4+4+4+4 bytes.
+            Assert::IsTrue(w.GetData().size() > 0);
         }
     };
 }

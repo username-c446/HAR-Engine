@@ -711,6 +711,7 @@
     <ClCompile Include="p3d\camera.cpp" />
     <ClCompile Include="p3d\cameraloader.cpp" />
     <ClCompile Include="p3d\chunkfile.cpp" />
+    <ClCompile Include="p3d\p3dwriter.cpp" />
     <ClCompile Include="p3d\context.cpp" />
     <ClCompile Include="p3d\debugdraw.cpp" />
     <ClCompile Include="p3d\directionallight.cpp" />

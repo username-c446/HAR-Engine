@@ -7,6 +7,7 @@
 #include "ENetInit.h"
 #include "NetworkPacket.h"
 #include "ServerModManager.h"
+#include "MissionSyncState.h"
 #include <enet/enet.h>
 #include <map>
 
@@ -85,5 +86,6 @@ private:
     std::map<unsigned short, ENetPeer*> m_peersById;
     std::map<unsigned short, ClientSession> m_sessions;
     RemotePlayerManager m_players;
+    std::map<unsigned short, MissionSyncState> m_missionStates;
     ServerModManager m_mods;
 };

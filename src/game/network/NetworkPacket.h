@@ -22,6 +22,7 @@ namespace net
         PACKET_PING = 6,          // client heartbeat; server treats it as liveness
         PACKET_PONG = 7,          // server acknowledgement of a ping
         PACKET_AUTH = 8,          // client->server: password for a password-protected host
+        PACKET_MISSION_STATE = 9, // per-player mission progress (relayed like player state)
     };
 
     // A client is considered alive if it has been heard from within this window.

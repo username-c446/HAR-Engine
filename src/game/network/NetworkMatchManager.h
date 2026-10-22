@@ -3,6 +3,7 @@
 #include "NetworkServer.h"
 #include "NetworkClient.h"
 #include "PlayerNetworkState.h"
+#include "MissionSyncState.h"
 
 #include <memory>
 #include <vector>
@@ -22,6 +23,9 @@ public:
     // if no state is available yet.
     typedef bool (*LocalStateProvider)(PlayerNetworkState& out);
 
+    // Returns true and fills out with the local player's mission progress.
+    typedef bool (*MissionStateProvider)(MissionSyncState& out);
+
     static NetworkMatchManager* CreateInstance();
     static NetworkMatchManager* GetInstance();
     static void DestroyInstance();
@@ -31,6 +35,7 @@ public:
     void Leave();
 
     void SetLocalStateProvider(LocalStateProvider provider) { m_localStateProvider = provider; }
+    void SetMissionStateProvider(MissionStateProvider provider) { m_missionStateProvider = provider; }
 
     // Host configuration: password and slot cap applied to the server when it is
     // next (re)started via StartHost. Empty password / 0 slots = defaults.
@@ -66,6 +71,7 @@ private:
     std::unique_ptr<NetworkClient> m_client;
     unsigned short m_hostPort;
     LocalStateProvider m_localStateProvider;
+    MissionStateProvider m_missionStateProvider;
     char m_hostPassword[65];
     unsigned short m_hostMaxPlayers;
 };

@@ -1,6 +1,7 @@
 #include "NetworkServer.h"
 #include "NetworkPacket.h"
 #include "ServerModManager.h"
+#include "MissionSyncState.h"
 
 namespace
 {
@@ -58,6 +59,7 @@ void NetworkServer::Stop()
     m_peerIds.clear();
     m_peersById.clear();
     m_players.Clear();
+    m_missionStates.clear();
 }
 
 void NetworkServer::Update()
@@ -111,10 +113,12 @@ void NetworkServer::Update()
         {
             auto it = m_peerIds.find(event.peer);
             if (it != m_peerIds.end()) {
-                if (m_mods.HasScript()) m_mods.OnPlayerLeave(static_cast<int>(it->second));
-                m_players.RemovePlayer(static_cast<int>(it->second));
-                m_sessions.erase(it->second);
-                m_peersById.erase(it->second);
+                unsigned short deadId = it->second;
+                if (m_mods.HasScript()) m_mods.OnPlayerLeave(static_cast<int>(deadId));
+                m_players.RemovePlayer(static_cast<int>(deadId));
+                m_missionStates.erase(deadId);
+                m_sessions.erase(deadId);
+                m_peersById.erase(deadId);
                 m_peerIds.erase(it);
                 // Reflect the authoritative entity change for everyone.
                 SendPlayerListToAll();
@@ -200,6 +204,29 @@ void NetworkServer::HandlePacket(ENetPeer* peer, const char* data, size_t size)
         // Heartbeat acknowledgement. The liveness timestamp was refreshed above.
         SendTo(peer, net::PACKET_PONG, nullptr, 0, clientId);
         break;
+    case net::PACKET_MISSION_STATE:
+    {
+        // Payload from client: [senderClientId u16][MissionSyncState].
+        // Relay verbatim to everyone else (mission progress is not plausibility-
+        // gated; the host decides progression).
+        if (payloadSize < sizeof(unsigned short) + static_cast<size_t>(MissionSyncState::SERIALIZED_SIZE)) break;
+        const char* p = payload;
+        net::ReadU16(p); // client-sent clientId; we trust our authoritative mapping.
+        MissionSyncState mstate;
+        mstate.Deserialize(p);
+        m_missionStates[clientId] = mstate;
+
+        char relay[sizeof(unsigned short) + MissionSyncState::SERIALIZED_SIZE];
+        char* rp = relay;
+        net::WriteU16(rp, clientId);
+        mstate.Serialize(rp);
+        for (auto& kv : m_peerIds)
+        {
+            if (kv.first == peer) continue;
+            SendTo(kv.first, net::PACKET_MISSION_STATE, relay, sizeof(relay), clientId);
+        }
+        break;
+    }
     case net::PACKET_AUTH:
     {
         // Client presents a password: payload is a null-terminated string.

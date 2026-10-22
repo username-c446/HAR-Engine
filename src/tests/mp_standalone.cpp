@@ -20,6 +20,7 @@
 // and runs standalone.
 #include <cstdio>
 #include <cstring>
+#include "p3d/p3dwriter.h"
 
 #include "mp_network_fakes.h"
 
@@ -35,6 +36,7 @@ int main(int argc, char** argv)
         printf("usage:\n  mp_standalone server [port] [--mod <lua>] [--password <pw>] [--max <slots>] [--log <file>]\n"
                "  mp_standalone host [port] [--password <pw>] [--max <slots>] [--log <file>]\n"
                "  mp_standalone join <hostIp> [port] [--password <pw>]\n"
+               "  mp_standalone genui [out.p3d]\n"
                "  (default port 3737)\n");
         return 1;
     }
@@ -142,6 +144,42 @@ int main(int argc, char** argv)
                 client.SendPlayerState(st);
             }
         }
+    }
+    else if (strcmp(mode, "genui") == 0) {
+        // Generate a Scrooby .p3d lobby screen to disk using P3DWriter.
+        const char* outPath = (argc >= 3) ? argv[2] : "lobby.p3d";
+        P3DWriter w;
+        w.BeginProject("mp_lobby", 640, 480, "pc", "art\\pages", "art\\res", "art\\screens");
+        w.BeginScreen("mp_lobby_screen", 1, 0);
+        w.EndScreen();
+        w.BeginPage("mp_lobby_page", 1, 640, 480);
+        w.BeginLayer("main", 1, true, true, 255);
+        w.BeginGroup("title_grp", 1);
+        w.WriteText("Title", 17, 100, 40, 440, 40, 0, 0, 0xFFFFFFFF,
+            0, 0.0f, "HudTextStyle", true, 0xFF000000, 1, 2, 0);
+        w.AddTextHardCodedString("Multiplayer Lobby");
+        w.EndText();
+        w.EndGroup();
+        w.BeginGroup("status_grp", 1);
+        w.WriteText("Status", 17, 100, 120, 440, 30, 0, 0, 0xFFFFFFFF,
+            0, 0.0f, "HudTextStyle", true, 0xFF000000, 1, 2, 0);
+        w.AddTextHardCodedString("Host a game to begin.");
+        w.EndText();
+        w.EndGroup();
+        w.EndLayer();
+        w.EndPage();
+        w.EndProject();
+
+        FILE* f = fopen(outPath, "wb");
+        if (f == NULL) {
+            printf("[genui] cannot open output file: %s\n", outPath);
+            return 2;
+        }
+        const std::vector<char>& data = w.GetData();
+        fwrite(data.data(), 1, data.size(), f);
+        fclose(f);
+        printf("[genui] wrote %u bytes to %s\n", (unsigned)data.size(), outPath);
+        return 0;
     }
     else {
         printf("unknown mode '%s'\n", mode);

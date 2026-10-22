@@ -76,6 +76,7 @@ void NetworkClient::Disconnect()
     m_serverReady = false;
     m_clientId = 0;
     m_remotePlayers.Clear();
+    m_remoteMissionStates.clear();
 }
 
 void NetworkClient::Update()
@@ -183,6 +184,7 @@ void NetworkClient::HandlePacket(const char* data, size_t size)
         m_authoritativePlayers.clear();
         m_prevAuthoritativePlayers.clear();
         m_pendingEvents.clear();
+        m_remoteMissionStates.clear();
         break;
     }
     case net::PACKET_PLAYER_LIST:
@@ -255,6 +257,18 @@ void NetworkClient::HandlePacket(const char* data, size_t size)
         m_pingSentMs = 0;
         break;
     }
+    case net::PACKET_MISSION_STATE:
+    {
+        // Payload: clientId(u16) + MissionSyncState
+        if (payloadSize < sizeof(unsigned short) + static_cast<size_t>(MissionSyncState::SERIALIZED_SIZE)) return;
+        const char* p = payload;
+        unsigned short sender = net::ReadU16(p);
+        if (sender == m_clientId) break; // ignore our own echoed state
+        MissionSyncState mstate;
+        mstate.Deserialize(p);
+        m_remoteMissionStates[sender] = mstate;
+        break;
+    }
     case net::PACKET_PLAYER_STATE:
     {
         // Payload: clientId(u16) + PlayerNetworkState
@@ -279,6 +293,21 @@ void NetworkClient::SendPlayerState(const PlayerNetworkState& state)
 
     char buffer[1 + sizeof(unsigned short) + PlayerNetworkState::SERIALIZED_SIZE];
     buffer[0] = net::PACKET_PLAYER_STATE;
+    char* p = buffer + 1;
+    net::WriteU16(p, m_clientId);
+    state.Serialize(p);
+
+    ENetPacket* packet = enet_packet_create(buffer, sizeof(buffer), 0);
+    if (!packet) return;
+    enet_peer_send(m_server, static_cast<enet_uint8>(net::GAME_CHANNEL), packet);
+}
+
+void NetworkClient::SendMissionState(const MissionSyncState& state)
+{
+    if (!m_connected || !m_serverReady || !m_host || !m_server) return;
+
+    char buffer[1 + sizeof(unsigned short) + MissionSyncState::SERIALIZED_SIZE];
+    buffer[0] = net::PACKET_MISSION_STATE;
     char* p = buffer + 1;
     net::WriteU16(p, m_clientId);
     state.Serialize(p);
