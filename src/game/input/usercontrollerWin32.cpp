@@ -973,6 +973,8 @@ void UserController::LoadDefaults()
         SetMap( SLOT_PRIMARY, InputManager::MoveRight, KEYBOARD, DIK_D );
         SetMap( SLOT_PRIMARY, InputManager::Jump, KEYBOARD, DIK_SPACE );
         SetMap( SLOT_PRIMARY, InputManager::Sprint, KEYBOARD, DIK_LSHIFT );
+        SetMap( SLOT_PRIMARY, InputManager::DoAction, KEYBOARD, DIK_E );
+        SetMap( SLOT_PRIMARY, InputManager::GetOutCar, KEYBOARD, DIK_F );
 
         SetMap( SLOT_PRIMARY, InputManager::Accelerate, KEYBOARD, DIK_W );
         SetMap( SLOT_PRIMARY, InputManager::Reverse, KEYBOARD, DIK_S );
@@ -992,6 +994,16 @@ void UserController::LoadDefaults()
         SetMap( SLOT_PRIMARY, InputManager::CameraCarRight, KEYBOARD, DIK_NUMPAD6 );
         SetMap( SLOT_PRIMARY, InputManager::CameraCarLookUp, KEYBOARD, DIK_NUMPAD8 );
         SetMap( SLOT_PRIMARY, InputManager::CameraCarLookBack, KEYBOARD, DIK_NUMPAD2 );
+
+        // Arrow-key camera duplicates for keyboards/laptops without a numpad.
+        SetMap( SLOT_PRIMARY, InputManager::CameraLeft, KEYBOARD, DIK_LEFT );
+        SetMap( SLOT_PRIMARY, InputManager::CameraRight, KEYBOARD, DIK_RIGHT );
+        SetMap( SLOT_PRIMARY, InputManager::CameraMoveOut, KEYBOARD, DIK_DOWN );
+        SetMap( SLOT_PRIMARY, InputManager::CameraMoveIn, KEYBOARD, DIK_UP );
+        SetMap( SLOT_PRIMARY, InputManager::CameraCarLeft, KEYBOARD, DIK_LEFT );
+        SetMap( SLOT_PRIMARY, InputManager::CameraCarRight, KEYBOARD, DIK_RIGHT );
+        SetMap( SLOT_PRIMARY, InputManager::CameraCarLookBack, KEYBOARD, DIK_DOWN );
+        SetMap( SLOT_PRIMARY, InputManager::CameraCarLookUp, KEYBOARD, DIK_UP );
     }
 
     SetMap( SLOT_PRIMARY, InputManager::Attack, MOUSE, DIMOFS_BUTTON1 );
