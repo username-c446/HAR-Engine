@@ -82,6 +82,7 @@ public:
     void SetInGameMode( bool ingame );
     void SetInGameOverride( bool override );
     bool IsInGameMode() const { return m_bInGame && !m_bInGameOverride; }
+    void ReapplyInGameMode();
 
 private:
     void SetupInGameMode();

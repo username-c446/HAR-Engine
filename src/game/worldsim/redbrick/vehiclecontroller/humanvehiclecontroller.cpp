@@ -10,6 +10,7 @@
 #include <events/eventdata.h>
 
 #include <main/commandlineoptions.h>
+#include <network/NetworkMatchManager.h>
 
 #if defined(RAD_WIN32)
 #include <input/basedamper.h>
@@ -161,6 +162,13 @@ float HumanVehicleController::GetHorn( void ) const
 
 void HumanVehicleController::Reset( void )
 {
+    // In a networked match a manual vehicle reset (usually bound to Space) would
+    // teleport the client's car and desync everyone, so it is disabled.
+    if( NetworkMatchManager::GetInstance() != NULL &&
+        NetworkMatchManager::GetInstance()->IsInMatch() )
+    {
+        return;
+    }
     if( !mDisableReset )
     {
         Vehicle* vehicle = GetVehicle();

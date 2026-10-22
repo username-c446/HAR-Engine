@@ -306,6 +306,14 @@ void FEMouse::SetInGameOverride( bool override )
     SetupInGameMode();
 }
 
+void FEMouse::ReapplyInGameMode()
+{
+    // SDL drops relative mouse mode when the window loses focus and does not
+    // restore it on regaining focus, which left the mouse "stuck" until an
+    // alt+tab. Re-apply the mode that matches the current in-game state.
+    SetupInGameMode();
+}
+
 void FEMouse::SetupInGameMode()
 {
     bool ingame = m_bInGame && ! m_bInGameOverride;

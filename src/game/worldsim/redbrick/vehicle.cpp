@@ -54,6 +54,7 @@
 #include <worldsim/avatarmanager.h>
 #include <worldsim/avatar.h>
 #include <worldsim/character/character.h>
+#include <network/NetworkMatchManager.h>
 
 
 #include <choreo/puppet.hpp>
@@ -2584,7 +2585,13 @@ void Vehicle::PostSubstepUpdate(float dt)
                 // put it at rest
                 // reset
                 
-                if(GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
+                if( NetworkMatchManager::GetInstance() != NULL &&
+                    NetworkMatchManager::GetInstance()->IsInMatch() )
+                {
+                    // In a network match an automatic on-spot reset would teleport
+                    // the client's car and desync players, so it is disabled.
+                }
+                else if(GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
                 {
                     this->ResetOnSpot(false);                
                 }
@@ -2618,7 +2625,13 @@ void Vehicle::PostSubstepUpdate(float dt)
                 {
                     mStuckOnSideTimer = 0.0f;     /// this is done in the reset anyway, but easier to see like this
                                      
-                    if(GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
+                    if( NetworkMatchManager::GetInstance() != NULL &&
+                        NetworkMatchManager::GetInstance()->IsInMatch() )
+                    {
+                        // Disable the on-side auto reset during a network match to
+                        // avoid teleporting/desyncing the client's car.
+                    }
+                    else if(GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
                     {
                         this->ResetOnSpot(false);                
                     }

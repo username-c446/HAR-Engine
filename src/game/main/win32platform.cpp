@@ -1854,10 +1854,12 @@ int SDLCALL Win32Platform::WndProc( void * userdata, SDL_Event * event )
                         RenderFlow* rf = GetRenderFlow();
 
                         rf->SetGamma( rf->GetGamma() );
+                        // On focus regain SDL does not restore relative mouse mode by
+                        // itself, leaving the mouse unresponsive in gameplay until an
+                        // alt+tab. Re-apply the mode that matches the current state.
                         if( pInputManager )
                         {
-                            //GetInputManager()->SetRumbleForDevice(0, true);
-                            //rDebugPrintf("Force Effects Started!!! \n");
+                            pInputManager->GetFEMouse()->ReapplyInGameMode();
                         }
                     }
                     break;
