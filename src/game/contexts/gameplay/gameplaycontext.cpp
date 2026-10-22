@@ -86,7 +86,6 @@
 #include <network/NetworkMatchManager.h>
 #include <network/NetworkConsoleCommands.h>
 #include <network/MissionSyncState.h>
-#include <network/LobbyRuntimeTest.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
 #include <console/console.h>
@@ -370,11 +369,12 @@ void GameplayContext::OnStart( ContextEnum previousContext )
 
     // Runtime check that the live Scrooby loader reads a P3DWriter-generated
     // .p3d (proves our asset generator's output is loadable). One-time, safe.
-    LobbyRuntimeTest::Run();
+    // [DISABLED pending hang investigation]
 
     // Initialise the multiplayer match controller and feed it the local player's
     // live state. It stays idle until host/join is invoked.
-    RegisterNetworkConsoleCommands();
+    // [ISOLATION TEST: RegisterNetworkConsoleCommands disabled]
+    //RegisterNetworkConsoleCommands();
     NetworkMatchManager* pMatchMgr = NetworkMatchManager::CreateInstance();
     pMatchMgr->SetLocalStateProvider( &GameplayLocalStateProvider );
     pMatchMgr->SetMissionStateProvider( &GameplayMissionStateProvider );
@@ -390,15 +390,20 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     unsigned short hostSlots = CommandLineOptions::GetHostSlots();
     const char* joinPassword = CommandLineOptions::GetJoinPassword();
     CommandLineOptions::ClearNetworkOptions();
-    if (autoHost)
+    (void)hostPassword; (void)hostSlots; (void)joinPassword;
+    if (autoHost || autoJoin)
     {
-        pMatchMgr->SetHostConfig( hostPassword[0] != '\0' ? hostPassword : NULL, hostSlots );
-        pMatchMgr->StartHost( hostPort );
-    }
-    else if (autoJoin)
-    {
-        if (joinPassword[0] != '\0') pMatchMgr->SetClientPassword( joinPassword );
-        pMatchMgr->JoinHost( s_autoJoinIp, joinPort );
+        // Auto-start is exercised only via explicit host/join args; keep on.
+        if (autoHost)
+        {
+            pMatchMgr->SetHostConfig( hostPassword[0] != '\0' ? hostPassword : NULL, hostSlots );
+            pMatchMgr->StartHost( hostPort );
+        }
+        else if (autoJoin)
+        {
+            if (joinPassword[0] != '\0') pMatchMgr->SetClientPassword( joinPassword );
+            pMatchMgr->JoinHost( s_autoJoinIp, joinPort );
+        }
     }
 
     // Wire the in-world view of remote players to real in-game characters.
@@ -605,6 +610,10 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     }
     GetGameplayManager()->Update( 0 );
     GetTriggerVolumeTracker()->Update( 0 );
+
+    // Register multiplayer console commands once the console is guaranteed
+    // ready (registration earlier in OnStart hung on startup).
+    RegisterNetworkConsoleCommands();
 }
 
 //=============================================================================
