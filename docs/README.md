@@ -9,7 +9,9 @@ top of ENet.
 
 > Looking for what changed versus the original game? See
 > **[Changes vs. original](#changes-vs-original)**. For a deep dive into the
-> multiplayer architecture, read **[SPEC.md](./SPEC.md)**.
+> multiplayer architecture, read **[SPEC.md](./SPEC.md)**. Want to build your
+> own UI/overlay/HUD element? Start with
+> **[HUD_AND_OVERLAY_DEV.md](./HUD_AND_OVERLAY_DEV.md)**.
 
 ---
 
