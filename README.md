@@ -1,5 +1,7 @@
 # The Simpsons: Hit & Run (SRR2) — Open-Source Rebuild
 
+> **[Русская версия / Russian version →](README.ru.md)**
+
 This repository contains the source code for _The Simpsons: Hit & Run_ with
 quite a few enhancements to it: C++20 & x64 builds, vcpkg for easier third-party
 library management, UWP builds, and a new **online multiplayer** layer built on
