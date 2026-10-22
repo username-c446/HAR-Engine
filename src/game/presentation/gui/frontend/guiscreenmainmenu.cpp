@@ -1579,12 +1579,14 @@ CGuiScreenMainMenu::EndMultiplayerOverlay()
 
 void CGuiScreenMainMenu::UpdateMpOverlayDisplay()
 {
-    // Show current selection and the typed IP.
+    // Show current selection and the typed value. In HOST mode the field is the
+    // server port (default 3737); in JOIN mode it is the server "ip:port".
     char buf[128];
     const char* mode = (m_mpOverlaySelection == 0) ? "HOST" : "JOIN";
-    const char* ip = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
+    const char* field = (m_mpOverlaySelection == 0) ? "Port (default 3737)" : "Address (ip:port)";
+    const char* value = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
     const char* action = (m_mpOverlaySelection == 0) ? "start" : "connect";
-    sprintf( buf, "MULTIPLAYER %s\nAddress: %s\n[Enter=%s   Esc=back]", mode, ip, action );
+    sprintf( buf, "MULTIPLAYER %s\n%s: %s\n[Enter=%s   Esc=back]", mode, field, value, action );
     if( m_mpOverlayText != NULL )
     {
         m_mpOverlayText->SetString( 0, buf );
