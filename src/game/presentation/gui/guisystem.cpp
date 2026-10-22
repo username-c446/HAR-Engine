@@ -19,6 +19,8 @@
 //===========================================================================
 #include <presentation/gui/guisystem.h>
 #include <presentation/gui/guitextbible.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <presentation/gui/bootup/guimanagerlanguage.h>
 #include <presentation/gui/bootup/guimanagerbootup.h>
 #include <presentation/gui/bootup/guiscreenlanguage.h>
@@ -546,6 +548,43 @@ void CGuiSystem::Update( unsigned int elapsedTime )
         if( m_pManagerInGame != NULL )
         {
             m_pManagerInGame->HandleMessage( GUI_MSG_UPDATE, elapsedTime );
+        }
+    }
+
+    // TEST-HARNESS: automatic front-end driver (disabled by default). Set
+    // SRR2_AUTOMENU=1 to run it. Deterministically presses Select/Back/Down on
+    // a timer so an automated run can sweep the menu and any screen and surface
+    // crashes/crashes without human testing. Intentionally kept (gated off) for
+    // future automated UI tests.
+    if( getenv("SRR2_AUTOMENU") != NULL )
+    {
+        static unsigned int accum = 0;
+        static int phase = 0;       // 0=select, 1=back
+        static int step = 0;
+        static int warmup = 0;
+        accum += elapsedTime;
+        // Defer until the front-end is actually up (avoid clobbering boot/load).
+        if( warmup < 60 )
+        {
+            warmup++;
+        }
+        else if( accum >= 1600 )
+        {
+            accum = 0;
+            FILE* f = fopen( "mp_dbg.log", "a" );
+            if( f ){ fprintf( f, "SYSAUTO step=%d phase=%d\n", step, phase ); fclose(f); }
+            if( phase == 0 )
+            {
+                this->HandleMessage( GUI_MSG_CONTROLLER_SELECT, 0 );
+                phase = 1;
+            }
+            else
+            {
+                this->HandleMessage( GUI_MSG_CONTROLLER_BACK, 0 );
+                this->HandleMessage( GUI_MSG_CONTROLLER_DOWN, 0 );
+                phase = 0;
+                step++;
+            }
         }
     }
 }

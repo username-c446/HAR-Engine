@@ -402,6 +402,25 @@ restarting), not a multiplayer issue.
 
 ---
 
+### Auto UI driver for tests (opt-in)
+`CGuiSystem::Update` (guisystem.cpp) has a built-in **front-end test harness**:
+with `SRR2_AUTOMENU=1` it self-presses `SELECT`/`BACK`/`DOWN` on a timer,
+logging each step to `mp_dbg.log`. Disabled by default (`getenv` == NULL) and
+does not affect gameplay. Purpose: automated menu/screen sweep to surface
+crashes without manual testing. Only enable for debugging; needs a warm-up so it
+fires only after the front-end is up.
+
+### Crash handler vs rAssert (important)
+`CrashHandler` (win32main.cpp) catches access violations (`0xc0000005`) via SEH
+and, through hooks, `abort`/`terminate`/pure-virtual call → writes a stack to
+`crash.log`. **But `rAssert`/`rAssertMsg` do NOT write crash.log**: when they fire
+in Debug, `rDebugAssertFail_Implementation` (radcore raddebug/debug.cpp) calls
+`exit(-10)` on Abort — that is neither SEH nor our hooks, so no stack is dumped
+(only console text). Gap: rAssert asserts are never dumped. If needed, hook the
+Abort branch of the assert to write `crash.log`.
+
+---
+
 ## 16. Rule for the future
 
 **Before and during any development, consult this document.** If a feature is
