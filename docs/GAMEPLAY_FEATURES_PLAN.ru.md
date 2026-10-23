@@ -8,8 +8,11 @@
 > Принцип проекта: «код без обязательных ассетов» — деградация вместо краха.
 > Поэтому всё ниже реализовано так, чтобы работало и без анимаций.
 >
-> **Reference:** `https://github.com/CelestialAddy/SHR-InfoDumps` — документация
-> по TS:H&R (скрипты, авто, трафик, звук); детали — §9.
+> **Reference:**
+> - `https://github.com/CelestialAddy/SHR-InfoDumps` — документация по TS:H&R
+>   (скрипты, авто, трафик, звук); детали — §9.
+> - `https://github.com/donutteam/shar-crash-analyser` — анализатор крэш-дампов
+>   (DBGENG + символы); детали — §10.
 
 ---
 
@@ -198,3 +201,36 @@
   (`.rsd`) и музыка — если трогаем звук/уведомления.
 
 Как вернуться: ссылка выше; локальная копия в `%TEMP%\gigatool\SHR-InfoDumps\InfoDumps`.
+
+---
+
+## 10. Reference: SHARCrashAnalyser (donutteam)
+
+> **Источник:** `https://github.com/donutteam/shar-crash-analyser`
+> (GPL-3.0; «A tool to analyse The Simpsons: Hit and Run crash dumps»; powered by
+> DBGENG/WinDbg + CSV символов). Локальная копия: `%TEMP%\gigatool\shar-crash-analyser`.
+
+**Суть:** открывает крэш-дамп SHAR, через **DBGENG API** (`IDebugClient`/Control,
+`GetStackTraceEx`) берёт стек (`DEBUG_STACK_FRAME_EX[100]`), мапит адреса фреймов
+через `Symbols/shar_symbols.csv` → читаемый trace. CLI (`--nogui`) + GUI (WinForms,
+.NET 4.8.1).
+
+**Полезное для нас:**
+- **`Symbols/shar_symbols.csv`** (651 KB, 17107 записей) — база адрес→имя функций
+  **оригинального SRR2.exe** (частично реконструирована по Ghidra: `cls_0x…`,
+  `FUN_…`). У нас адреса другие + есть собственные PDB (DebugWindows), поэтому
+  точно мапить стек НЕЛЬЗЯ, но CSV — словарь логики ванильного движка для
+  сопоставлений/RE.
+- **Подход DBGENG вместо ручного `cdb -cz "~* kb"`** — мы раньше анализировали
+  вис/краши через cdb вручную (он убивал процесс при attach). Улучшение: мини-
+  утилита на DBGENG, которая открывает дамп/attach, тянет `GetStackTraceEx` и
+  резолвит по **нашим** PDB — стабильнее ручного cdb.
+- **CLI-флаг `-h/--hacks <PDB path>`** — подмешивает PDB хаков; у нас можно
+  аналогично подать наши PDB.
+
+**Лицензия GPL-3.0:** код использовать как reference/идеи, не копировать целиком
+в другой-лицензионный проект без последствий.
+
+**Предложение (план):** отдельный пункт «написать DBGENG-анализатор стеков под
+нашу пересборку» — резолв наших PDB для быстрой диагностики крашей/висов
+(в т.ч. сплэш-виса при фоновом старте, что мешал весь проект).
