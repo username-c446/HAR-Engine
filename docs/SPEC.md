@@ -1,5 +1,7 @@
 # HAR-Engine — Networking Layer Specification
 
+> [🇷🇺 Russian version](SPEC.ru.md)
+
 > **Status:** living document. Update and consult it during every development
 > cycle, so you never create duplicate functionality. Mark implemented features
 > and describe new function relationships as they appear.

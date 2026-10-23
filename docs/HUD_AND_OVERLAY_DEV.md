@@ -2,7 +2,7 @@
 
 > **Status:** experience documentation from the team/assistant — how to add and
 > edit interface elements (overlay/HUD) in the engine, where it usually
-> breaks, and how to fix it. English version; Russian — `HUD_AND_OVERLAY_DEV.ru.md`.
+> breaks, and how to fix it. English version; Russian — [🇷🇺 `HUD_AND_OVERLAY_DEV.ru.md`](HUD_AND_OVERLAY_DEV.ru.md).
 >
 > See also `SPEC.md` (sections §14–16) and `README.md`.
 
