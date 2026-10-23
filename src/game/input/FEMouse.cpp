@@ -101,7 +101,22 @@ void FEMouse::Update()
     bool bLoading = (GetGameFlow()->GetCurrentContext() == CONTEXT_LOADING_GAMEPLAY) ||
                     (GetGameFlow()->GetCurrentContext() == CONTEXT_LOADING_SUPERSPRINT) ||
                     (GetGameFlow()->GetCurrentContext() == CONTEXT_EXIT);
-    if( ingame || bLoading ) return;
+
+    // Keep relative mouse mode assertively enabled during gameplay. Various
+    // transitions (entering/exiting a vehicle, camera changes, focus switches)
+    // can let SDL drop relative mode, which leaves the mouse unresponsive in
+    //-game until an alt+tab. Re-asserting each frame is a cheap no-op when the
+    // mode is already set and fixes the condition regardless of what dropped it.
+    // Note: we deliberately do NOT call SetupInGameMode() here because it warps
+    // the cursor to the window centre every frame, which fights mouse look.
+    if( ingame )
+    {
+        m_pCursor->SetVisible( false );
+        SDL_SetRelativeMouseMode( SDL_TRUE );
+        return;
+    }
+
+    if( bLoading ) return;
     if( !m_pCursor->IsVisible() ) return;
 
     CGuiWindow* pCurrentWindow = GetGuiSystem()->GetCurrentManager()->GetCurrentWindow();

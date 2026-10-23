@@ -389,6 +389,22 @@ void InCar::Update( float timeins )
                         break;
                     }
 
+                    // Bail out immediately at speed instead of idling/braking and
+                    // waiting for the car to nearly stop. Action is held (F down).
+                    if ( pVehicle->GetSpeedKmh() > 12.0f && !pVehicle->IsAirborn() )
+                    {
+                        mpCharacter->GetTargetVehicle()->mGeometryVehicle->HideBrakeLights();
+                        HumanVehicleController* uc = static_cast<HumanVehicleController*>(GetVehicleCentral()->GetVehicleController(GetVehicleCentral()->GetVehicleId(pVehicle)));
+                        if(uc)
+                        {
+                            uc->GetMappable()->GetButton(VehicleMappable::Gas)->SetValue(0.0f);
+                            uc->GetMappable()->GetButton(VehicleMappable::Brake)->SetValue(0.0f);
+                            uc->GetMappable()->GetButton(VehicleMappable::HandBrake)->SetValue(0.0f);
+                        }
+                        mpCharacter->GetStateManager()->SetState<CharacterAi::GetOut>();
+                        return;
+                    }
+
                     if ( pVehicle->GetSpeedKmh() < 30.0f && 
                          !pVehicle->IsUnstable() &&
                          !pVehicle->IsAirborn() )
@@ -402,6 +418,25 @@ void InCar::Update( float timeins )
 
             case GETOUT_COMITTED :
                 {
+                    // Jump out while the car is still moving instead of waiting
+                    // to fully stop. The character exits immediately and keeps
+                    // its momentum (and the car keeps moving), like a GTA bail.
+                    if ( pVehicle->GetSpeedKmh() > 12.0f && !pVehicle->IsAirborn() )
+                    {
+                        mpCharacter->GetTargetVehicle()->mGeometryVehicle->HideBrakeLights();
+                        HumanVehicleController* uc = static_cast<HumanVehicleController*>(GetVehicleCentral()->GetVehicleController(GetVehicleCentral()->GetVehicleId(pVehicle)));
+                        if(uc)
+                        {
+                            uc->GetMappable()->GetButton(VehicleMappable::Gas)->SetValue(0.0f);
+                            uc->GetMappable()->GetButton(VehicleMappable::Brake)->SetValue(0.0f);
+                            uc->GetMappable()->GetButton(VehicleMappable::HandBrake)->SetValue(0.0f);
+                        }
+                        // GetOut::Enter reads the current speed and bails out with
+                        // the character keeping its momentum (car keeps moving).
+                        mpCharacter->GetStateManager()->SetState<CharacterAi::GetOut>();
+                        return;
+                    }
+
                     if ( pVehicle->GetSpeedKmh() < 3.0f )
                     {
                         mpCharacter->GetActionController()->Clear();
@@ -936,6 +971,25 @@ void GetIn::Enter( void )
         }
 
         Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
+
+        // Carjacking: if the car has an NPC driver and the player is the one
+        // getting in, eject the driver (walk him out of the car) and claim the
+        // driver's seat instead of sitting as a passenger. This mirrors how
+        // SetupDriver removes an NPC driver when the player takes over.
+        if( mpCharacter == GetCharacterManager()->GetCharacter(0) &&
+            mpCharacter->GetTargetVehicle()->HasDriver() &&
+            mpCharacter->GetTargetVehicle()->GetDriver() != NULL &&
+            mpCharacter->GetTargetVehicle()->GetDriver() != mpCharacter )
+        {
+            Character* npcDriver = mpCharacter->GetTargetVehicle()->GetDriver();
+            if( npcDriver->GetRole() != Character::ROLE_PEDESTRIAN )
+            {
+                npcDriver->SetTargetVehicle( NULL );
+                GetCharacterManager()->RemoveCharacter( npcDriver );
+                mpCharacter->GetTargetVehicle()->SetDriver( NULL );
+            }
+        }
+
         bool isDriver = mpCharacter->GetTargetVehicle()->HasDriver() ? false : true;
         Vehicle::Door door = (isDriver && !slide) ? Vehicle::DOOR_DRIVER : Vehicle::DOOR_PASSENGER;
         Action* pAction = 0;
@@ -1336,7 +1390,8 @@ GetOut::GetOut( Character* pCharacter )
 State( pCharacter ),
 mObstructed(false),
 mFirst(true),
-mPanic(false)
+mPanic(false),
+mSpeedBail(false)
 {
 }
 
@@ -1347,6 +1402,14 @@ GetOut::~GetOut( void )
 void GetOut::Enter( void )
 {
     bool destroyed = !mpCharacter->GetTargetVehicle() || mpCharacter->GetTargetVehicle()->mVehicleDestroyed;
+
+    // Jumping out at speed: character exits immediately and keeps momentum
+    // while the car keeps moving, instead of the slow "stop, open door, step
+    // out" path.
+    mSpeedBail = ( mpCharacter->GetTargetVehicle() != NULL ) &&
+                 !mpCharacter->GetTargetVehicle()->mVehicleDestroyed &&
+                 ( mpCharacter->GetTargetVehicle()->GetSpeedKmh() > 12.0f );
+
     bool iris = !destroyed && (mObstructed || mpCharacter->GetTargetVehicle()->mIrisTransition);
 
     if(mFirst)
@@ -1546,6 +1609,43 @@ void GetOut::DoGetOut( void )
     }
 
     Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
+
+    // Bail out at speed: leave the car instantly, keep the character's forward
+    // momentum (and let the car keep moving), no door choreography and no iris.
+    if( mSpeedBail && mpCharacter->GetTargetVehicle() != NULL )
+    {
+        mpCharacter->AddToWorldScene();
+        mpCharacter->SetScale(1.0f);
+
+        // Place the character next to the driver's door, then throw them forward
+        // with the car's current speed so they tumble on inertia while the car
+        // coasts.
+        rmt::Vector seat = mpCharacter->GetTargetVehicle()->GetDriverLocation();
+
+        rmt::Vector facing = mpCharacter->GetTargetVehicle()->GetFacing();
+        facing.y = 0.0f;
+        facing.Normalize();
+        // Convert the car's heading into the character-facing angleradians.
+        float fDir = rmt::ATan2( facing.x, facing.z );
+        mpCharacter->SetFacingDir( fDir );
+        // SetSpeed uses the facing vector (scaled), so push the character along
+        // its own (newly set) heading at the car's current speed.
+        float speedMps = mpCharacter->GetTargetVehicle()->GetSpeedKmh() / 3.6f;
+        mpCharacter->SetSpeed( speedMps );
+
+        pSeq->BeginSequence();
+        pSeq->AddAction( new Position(mpCharacter, seat, 0.0f, true));
+        pSeq->AddAction( new GroundSnap(mpCharacter) );
+        pSeq->AddAction( new ChangeLocomotion(mpCharacter, ChangeLocomotion::WALKING) );
+        pSeq->AddAction( new DodgeAction(mpCharacter) );
+        pSeq->AddAction( new ChangeState<CharacterAi::Loco>(mpCharacter));
+        pSeq->AddAction( new TriggerEventAction(EVENT_GETOUTOFVEHICLE_END, mpCharacter));
+        pSeq->EndSequence( );
+
+        mpCharacter->GetTargetVehicle()->SetDriver(NULL);
+        mpCharacter->GetTargetVehicle()->UpdateDoorState();
+        return;
+    }
 
     if(mPanic)
     {

@@ -974,6 +974,7 @@ void UserController::LoadDefaults()
         SetMap( SLOT_PRIMARY, InputManager::Jump, KEYBOARD, DIK_SPACE );
         SetMap( SLOT_PRIMARY, InputManager::Sprint, KEYBOARD, DIK_LSHIFT );
         SetMap( SLOT_PRIMARY, InputManager::DoAction, KEYBOARD, DIK_E );
+        SetMap( SLOT_PRIMARY, InputManager::Attack, KEYBOARD, DIK_F );
         SetMap( SLOT_PRIMARY, InputManager::GetOutCar, KEYBOARD, DIK_F );
 
         SetMap( SLOT_PRIMARY, InputManager::Accelerate, KEYBOARD, DIK_W );
@@ -1182,15 +1183,20 @@ void UserController::LoadConfig( ConfigString& config )
         }
     }
 
-    // The keyboard defaults for the primary controller (E=DoAction, F=GetOutCar)
+    // The keyboard defaults for the primary controller
+    // (E=DoAction, F=Attack, F=GetOutCar)
     // may be missing from configs saved before these bindings existed. Restore
-    // them here so interaction/exit-from-car always have a keyboard binding,
+    // them here so interaction/kick/exit-from-car always have a keyboard binding,
     // without overriding any explicit user remap.
     if( m_controllerId == 0 )
     {
         if( m_pController[KEYBOARD]->GetMap( DIK_E, DIR_UP, MAP_CHARACTER ) == Input::INVALID_CONTROLLERID )
         {
             SetMap( SLOT_PRIMARY, InputManager::DoAction, KEYBOARD, DIK_E );
+        }
+        if( m_pController[KEYBOARD]->GetMap( DIK_F, DIR_UP, MAP_CHARACTER ) == Input::INVALID_CONTROLLERID )
+        {
+            SetMap( SLOT_PRIMARY, InputManager::Attack, KEYBOARD, DIK_F );
         }
         if( m_pController[KEYBOARD]->GetMap( DIK_F, DIR_UP, MAP_VEHICLE ) == Input::INVALID_CONTROLLERID )
         {

@@ -1549,7 +1549,7 @@ CGuiScreenMainMenu::StartMultiplayerOverlay()
             overlayText->SetBoundingBoxSize( 720, 160 );
             overlayText->SetHorizontalJustification( Scrooby::Centre );
             overlayText->SetVerticalJustification( Scrooby::Centre );
-            overlayText->SetPositionOfCenter( 400, 240 );
+            overlayText->SetPositionOfCenter( 400, 285 );
         }
     }
     if( overlayText == NULL ) return;
@@ -1586,7 +1586,7 @@ void CGuiScreenMainMenu::UpdateMpOverlayDisplay()
     const char* field = (m_mpOverlaySelection == 0) ? "Port (default 3737)" : "Address (ip:port)";
     const char* value = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
     const char* action = (m_mpOverlaySelection == 0) ? "start" : "connect";
-    sprintf( buf, "MULTIPLAYER %s\n%s: %s\n[Enter=%s   Esc=back]", mode, field, value, action );
+    sprintf( buf, "MULTIPLAYER %s\n%s: %s\n[Enter=%s | Esc=back]\n[Up/Down: switch to %s]", mode, field, value, action, (m_mpOverlaySelection == 0) ? "JOIN" : "HOST" );
     if( m_mpOverlayText != NULL )
     {
         m_mpOverlayText->SetString( 0, buf );

@@ -226,6 +226,7 @@ protected:
     bool mObstructed : 1;
     bool mFirst      : 1;
     bool mPanic      : 1;
+    bool mSpeedBail  : 1;   // jumping out while the car is still moving
 };
 
 }; // end of namespace
