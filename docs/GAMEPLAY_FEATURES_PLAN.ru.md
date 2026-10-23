@@ -13,6 +13,9 @@
 >   (скрипты, авто, трафик, звук); детали — §9.
 > - `https://github.com/donutteam/shar-crash-analyser` — анализатор крэш-дампов
 >   (DBGENG + символы); детали — §10.
+> - Репо SHAR-экосистемы (pure3d-ts, p3d-merge, SHARCarPhysicsObjectGenerator,
+>   shar-mp-companion, springfield-after-hours-toolkit, lucas-mod-launcher-lua) —
+>   §11; совместимость с Lucas' Mod Launcher (LML + Multiplayer-хак) — §12.
 
 ---
 
@@ -234,3 +237,87 @@
 **Предложение (план):** отдельный пункт «написать DBGENG-анализатор стеков под
 нашу пересборку» — резолв наших PDB для быстрой диагностики крашей/висов
 (в т.ч. сплэш-виса при фоновом старте, что мешал весь проект).
+
+---
+
+## 11. Reference: ещё шесть репозиториев SHAR-экосистемы
+
+По приоритету для нашей пересборки:
+
+1. **shar-mp-companion** (`https://github.com/donutteam/shar-mp-companion`) — Lua-
+   мод-компаньон для SHAR MP Server: `Main.lua` + `commands/` (ban/kick/login/
+   register/teleport/position/whois/countdown) + `events/PlayerJoined.lua`.
+   **Эталон архитектуры «серверные Lua-моды»** (entry-point, команды/события,
+   аккаунты, банлисты). Брать как каркас для наших серверных модов.
+2. **pure3d-ts** (`https://github.com/donutteam/pure3d-ts`, MIT) — TS-библиотека
+   чтения/записи Pure3D (`@donutteam/pure3d`). **Каноническая спецификация чанков
+   .p3d**: структуры, порядок полей, little/big-endian reader/writer, ChunkRegistry.
+   Сверять с нашим P3DWriter / chunkids.hpp.
+3. **p3d-merge** (`https://github.com/donutteam/p3d-merge`) — CLI слияния .p3d (C#).
+   Флаги `-sort` (порядок чанков Texture→Shader, как требует SHAR), `-dedupe`,
+   `-nohistory`. Спецификация «как правильно собрать/объединить .p3d».
+4. **SHARCarPhysicsObjectGenerator** (`https://github.com/Hampo/SHARCarPhysicsObjectGenerator`,
+   MIT) — CLI (C#/.NET, NetP3DLib) генерирует **PhysicsObject-чанки** авто .p3d
+   (масса/инерция/коллизии; чанки `PhysicsObject 0x7011000`, `PhysicsInertiaMatrix
+   0x7011001`). Эталон для физики машин (инерция/угон/выпрыгивание).
+5. **springfield-after-hours-toolkit** (`https://github.com/22500107Zc/springfield-after-hours-toolkit`,
+   MIT) — офлайн-тулкит (Node/TS) для подготовки модов: YAML→Lua-компилятор
+   миссий, реестр команд `Game.*`, генерация LuaLS-дефинишенов, MCP-обвязка.
+   Образец методологии Lua-модов; не встраивается (TS).
+6. **lucas-mod-launcher-lua** (`https://github.com/donutteam/lucas-mod-launcher-lua`,
+   MIT) — LuaL-дефинишены для клиентского Mod Launcher (Custom Files Lua Functions).
+   Образец `.meta.lua`-формата для автокомплита серверных Lua-функций.
+
+**Важно:** сетевой транспорт/ENet нигде из этих репо не раскрыт — это Lua-логика
+и .p3d-обработка. Транспорт сетевого протокола остаётся проектировать самим
+(ориентир — SHAR MP Server).
+
+---
+
+## 12. Совместимость с Lucas' Simpsons Hit & Run Mod Launcher (LML)
+
+> **Цель (запрос пользователя):** не переизобретать моды с нуля — нужна
+> совместимость с существующим мод-лаунчером для оригинальной игры, чтобы
+> можно было подключать к нашей пересборке готовые моды сообщества.
+
+### Что такое LML
+**Lucas' Simpsons Hit & Run Mod Launcher** (`docs.donutteam.com/docs/LucasSimpsonsHitAndRunModLauncher`)
+— лаунчер для запуска модов с оригинальной PC-версией игры. Скачивается с Mod
+Bakery (`modbakery.donutteam.com`, проект view/6). Формат модов `lmlm`/структура:
+`Meta.ini`, `CustomFiles.ini`, `CustomFiles.lua`, замены ресурсов (в т.ч. .p3d).
+Мод накладывается на оригинальный SRR2.exe без его модификации (хаки LML
+patched через DLL/хуки).
+
+### Мультиплеер уже есть в LML (хаMultiplayer Beta)
+Включён с **LML 1.27**, «Multiplayer (Beta)» хак (Mods List после Hacks):
+- **Настройки**: Server Name, Name Colour, **Host** (127.0.0.1), **Port** (7777),
+  Server Password, Low Bandwidth.
+- **Keybinds UI**: U=name tags, I=vehicle tags, X=player list (удерж.), F10=full map,
+  T=chat.
+- **Keybinds gameplay**: . / = prev/next character model; Y=mission radar icon; G=spawn explosion.
+- **Mutators**: Allow Explosions, Cops and Robbers (мигает полицейский радар).
+- **Нет встроенного сервера** — клиент подключается к **SHAR MP Server** (отдельный
+  self-hostable софт; конфиг, CLI, Lua-скрипты/API). Протокол централизованный:
+  клиент↔сервер, сервер ретранслирует события (взрывы, радар-иконки, чат,
+  name/role) между игроками одного уровня.
+- Конфиг хака из мода — `Multiplayer.xml` (напр. `<DebugCharacter Model=... AnimationSet=...>`).
+
+### Что это значит для нашей пересборки (план совместимости)
+- **Основная цель:** наш движок должен принимать **готовые моды LML-экосистемы**,
+  чтобы не переизобретать их. Минимум — совместимость с форматом модов
+  (метаданные + кастомные файлы/скрипты + подмена ресурсов .p3d).
+- **Наш мультиплеер vs LML Multiplayer-hack:** у нас свой ENet-стек. Нужно решить:
+  либо (а) реализовать совместимость с SHAR MP Server-протоколом, чтобы наш клиент
+  умел заходить на те же серверы/моды, либо (б) наш сервер должен говорить на
+  том же формате команд/событий (бан/логин/чат), что и SHAR MP — чтобы моды-
+  компаньоны (`shar-mp-companion`, §11) работали без переписи.
+- **Проверить:** как LML накладывает хаки (DLL-инъекции/патчи) — наша пересборка
+  собственный .exe, поэтому хаки LML вряд ли совместимы напрямую; но **формат модов
+  (.p3d-замены, Lua Custom Files, Meta.ini) переносим** в наш ассет-пайплайн.
+- **Ориентир для сети:** доки SHAR MP Server — LuaScripting, Lua API, события,
+  `Player.SendGameChatMessage`, `SendGameExplosion`, `SendGameResync`,
+  `SendCreateMissionRadarIcon` (см. `docs.donutteam.com/.../SimpsonsHitAndRunMultiplayerServer`).
+
+**Приоритет:** 1) совместимость формата модов LML (p3d-замены + Custom Files Lua);
+2) сетевой протокол/команды — стыковка с SHAR MP Server-экосистемой, чтобы
+моды-компаньоны работали.
