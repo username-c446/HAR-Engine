@@ -49,6 +49,11 @@
 #include <events/eventmanager.h>
 #include <gameflow/gameflow.h>
 
+#include <choreo/locomotion.hpp>
+#include <ai/sequencer/action.h>
+#include <ai/sequencer/actioncontroller.h>
+#include <ai/sequencer/sequencer.h>
+
 #include <data/gamedatamanager.h>
 
 #include <interiors/interiormanager.h>
@@ -141,6 +146,23 @@ namespace
 
         outState.inVehicle = avatar->IsInCar() ? 1 : 0;
 
+        // Carry animation/prediction flags so the receiver knows when NOT to
+        // smooth our trajectory (e.g. while airborne / jumping, smoothing the
+        // vertical arc produces the "bouncy rubber-band" artifact).
+        outState.flags = 0;
+        Character* pChar = avatar->GetCharacter();
+        if ( pChar != NULL )
+        {
+            if ( pChar->IsJumping() )
+            {
+                outState.flags |= PlayerNetworkState::FLAG_JUMPING;
+            }
+            if ( pChar->GetLocoVelocity().y > 0.01f || pChar->GetLocoVelocity().y < -0.01f )
+            {
+                outState.flags |= PlayerNetworkState::FLAG_IN_AIR;
+            }
+        }
+
         Vehicle* vehicle = avatar->GetVehicle();
         if (outState.inVehicle && vehicle != NULL)
         {
@@ -201,6 +223,18 @@ namespace
         sprintf( name, "mp_remote_%d", playerId );
         Character* c = GetCharacterManager()->AddCharacter(
             CharacterManager::NPC, name, "homer", "npd", NULL );
+        if ( c == NULL ) return NULL;
+        // AddCharacter does NOT put NPCs into the world scene (only PCs get
+        // AddToWorldScene there), so an NPC would exist but never render.
+        // Also, an NPC in its default state is static: locomotion is not driven
+        // so the skeleton stays in the bind pose (the "T pose"). Put it into the
+        // LOCO state so its walk/jump locomotion drivers run and animate it.
+        c->AddToWorldScene();
+        CharacterAi::StateManager* sm = c->GetStateManager();
+        if ( sm != NULL && sm->GetState() != CharacterAi::LOCO )
+        {
+            sm->SetState<CharacterAi::Loco>();
+        }
         return c;
     }
 
@@ -210,7 +244,45 @@ namespace
         Character* c = static_cast<Character*>( handle );
         if ( c == NULL ) return;
         rmt::Vector pos( state.x, state.y, state.z );
-        c->SetPosition( pos );
+
+// Drive locomotion so the remote character animates (walks/runs) rather
+        // than sliding in the bind pose. StateManager::Update / the action
+        // controller only run for NPCs when they are inside someone's frustum
+        // and even then only intermittently, so we cannot rely on
+        // WalkerLocomotionAction::DoSimulation to apply a desired speed. Instead
+        // feed the locomotion DRIVER directly (exactly what DoSimulation does),
+        // and let UpdatePuppet()->Advance() (run in PostSimUpdate for NPCs) turn
+        // that into a walk/run animation.
+        if ( c->GetStateManager() != NULL && c->GetStateManager()->GetState() == CharacterAi::LOCO )
+        {
+            choreo::LocomotionDriver* driver =
+                c->GetWalkerLocomotionAction()->GetDriver();
+            if ( driver != NULL )
+            {
+                rmt::Vector cur;
+                c->GetPosition( &cur );
+                rmt::Vector delta = pos - cur;
+                float horizDist = sqrtf( delta.x * delta.x + delta.z * delta.z );
+                float speed = ( horizDist > 0.05f ) ? ( horizDist * 8.0f ) : 0.0f;
+
+                driver->SetDesiredFacingAngle( state.rotY );
+                driver->SetDesiredMotionAngle( state.rotY );
+                driver->SetDesiredVelocity( speed );
+                c->SetFacingDir( state.rotY );
+                c->SetDesiredDir( state.rotY );
+            }
+        }
+
+        // Snap the world position only when the locomotion position drifts too
+        // far from the authoritative network position (otherwise we fight the
+        // locomotion every frame and cause jitter).
+        rmt::Vector cur;
+        c->GetPosition( &cur );
+        rmt::Vector delta = pos - cur;
+        if ( delta.MagnitudeSqr() > 1.0f )
+        {
+            c->SetPosition( pos );
+        }
     }
 
     void RemotePlayerDespawn( int playerId, void* handle )
@@ -219,6 +291,25 @@ namespace
         Character* c = static_cast<Character*>( handle );
         if ( c == NULL ) return;
         GetCharacterManager()->RemoveCharacter( c );
+    }
+
+    // The remote player started a jump (rising edge of FLAG_JUMPING): play the
+    // skeletal jump animation once, exactly as the local player's Loco state
+    // does, so the remote character visibly jumps instead of just snapping up.
+    void RemotePlayerJump( int playerId, void* handle )
+    {
+        (void)playerId;
+        Character* c = static_cast<Character*>( handle );
+        if ( c == NULL ) return;
+        if ( c->GetStateManager() == NULL || c->GetStateManager()->GetState() != CharacterAi::LOCO ) return;
+
+        JumpAction* jump = c->GetJumpLocomotionAction();
+        if ( jump == NULL ) return;
+        jump->Reset( CharacterTune::sfJumpHeight, false );
+        c->GetWalkerLocomotionAction()->StopDriver();
+        c->GetActionController()->GetNextSequencer()->BeginSequence();
+        c->GetActionController()->GetNextSequencer()->AddAction( jump );
+        c->GetActionController()->GetNextSequencer()->EndSequence();
     }
 
     // Ghost-vehicle sink: mirrors a remote driver's machine in the world.
@@ -410,6 +501,7 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     RemotePlayerWorldView::Sink sink;
     sink.spawn = &RemotePlayerSpawn;
     sink.move = &RemotePlayerMove;
+    sink.jump = &RemotePlayerJump;
     sink.despawn = &RemotePlayerDespawn;
     GetRemotePlayerWorldView()->SetSink( sink );
 
@@ -640,10 +732,13 @@ void GameplayContext::OnStop( ContextEnum nextContext )
     GetInputManager()->ToggleRumble( false );
 
 
-    // Disconnect any active online match when leaving gameplay.
+    // Disconnect any active online match when leaving gameplay — but NOT when
+    // we are only pausing (ESC opens the Pause context, then returns to
+    // gameplay). Tearing down the match on pause made one client stop seeing
+    // the other after the pause menu was closed.
     //
     NetworkMatchManager* pMatch = NetworkMatchManager::GetInstance();
-    if ( pMatch != NULL && pMatch->IsInMatch() )
+    if ( pMatch != NULL && pMatch->IsInMatch() && nextContext != CONTEXT_PAUSE )
     {
         pMatch->Leave();
     }
@@ -805,7 +900,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
         GetRemoteVehicleWorldView()->Update( elapsedTime );
 
         // Surface join/leave notifications as console messages.
-        std::vector<NetworkClient::JoinLeaveEvent> events;
+        std::vector<NetworkMatchManager::JoinLeaveEvent> events;
         pMatch->DrainJoinLeaveEvents( events );
         for ( size_t i = 0; i < events.size(); ++i )
         {

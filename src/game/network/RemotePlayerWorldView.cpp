@@ -53,6 +53,7 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
         entry.targetY = entry.visualY = state.y;
         entry.targetZ = entry.visualZ = state.z;
         entry.smoothingApplied = false;
+        entry.jumping = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
         m_entries[playerId] = entry;
         if (m_sink.move) m_sink.move(playerId, handle, state);
         return;
@@ -62,10 +63,18 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
     // the visual representation is driven by Update() so a packet with the same
     // position does not produce stutter.
     Entry& entry = it->second;
+    bool jumpingNow = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
+    // Rising edge of a jump: fire the animation callback once so the receiver
+    // can play the skeletal jump (not merely snap the height).
+    if ( jumpingNow && !entry.jumping && m_sink.jump )
+    {
+        m_sink.jump(playerId, entry.handle);
+    }
     entry.targetX = state.x;
     entry.targetY = state.y;
     entry.targetZ = state.z;
     entry.smoothingApplied = false;
+    entry.jumping = jumpingNow;
 }
 
 void RemotePlayerWorldView::Update(float dt)
@@ -82,9 +91,21 @@ void RemotePlayerWorldView::Update(float dt)
         Entry& entry = kv.second;
         if (entry.smoothingApplied) continue;
 
-        entry.visualX += (entry.targetX - entry.visualX) * alpha;
-        entry.visualY += (entry.targetY - entry.visualY) * alpha;
-        entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
+        // While the remote player is jumping / airborne, do NOT smooth the
+        // vertical axis: interpolation through the arc looks like rubber-banding.
+        // Snap the height instantly and only smooth the horizontal plane.
+        if (entry.jumping)
+        {
+            entry.visualY = entry.targetY;
+            entry.visualX += (entry.targetX - entry.visualX) * alpha;
+            entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
+        }
+        else
+        {
+            entry.visualX += (entry.targetX - entry.visualX) * alpha;
+            entry.visualY += (entry.targetY - entry.visualY) * alpha;
+            entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
+        }
         entry.smoothingApplied = true;
 
         if (m_sink.move)

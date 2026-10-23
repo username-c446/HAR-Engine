@@ -12,7 +12,7 @@ void PlayerNetworkState::Serialize(char* buffer) const
     net::WriteU32(p, static_cast<uint32_t>(netVehicleId));
     net::WriteFloat(p, vehicleSpeed);
     *p++ = inVehicle;
-    *p++ = padding;
+    *p++ = flags;
 }
 
 void PlayerNetworkState::Deserialize(const char* buffer)
@@ -26,5 +26,5 @@ void PlayerNetworkState::Deserialize(const char* buffer)
     netVehicleId = static_cast<int32_t>(net::ReadU32(p));
     vehicleSpeed = net::ReadFloat(p);
     inVehicle = static_cast<uint8_t>(*p++);
-    padding = static_cast<uint8_t>(*p++);
+    flags = static_cast<uint8_t>(*p++);
 }

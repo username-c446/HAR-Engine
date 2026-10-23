@@ -30,6 +30,7 @@
 #include <radplatform.hpp>
 #include <radobjectlist.hpp>
 #include <radtime.hpp>
+#include <radthread.hpp>
 #include <radstring.hpp>
 #include <radmemorymonitor.hpp>
 #include <directinputcontroller.hpp>
@@ -2015,10 +2016,24 @@ class radControllerDirectInput
 						// have been set.  We can acquire the device...
 						//
 
+                        // Acquiring a DI device fails with
+                        // DIERR_OTHERAPPHASPRIO while our window does not have
+                        // input focus (e.g. when the game is launched in the
+                        // background). The original code spun here forever
+                        // (diagnosed as "splash-screen hang: CPU 100%,
+                        // Responding=False, stuck before the menu") because
+                        // Acquire() keeps returning that error until the window
+                        // gains focus. Bound the retries and yield between them
+                        // so the process does not busy-wait and actually reaches
+                        // the menu; the device is re-acquired on focus/poll.
+                        int acquireTries = 0;
                         do
                         {
     						hr = m_xIDirectInputDevice8->Acquire( );
-                        }while (DIERR_OTHERAPPHASPRIO == hr);
+                            if ( DIERR_OTHERAPPHASPRIO != hr ) break;
+                            ::radThreadSleep( 16 );
+                            ++acquireTries;
+                        } while ( acquireTries < 150 );   // ~2.4s max, then proceed
 
                         rWarningMsg( SUCCEEDED( hr ), "radControllerDirectInput: Could not acquire device" );
 

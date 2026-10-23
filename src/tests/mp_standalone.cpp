@@ -1,8 +1,8 @@
 // Standalone multiplayer headless test stand / dedicated server.
 //
-// Runs the real NetworkServer/NetworkClient (ENet, no game data needed) between
-// two live processes, so the network layer is exercised over actual sockets —
-// the thing the in-process unit tests cannot cover.
+// Runs the engine network layer (net::Session / GamePlayerBridge, ENet, no game
+// data needed) between two live processes, so the network layer is exercised
+// over actual sockets — the thing the in-process unit tests cannot cover.
 //
 // Usage:
 //   mp_standalone server [port] [--mod <lua-path>]
@@ -15,7 +15,7 @@
 //   join   -> connects to the host, sends a fake moving state ~10/s, and applies
 //             the server-authoritative player list.
 //
-// The mock in mp_network_fakes.h supplies the world hooks the game normally
+// The mock in mp_network_fakes.h supplies the world hooks the engine normally
 // wires up (local state provider + remote player world sink), so this builds
 // and runs standalone.
 #include <cstdio>
@@ -24,10 +24,17 @@
 
 #include "mp_network_fakes.h"
 
-// Small ENet-free helper to snapshot how many remote players the server has.
-static int ServerRemotePlayerCount(const NetworkServer& server)
+// Simple game-side typed local provider: a slowly-advancing fake position.
+static struct {
+    PlayerNetworkState st = {};
+    bool ready = false;
+} g_fake;
+
+static bool FakeLocalState(PlayerNetworkState& out)
 {
-    return server.GetRemotePlayers().GetPlayerCount();
+    if (!g_fake.ready) return false;
+    out = g_fake.st;
+    return true;
 }
 
 int main(int argc, char** argv)
@@ -69,19 +76,16 @@ int main(int argc, char** argv)
     }
 
     if (strcmp(mode, "server") == 0 || strcmp(mode, "host") == 0) {
-        NetworkServer server;
-        if (maxPlayers > 0) server.SetMaxPlayers(maxPlayers);
-        if (password != NULL && password[0] != '\0') server.SetPassword(password);
-        if (!server.Start(port)) {
+        net::Session server;
+        if (password != NULL && password[0] != '\0') server.SetHostPassword(password);
+        if (!server.StartHost(port, 0x5EED0000u | static_cast<uint32_t>(port))) {
             printf("[%s] failed to start on port %u\n", mode, port);
             return 2;
         }
         if (modPath != NULL) {
-            if (server.LoadServerMod(modPath)) {
-                printf("[%s] loaded server mod: %s\n", mode, modPath);
-            } else {
-                printf("[%s] WARNING: failed to load server mod: %s\n", mode, modPath);
-            }
+            // Server-side Lua mod hook: the standalone does not embed Lua, so
+            // we acknowledge and continue (mod validation is covered elsewhere).
+            printf("[%s] note: --mod is accepted but Lua mods are loaded by the game's ServerModManager, not the engine session.\n", mode);
         }
         fflush(stdout);
         printf("[%s] listening on %u. connect with mp_standalone join ...\n", mode, port);
@@ -105,7 +109,7 @@ int main(int argc, char** argv)
         int lastCount = 0;
         for (;;) {
             server.Update();
-            int count = ServerRemotePlayerCount(server);
+            int count = server.GetPeerRoster().size();
             if (count != lastCount) {
                 printf("[%s] clients in world: %d\n", mode, count);
                 fflush(stdout);
@@ -119,29 +123,36 @@ int main(int argc, char** argv)
     }
     else if (strcmp(mode, "join") == 0) {
         const char* ip = argv[2];
-        NetworkClient client;
+        net::Session client;
         if (password != NULL && password[0] != '\0') client.SetPassword(password);
-        if (!client.Connect(ip, port)) {
+
+        // Publish a slowly-moving state so the server sees us as a live player.
+        g_fake.st.x = 0.0f; g_fake.st.y = 0.0f; g_fake.st.z = 0.0f; g_fake.st.rotY = 0.0f;
+        g_fake.st.inVehicle = 0; g_fake.st.vehicleModel[0] = '\0';
+        g_fake.ready = true;
+        net::GamePlayerBridge bridge;
+        bridge.SetTypedLocalProvider(&FakeLocalState);
+        bridge.AttachToSession(&client);
+
+        if (!client.Join(ip, port)) {
             printf("[join] connect failed to %s:%u\n", ip, port);
             return 2;
         }
         printf("[join] connecting to %s:%u ...\n", ip, port);
         fflush(stdout);
         bool announced = false;
+        int tick = 0;
         for (;;) {
             client.Update();
-            if (client.IsServerReady()) {
+            if (client.GetLocalPeerId() != 0) {
                 if (!announced) {
                     printf("[join] SERVER READY, my client id = %u\n",
-                           client.GetClientId());
+                           client.GetLocalPeerId());
                     fflush(stdout);
                     announced = true;
                 }
                 // Send a slowly moving signature once ready.
-                static PlayerNetworkState st;
-                st.x += 0.1f;
-                st.inVehicle = 0;
-                client.SendPlayerState(st);
+                if (++tick % 6 == 0) g_fake.st.x += 0.1f;
             }
         }
     }

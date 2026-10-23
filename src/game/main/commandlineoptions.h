@@ -83,6 +83,11 @@ enum CmdLineOptionEnum
     CLO_NO_LOADING_SPEW,    // Don't Spew <<START>>, <<END>> messages
     CLO_AUDIO_LOADING_SPEW, // Spew Audio loading info
 
+    CLO_HEADLESS,           // Run with a hidden window: no focus grab, no mouse
+                            // capture, no single-instance mutex. For automated
+                            // multiplayer client launches that must not disturb
+                            // the desktop while the user is working.
+
     NUM_CLO             // Must not exceed 64
 };
 

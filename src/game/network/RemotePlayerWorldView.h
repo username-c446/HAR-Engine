@@ -20,12 +20,14 @@ public:
     // passed back unmodified to later Move/Despawn calls.
     typedef void* (*SpawnFn)(int playerId);
     typedef void  (*MoveFn)(int playerId, void* handle, const PlayerNetworkState& state);
+    typedef void  (*JumpFn)(int playerId, void* handle); // rising edge of a remote jump
     typedef void  (*DespawnFn)(int playerId, void* handle);
 
     struct Sink
     {
         SpawnFn spawn;
         MoveFn move;
+        JumpFn jump;
         DespawnFn despawn;
     };
 
@@ -56,6 +58,7 @@ private:
         float targetX, targetY, targetZ;
         float visualX, visualY, visualZ;
         bool smoothingApplied;
+        bool jumping; // last reported FLAG_JUMPING/FLAG_IN_AIR — snap Y, don't smooth
     };
 
     Sink m_sink;

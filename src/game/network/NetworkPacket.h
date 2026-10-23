@@ -23,6 +23,7 @@ namespace net
         PACKET_PONG = 7,          // server acknowledgement of a ping
         PACKET_AUTH = 8,          // client->server: password for a password-protected host
         PACKET_MISSION_STATE = 9, // per-player mission progress (relayed like player state)
+        PACKET_WORLD_SEED = 10,   // server->client: authoritative world seed (u32)
     };
 
     // A client is considered alive if it has been heard from within this window.

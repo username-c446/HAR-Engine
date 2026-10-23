@@ -1,19 +1,19 @@
-# Custom HUD / Overlay development in the SRR2 front-end
+# Custom HUD / Overlay development in the engine's UI layer
 
 > **Status:** experience documentation from the team/assistant — how to add and
-> edit interface elements (overlay/HUD) in the SRR2 rebuild, where it usually
+> edit interface elements (overlay/HUD) in the engine, where it usually
 > breaks, and how to fix it. English version; Russian — `HUD_AND_OVERLAY_DEV.ru.md`.
 >
 > See also `SPEC.md` (sections §14–16) and `README.md`.
 
-This article is a practical guide to working with the UI of
-_The Simpsons: Hit & Run_ during a rebuild. It comes from the real experience of
+This article is a practical guide to working with the engine's UI
+(menus, HUD, overlays). It comes from the real experience of
 adding the "MULTIPLAYER" item and an IP-input overlay to the main menu, and it
 should save time for anyone who wants to write their own screens or HUD elements.
 
 ---
 
-## 1. How the SRR2 UI works (quick overview)
+## 1. How the engine UI works (quick overview)
 
 All interface graphics (menus, HUD, title screens) are **Scrooby** projects that
 compile into **Pure3D** (`.p3d`) files. Hierarchy:

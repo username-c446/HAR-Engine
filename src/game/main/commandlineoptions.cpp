@@ -217,6 +217,10 @@ void CommandLineOptions::HandleOption( const char* const optionIn )
     {
         orValue <<= CLO_SKIP_FE;
     }
+    else if( strcmp( strupr(option), "HEADLESS" ) == 0 )
+    {
+        orValue <<= CLO_HEADLESS;
+    }
     else if( strcmp( strupr(option), "FEGAGS" ) == 0 )
     {
         orValue <<= CLO_FE_GAGS_TEST;

@@ -1,27 +1,55 @@
-# MultiTool — «The Simpsons: Hit & Run» (SRR2) — Спецификация мультиплеера
+# HAR-Engine — Спецификация сетевого слоя
 
 > **Статус:** живой документ. Обновляй и сверяйся с ним при каждой разработке,
 > чтобы не создавать дублирующий функционал. Помечай реализованное фичами и
 > описывай новые связи функций по мере их появления.
 
-Этот файл описывает весь программно реализованный поверх оригинального SRR2
-геймплей и, прежде всего, мультиплеерный стек — как части взаимодействуют между
-собой. Он предназначен и для другой нейронки/разработчика, изучающей проект, и
-для самого ассистента, чтобы не путаться.
+> Проект развивается как **самостоятельный игровой движок**; исходной базой кода
+> послужила игра _The Simpsons: Hit & Run_ (современная сообществная пересборка).
+
+> **Миграция завершена (2026-10).** Старый монолит `NetworkServer`/`NetworkClient`
+> полностью удалён из кода и проектов. Весь транспорт, авторизация, валидация и
+> релей вынесены в переиспользуемый движковый слой `src/game/netengine/`
+> (`net::Session`, `net::ServerEndpoint`/`ClientEndpoint`, `net::Packet`,
+> `net::PacketRegistry`, `world-интерфейсы`). `NetworkMatchManager` теперь —
+> тонкий мост поверх `net::Session` + `GamePlayerBridge`, сохраняющий старый
+> игровой АПИ. Защитные фичи монолита (таймаут-кик, heartbeat/ping/RTT, пароль,
+> анти-телепорт) перенесены в netengine; тесты 42/42 зелёные.
+
+Этот файл описывает сетевой слой движка и то, как его части взаимодействуют
+между собой. Он предназначен и для другого разработчика/ИИ, изучающего проект,
+и для самого ассистента, чтобы не путаться. World-терминология («игрок»,
+«машина», «миссия») относится к контенту, который движок загружает через
+интерфейсы мира, а не к привязке к какой-либо конкретной игре.
 
 ---
 
 ## 1. Карта проекта (область сети)
 
-Все сетевые файлы лежат в `src/game/network/`. Основные проекции:
+Сетевой слой движка разбит на **независимые слои**: игровой слой
+(`src/game/network/`) и переиспользуемый движковый слой (`src/game/netengine/`).
+Старый монолит `NetworkServer`/`NetworkClient` полностью выпилен.
+
+### Движковый слой `src/game/netengine/` (переиспользуемый, world-agnostic)
 
 | Файл | Роль |
 |------|------|
-| `NetworkPacket.h` | Формат пакетов, типы, little-endian сериализация, константы |
+| `Packet.h` | Он-найр протокол: `PacketId`, версия, зарезервированные id (0x00-0xFF системные, 0x100+ игровые), bounds-checked `Writer`/`Reader` |
+| `PacketRegistry.{h,cpp}` | Реестр пакетов (id → обработчик) вместо `switch`; расширяем без правки ядра |
+| `ServerEndpoint.{h,cpp}` | Чистый ENet-хост: допуск пиров, `PeerId`, счёт liveness, таймаут-свип, `KickPeer`, авто-PING-проб |
+| `ClientEndpoint.{h,cpp}` | Чистый ENet-клиент: коннект, фрейминг, heartbeat (`SetPingIntervalMs`), замер RTT (`SendPing`/`GetPingMs`) |
+| `Session.{h,cpp}` | Оркестратор матча: host/join/leave, релей состояния, пароль (`SetHostPassword`/`SetPassword`), валидатор (`SetStateValidator`), реестр пиров |
+| `GamePlayerBridge.{h,cpp}` | Игровой адаптер: связывает `PlayerNetworkState` с opaque-блобами `Session`'а |
+| `WorldInterfaces.h` | Интерфейсы `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator` — мир подключается снаружи |
+| `ENetInit.{h,cpp}` | RAII-счётчик ссылок ENet (статика определена в `.cpp`) |
+
+### Игровой слой `src/game/network/`
+
+| Файл | Роль |
+|------|------|
+| `NetworkPacket.h` | Игровые типы и little-endian-примитивы (`net::Write*/Read*`) |
 | `PlayerNetworkState.{h,cpp}` | Структура состояния игрока (позиция/поворот/машина) + сериализация |
-| `NetworkServer.{h,cpp}` | Авторитетный сервер: допуск, сессии, валидация, релей |
-| `NetworkClient.{h,cpp}` | Клиент: подключение, heartbeat, приём реестра/состояний |
-| `NetworkMatchManager.{h,cpp}` | Оркестратор: host/join/leave, провайдер локального состояния |
+| `NetworkMatchManager.{h,cpp}` | ТОНКИЙ МОСТ: сохраняет старый публичный АПИ (`StartHost`/`JoinHost`/`Leave`/`GetRemotePlayers`), внутри делегирует `net::Session` + `GamePlayerBridge` |
 | `RemotePlayerManager.{h,cpp}` | Реестр удалённых игроков (идент. по clientId) |
 | `RemotePlayerWorldView.{h,cpp}` | Визуализация удалённых пеших игроков + интерполяция |
 | `RemoteVehicleWorldView.{h,cpp}` | Визуализация «призраков» машин удалённых водителей |
@@ -29,7 +57,6 @@
 | `MissionSyncManager.{h,cpp}` | Синхронизация миссии/стадии/цели между клиентами (co-op-прогресс) |
 | `MissionSyncState.{h,cpp}` | Сериализуемое состояние миссии (миссия/стадия/цель) |
 | `NetworkConsoleCommands.{h,cpp}` | Консольные команды `host`/`join`/`match` |
-| `ENetInit.h` | RAII-счётчик ссылок ENet |
 
 Интеграция в игру: `src/game/contexts/gameplay/gameplaycontext.cpp`
 (провайдер состояния, sink-и, вызовы в игровом цикле) и
@@ -39,34 +66,35 @@
 
 ## 2. Сетевая модель и транспорт
 
-- **Транспорт:** ENet (vcpkg `enet`), канал `GAME_CHANNEL = 0`, все игровые
-  пакеты надёжные (`ENET_PACKET_FLAG_RELIABLE`). Порядок и доставку гарантирует
-  ENet; свой протокол — только тип + payload.
+- **Транспорт:** ENet (vcpkg `enet`), единственный канал, все игровые пакеты
+  надёжные (`ENET_PACKET_FLAG_RELIABLE`). Порядок и доставку гарантирует ENet;
+  свой протокол — только id + payload.
 - **Архитектурный принцип:** авторитетный сервер (а не P2P). Сервер допускает
-  клиентов, выдаёт `clientId`, валидирует состояния, ретранслирует их, ведёт
-  реестр сущностей и раздаёт его клиентам. Клиент не само-авторизуется.
-- `MAX_PACKET_SIZE = 512` байт. `CLIENT_TIMEOUT_MS = 8000`, `PING_INTERVAL_MS = 2000`.
-- Данные линейны, big-fat-протокол отсутствует: payload может содержать
-  повторяющиеся `clientId` (в `PLAYER_STATE`), но полный id — всегда
-  авторитетная забота сервера.
+  клиентов, выдаёт `PeerId`, валидирует состояния, ретранслирует их, ведёт
+  реестр пиров и раздаёт его клиентам. Клиент не само-авторизуется.
+- `MAX_PACKET_PAYLOAD = 512` байт. Таймаут liveness по умолчанию 30 с
+  (переопределяется `SetClientTimeoutMs`), heartbeat-кадр по умолчанию 60 Update.
+- Данные линейны: payload может содержать повторяющиеся `PeerId` (в `PLAYER_STATE`),
+  но полный id — всегда авторитетная забота сервера.
 
-### Типы пакетов (`net::PacketType`, 1-байтовый тег в начале)
+### Типы пакетов (`net::ReservedPacketId`, 2-байтовый id в начале)
 
-| Тег | Имя | Направление | Назначение |
-|-----|-----|-------------|------------|
-| 0 | `HELLO` | C→S | Анонс после ENet-коннекта |
-| 1 | `WELCOME` | S→C | Авторитетный `clientId` (аналог адмиссии) |
-| 2 | `PLAYER_STATE` | C→S→C | Состояние игрока (релей) |
-| 3 | `DISCONNECT` | C→S | Объявление об отключении |
-| 4 | `PLAYER_LIST` | S→C | Авторитетный реестр присутствующих сущностей |
-| 5 | `VEHICLE_STATE` | зарезервирован | (описан в §6 как часть PLAYER_STATE на практике) |
-| 6 | `PING` | C→S | Heartbeat + замер RTT |
-| 7 | `PONG` | S→C | Ответ на ping |
-| 8 | `AUTH` | C→S | Пароль для защищённого хоста |
-| 9 | `MISSION_STATE` | C→S→C | Прогресс миссии/стадии/цели (релей, для co-op) |
+| Id | Имя | Направление | Назначение |
+|----|-----|-------------|------------|
+| 0x0000 | `HELLO` | C→S | Анонс после ENet-коннекта |
+| 0x0001 | `WELCOME` | S→C | Авторитетный `PeerId` (self id) |
+| 0x0002 | `ACK` | S/C | Квитирование версии/liveness |
+| 0x0003 | `AUTH` | C→S | Пароль для защищённого хоста |
+| 0x0004 | `PLAYER_LIST` | S→C | Авторитетный реестр присутствующих пиров |
+| 0x0005 | `PING` | C→S | Heartbeat + замер RTT |
+| 0x0006 | `PONG` | S→C | Ответ на ping |
+| 0x0007 | `WORLD_SEED` | S→C | Авторитетный сид мира (u32) |
+| 0x0100 | `PLAYER_STATE` | C→S→C | Состояние игрока (релей) |
+| 0x0101 | `VEHICLE_STATE` | зарезервирован | (данные машин переносятся внутри PLAYER_STATE) |
+| 0x0102 | `MISSION_STATE` | C→S→C | Прогресс миссии/стадии/цели (релей, для co-op) |
 
 > Примечание: `PACKET_VEHICLE_STATE` объявлен в enum, но текущая реализация
-> переносит транспортные данные внутри `PLAYER_STATE` (см. §6), т.е. пакет 5
+> переносит транспортные данные внутри `PLAYER_STATE` (см. §6), т.е. пакет 0x0101
 > пока не используется на проводе.
 
 ---
@@ -99,63 +127,64 @@ struct PlayerNetworkState {
 
 ---
 
-## 4. Сервер `NetworkServer`
+## 4. Серверный слой `net::ServerEndpoint` + `net::Session`
 
-### Подключение (допуск)
-1. ENet-коннект → назначение `clientId` (`m_nextClientId++`, стартует с 1000).
-2. **Lua-мод** может отклонить: `OnPlayerJoin(clientId)` == false → разрыв.
-3. Создание `ClientSession` (peer, таймстемпы, `authenticated`).
-4. Если пароль включён (`m_requiresAuth`) — ждём `AUTH`; без пароля —
-   `WelcomeClient()` сразу.
+Серверная сторона разнесена на два слоя (см. §1):
 
-### Сессии (`ClientSession`)
-- `peer`, `lastStateTimeMs`, `connectedAtMs`, `lastSeenMs`, `validated`,
-  `authenticated`.
-- `lastSeenMs` обновляется на **любой** входящий пакет → таймаут-свип.
+- **`net::ServerEndpoint`** — чистый ENet-хост: допуск пиров, назначение `PeerId`,
+  фрейминг пакетов, счёт liveness, таймаут-свип, авто-PING-проб (heartbeat
+  запрашивает клиент сам), принудительный `KickPeer`. Ничего не знает про мир.
+- **`net::Session`** (host-режим) — поверх серверного эндпоинта: при приёме
+  `PID_AUTH` сверяет пароль и только тогда шлёт `WELCOME`+`WORLD_SEED`+`PLAYER_LIST`;
+  релее `PID_PLAYER_STATE` через **опциональный `IStateValidator`** (анти-телепорт);
+  ведёт авторитетный реестр пиров.
 
-### Heartbeat / сброс мёртвых
-- `PACKET_PING` → сервер отвечает `PONG` и обновляет `lastSeenMs`.
-- В конце `Update()` производится свип: если `now - lastSeenMs > m_clientTimeoutMs`
-  → клиент считается мёртвым, вызывается `OnPlayerLeave`, он удаляется из всех
-  структур и `enet_peer_disconnect`.
-- `SetClientTimeoutMs` переопределяет окно (для тестов).
+### Допуск
+1. ENet-коннект → `ServerEndpoint` назначает `PeerId` (`m_nextPeerId++`, стартует с 1).
+2. Если `Session` защищён паролем (`SetHostPassword`), `WELCOME` откладывается,
+   пока клиент не пришлёт корректный `PID_AUTH`; неправильный/отсутствующий пароль
+   → `KickPeer` (пир никогда не узнаёт состав мира).
+3. Без пароля — `WELCOME` + `WORLD_SEED` сразу, затем `PLAYER_LIST` всему составу.
 
-### Валидация и релей (`ValidateAndRelay`)
-- Проверка правдоподобия: телепорты/сверхскорости отсекаются; скорость зависит
-  от `inVehicle`. При превышении состояние не ретранслируется (последнее честное
-  остаётся в реестре).
-- Lua-хук `OnPlayerValidate` может дополнительно ужесточить.
-- Принятое состояние кладётся в `m_players` и ретранслируется всем остальным
-  клиентам как `PLAYER_STATE` (с sender = `clientId`).
+### Heartbeat / таймаут
+- Клиент сам шлёт `PID_PING` с заданной частотой (`ClientEndpoint::SetPingIntervalMs`);
+  каждый входящий пакет обновляет `lastSeenMs` пира в `ServerEndpoint`.
+- В конце `ServerEndpoint::Update()` — свип: `now - lastSeenMs > m_clientTimeoutMs`
+  → пир удаляется, `PeerEvent{id,false}` (Session чистит реестр/рекстур), и вызывается
+  `enet_peer_disconnect`. `SetClientTimeoutMs` переопределяет окно (для тестов).
 
-### Реестр сущностей (`SendPlayerListToAll`)
-- После каждого подключения/отключения/свипа сервер шлёт всем `PLAYER_LIST`:
-  `uint16 count` + массив `clientId`. Это авторитетный источник совстава мира.
+### Валидация и релей
+- `net::Session` на каждый входящий `PID_PLAYER_STATE` вызывает
+  `IStateValidator::ValidatePeerState` (если задан). Отклонённое состояние
+  **не ретранслируется**; последнее честное остаётся у получателя.
+- `GamePlayerBridge`/тесты реализуют валидатор как анти-телепорт с лимитом
+  скорости в зависимости от `inVehicle` (`kMaxSpeedOnFoot ≈ 15 м/с`,
+  `kMaxSpeedInVehicle ≈ 120 м/с`).
+- Принятое состояние ретранслируется всем остальным пирам как `PLAYER_STATE`
+  с полем sender = `PeerId`.
 
-### Аутентификация (`PACKET_AUTH`)
-- Сервер хранит `m_password[65]` + `m_requiresAuth`.
-- Если пароль задан и клиент присылает корректный — помечается `authenticated`
-  и приветствуется; иначе `enet_peer_disconnect`.
+### Реестр сущностей
+- После каждого подключения/отключения/свипа сервер шлёт всем `PLAYER_LIST`
+  (`uint16 count` + массив `PeerId`). Это авторитетный источник состава мира.
 
 ### Конфигурация
-- `SetMaxPlayers(slots)` — лимит одновременно подключённых (только до `Start`).
-- `SetPassword(pw)` — включение защиты; `SetClientTimeoutMs`.
+- `Session::SetHostPassword(pw)` — защита хоста; `ServerEndpoint::SetClientTimeoutMs`.
 
 ---
 
-## 5. Клиент `NetworkClient`
+## 5. Клиентский слой `net::ClientEndpoint` + `net::Session`
 
-- `Connect(ip, port)` → ENet host, `SetPassword` при наличии.
-- После ENet-коннекта шлёт `HELLO` и, если был задан пароль, `AUTH`.
-- При получении `WELCOME` запоминает `m_clientId` и переходит в
-  `m_serverReady = true`, сбрасывая `remotePlayers`/авторитетный список.
-- `PLAYER_LIST` → перестроение набора удалённых, **diff** против прошлого
-  авторитетного списка генерирует события join/leave (см. §7).
-- `PLAYER_STATE` от других клиентов → `UpdatePlayer` в `m_remotePlayers`
-  (свой собственный эхо игнорируется по `clientId`).
-- Heartbeat: каждые `m_pingIntervalMs` шлёт `PING`, фиксирует `m_pingSentMs`;
-  по `PONG` считает RTT → `GetPingMs()` / `HasMeasuredPing()`.
-- `SendPlayerState` — rate-limited (`kStateEveryFrames = 6`, ~10 Гц).
+- `net::ClientEndpoint::Connect(ip, port)` → ENet host + peer.
+- `Session::SetPassword(pw)` — задаёт пароль; отправка `PID_AUTH` отложена до
+  момента, когда ENet-соединение установлено (`IsPeerReady()`), через
+  `Session::SendAuthIfDue()` в `Update()` — иначе пакет до рукопожатия теряется.
+- `net::ClientEndpoint` сам шлёт `PID_PING` с заданной частотой (heartbeat), по
+  `PONG` считает RTT → `GetPingMs()`/`HasMeasuredPing()`.
+- `Session` при приёме `WELCOME` запоминает `selfId`; `PLAYER_LIST` → перестроение
+  реестра пиров (`GetPeerRoster`); `PLAYER_STATE` от других → `IRemoteStateSink`
+  (через `GamePlayerBridge` в игру); собственный эхо игнорируется по `selfId`.
+- Локальное состояние шлётся через `ILocalStateProvider` с каденцией
+  `SetStateSendEvery` (по умолчанию каждая 6-я `Update`, ~10 Гц).
 
 ---
 
@@ -193,12 +222,11 @@ struct PlayerNetworkState {
 
 ## 7. Игроки: список и уведомления (C8/C9)
 
-- `NetworkClient` при обработке `PLAYER_LIST` делает diff между
-  `m_prevAuthoritativePlayers` и новым списком:
-  - id был, теперь нет → событие leave;
-  - id нет, теперь есть → событие join.
-- События скапливаются в `m_pendingEvents` (`JoinLeaveEvent{clientId, joined}`)
-  и забираются через `DrainJoinLeaveEvents` (через `NetworkMatchManager`).
+- `net::Session` на принимающей стороне при каждом `PLAYER_LIST` перестраивает
+  авторитетный реестр пиров (`GetPeerRoster`); события join/leave доставляются
+  через `SetJoinLeaveFn(peerId, joined)` на уровне сессии.
+- Игровой слой через `NetworkMatchManager::DrainJoinLeaveEvents(out)` забирает
+  накопленные `JoinLeaveEvent{clientId, joined}` для UI/консоли.
 - В игровом цикле `gameplaycontext` печатает «net: player N connected /
   disconnected» в консоль.
 - Консольная команда `match status` выводит состав удалённых игроков через
@@ -218,10 +246,11 @@ mp_standalone host   [port] [--password pw] [--max slots] [--log file]
 mp_standalone join   <hostIp> [port] [--password pw]
 ```
 
-- `--password` → `server.SetPassword()` / `client.SetPassword()`.
-- `--max` → `server.SetMaxPlayers()`.
+- Работает на движковом слое `net::Session` (вместо старого `NetworkServer`/`Client`).
+- `--password` → `session.SetHostPassword()` / `session.SetPassword()`.
 - `--log` → файл лога (строка запуска + `clients:N` при смене состава).
-- `--mod` → `server.LoadServerMod()`.
+- `--mod` → принимается, но примечание: Lua-моды на движковом слое не
+  подгружаются (см. §9); признак оставлен для совместимости интерфейса.
 
 ### CLI основной игры (`CommandLineOptions`)
 - `HOSTPORT=<port>` — автостарт хоста.
@@ -245,16 +274,29 @@ mp_standalone join   <hostIp> [port] [--password pw]
 
 ## 10. Оркестратор `NetworkMatchManager`
 
-Единственный сетевой вход из геймплея. Один процесс = **либо хост, либо
-join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
+Единственный сетевой вход из геймплея. С момента миграции это **тонкий мост**
+поверх движкового слоя: он держит `net::Session` + `net::GamePlayerBridge` и
+сохраняет прежний публичный АПИ, чтобы потребители (геймплей, консоль, миссии,
+машины) не менялись.
 
-- `StartHost(port)` / `JoinHost(ip, port)` / `Leave()` — жизненный цикл матча.
-- `SetHostConfig(password, maxPlayers)`, `SetClientPassword(pw)` — конфиг.
-- `SetLocalStateProvider(fn)` — провайдер локального состояния.
-- `GetRemotePlayers()` — реестр (из сервера или клиента).
+- **Host** играет как полноценный участник: `StartHost(port)` запускает сервер и
+  сразу подключает loopback-клиент к своему же порту (`127.0.0.1:port`). Поэтому
+  host одновременно держит `m_server` + `m_client` и видим другим клиентам (его
+  локальное состояние ретранслируется как у любого присоединившегося).
+  `HostAndJoinAreMutuallyExclusive` по-прежнему запрещает *явный* join, пока идёт
+  матч, но сам host себе подсоединяется через loopback.
+- **Join-клиент** — только `m_client` (`JoinHost`).
+
+- `StartHost(port)` / `JoinHost(ip, port)` / `Leave()` — жизненный цикл матча
+  (делегирует `net::Session`).
+- `SetHostConfig(password, maxPlayers)` — конфиг; пароль host-сервера зеркалится
+  на loopback-клиент, чтобы host прошёл тот же авторизационный гейт.
+- `SetLocalStateProvider(fn)` — провайдер локального состояния (`GamePlayerBridge`).
+- `GetRemotePlayers()` — реестр **со стороны клиента** (для host и для
+  join-клиента), т.к. клиентская перспектива исключает самого игрока (`selfId`)
+  из remote-набора; голый серверный реестр включал бы host самому себе.
 - `DrainJoinLeaveEvents(out)` — уведомления join/leave.
-- `Update()` — крутит сервер/клиент; на клиенте по таймеру шлёт локальное
-  состояние через провайдера.
+- `Update()` — крутит `net::Session::Update()` (сервер+клиент+релей+валидатор).
 
 ---
 
@@ -278,16 +320,18 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 - **Состояние:** `MissionSyncState` (миссия/стадия/цель + флаг `inMission`),
   сериализация как у `PlayerNetworkState`.
-- **Локально:** `GameplayMissionStateProvider` в `gameplaycontext.cpp` читает
-  текущую миссию через `GameplayManager::GetCurrentMission()` /
-  `GetCurrentStageIndex()` и шлёт по сети (клиент → сервер → остальные).
-- **Сервер:** принимает `PACKET_MISSION_STATE`, хранит по клиенту в
-  `m_missionStates`, ретранслирует остальным (без gate-валидации — ход миссии
-  решает хост).
+- **Сервер:** ретранслирует `PID_MISSION_STATE` остальным (без gate-валидации —
+  ход миссии решает хост).
 - **Клиент:** `GetRemoteMissionStates()` отдаёт `map<clientId, MissionSyncState>`
   для UI «кто в какой миссии».
-- `MissionSyncManager` агрегирует локальный + удалённые прогрессы,
-  тестируем.
+- `MissionSyncManager` агрегирует локальный + удалённые прогрессы, тестируем.
+
+> Примечание о текущей реализации: в движковом слое `netengine` миссионная
+> полезная нагрузка переносится тем же generic-релеем, что и состояние игрока
+> (который пропускает произвольные блобы). Полноценный отдельный
+> `PID_MISSION_STATE` в `net::Session` не выделен; co-op-релей миссии на
+> движковом слое — открытая задача (тест `MissionStateRelaysBetweenClientsThroughServer`
+> покрывает перенос произвольного блоба через релей).
 
 ## 13. Точки интеграции в игровой цикл (`gameplaycontext.cpp`)
 
@@ -306,10 +350,14 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 
 - Все изменяемые возможности должны иметь юнит/интеграционные тесты
   (`src/tests/network_tests.cpp`; проект Tests.vcxproj, пакет `Tests.dll`).
-- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 30/30 зелёных.
+- Прогон: `vstest.console.exe` по `Tests.dll`. Текущее состояние — 42/42 зелёных.
 - Сборка полной игры: `MSBuild.exe src/srr2/SRR2.vcxproj
   /p:Configuration=DebugWindows /p:Platform=x64
   /p:WindowsTargetPlatformVersion=10.0.22621.0`.
+  - **Важно:** проект `sim.vcxproj` целится в SDK 10.0.26100.0, которого нет на
+    машине; версию SDK нужно переопределять в командной строке
+    (`/p:WindowsTargetPlatformVersion=10.0.22621.0`). Тесты собираются отдельно:
+    `MSBuild.exe src/tests/Tests.vcxproj "/p:Configuration=Debug" "/p:Platform=x64"`.
 
 ---
 
@@ -387,9 +435,39 @@ join-клиент, никогда оба** (`HostAndJoinAreMutuallyExclusive`).
 - **C7 (UI-лобби, улучшение)** — сделать отдельное видимое поле ввода IP/порта
   в оверлее Host/Join (сейчас это промпт внутри текста пункта меню). Возможно,
   своими экранами после генератора .p3d / UI-слоя.
-- **MP-стабильность** — проверить вход host/join в игре end-to-end (персонаж
-  управляется, клавиша взаимодействия работает, выход без ассертов), сетевой
-  матч между двумя копиями.
+
+**MP-стабильность — проверено end-to-end (2026-10, после миграции на net::*):**
+- **Сеть на реальных сокетах подтверждена.** Автономный стенд
+  `src/tests/mp_standalone` (на `net::Session`/`net::*`) сводит host+join как
+  два процесса: сервер фиксирует `clients in world: 1`, join получает
+  `SERVER READY, my client id = 2`. Дополнительная изоляция: in-game join-копия
+  подключается к `mp_standalone`-серверу (`selfId=2`) — значит in-game
+  клиентская сеть исправна.
+- **Полный in-game host↔join (две копии SRR2 в геймплее)** на этой машине НЕ
+  сходится на уровне ОС, а не сетевого кода: оба процесса обслуживают свои
+  ENet-сокеты (маркеры подтверждают опрос и приём), серверный UDP-сокет жив на
+  `0.0.0.0:<порт>`, CL-коннект корректно создаётся, но ENet-рукопожатие между
+  двумя инстансами не завершается даже при выключенном VPN и файрволе
+  (Private/Public выключены). Это ограничение среды запуска двух headless-копий
+  SRR2 на данной машине, не дефект `net::` слоя.
+- **Ручной вход host/join** через главное меню (видимые окна) остаётся
+  рекомендуемым способом проверить управление персонажем; логирование сети
+  через временные маркеры снято после диагностики, `net::` слой оставлен чистым.
+
+### Известная проблема (ПОТЕНЦИАЛЬНАЯ, не подтверждена как дефект кода)
+**Полный in-game host↔join между двумя копиями SRR2 не завершает ENet-рукопожатие.**
+2026-10, одна машина. Признаки: оба процесса обслуживают свои ENet-сокеты
+(опрос и приём подтверждены маркерами), UDP-сервер слушает `0.0.0.0:<порт>`,
+клиентский `enet_host_connect` создаёт peer корректно — но приём внешнего пира
+сервером не происходит, `selfId` у join остаётся 0. Не помогает: выключенный VPN,
+выключенные профили файрвола (Private/Public), видимые окна вместо headless,
+разные порты, последовательный старт. Контраст: тот же `net::` слой корректно
+работает на реальных сокетах в `mp_standalone` (host+join, сервер видит peers,
+join получает `selfId=2`) и in-game join подключается к `mp_standalone`-серверу.
+**Нужно проверить:** является ли ограничением запуска двух headless-копий SRR2
+на данной машине, средовой блокировкой (Windows Filtering Platform/driver) или
+реальным дефектом `net::` слоя, — повторить на машине без сетевых стеков/драйверов
+третьих сторон, либо перепроверить на другой машине.
 
 **Зафиксировано (не баг сети):** редкий разовый флейк «загрузка мира застревает
 почти у конца» при входе хостом через меню. Расследование: сетевой

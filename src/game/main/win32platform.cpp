@@ -269,29 +269,37 @@ void Win32Platform::DestroyInstance()
 //==============================================================================
 bool Win32Platform::InitializeWindow() 
 {
-    // check to see if another instance is running...
-    mhMutex = CreateMutex(NULL, 0, ApplicationName);
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    // Headless: skip the single-instance mutex (we want many automated clients
+    // on one machine) and create a hidden window so nothing grabs focus, shows
+    // on the desktop, or fights the user's active application.
+    bool headless = CommandLineOptions::Get( CLO_HEADLESS );
+
+    if( !headless )
     {
-        // simpsons is already running, so lets find the window and give it focus
-        HWND hwnd = FindWindow(ApplicationName, NULL);
-        if (hwnd != NULL)
+        // check to see if another instance is running...
+        mhMutex = CreateMutex(NULL, 0, ApplicationName);
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
         {
-            // if window is minimized, restore it
-            WINDOWPLACEMENT wndpl;
-            if (GetWindowPlacement(hwnd, &wndpl) != 0)
+            // simpsons is already running, so lets find the window and give it focus
+            HWND hwnd = FindWindow(ApplicationName, NULL);
+            if (hwnd != NULL)
             {
-                if ((wndpl.showCmd == SW_MINIMIZE) ||
-                    (wndpl.showCmd == SW_SHOWMINIMIZED))
+                // if window is minimized, restore it
+                WINDOWPLACEMENT wndpl;
+                if (GetWindowPlacement(hwnd, &wndpl) != 0)
                 {
-                    ShowWindow(hwnd, SW_RESTORE);
+                    if ((wndpl.showCmd == SW_MINIMIZE) ||
+                        (wndpl.showCmd == SW_SHOWMINIMIZED))
+                    {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
                 }
+
+                // activate the window
+                SetForegroundWindow(hwnd);
+
+                return false;
             }
-
-            // activate the window
-            SetForegroundWindow(hwnd);
-
-            return false;
         }
     }
 
@@ -302,9 +310,22 @@ bool Win32Platform::InitializeWindow()
 
     int w, h;
     TranslateResolution( StartingResolution, w, h );
-    mWnd = SDL_CreateWindow( ApplicationName, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_OPENGL );
+    uint32_t windowFlags = SDL_WINDOW_OPENGL | (headless ? SDL_WINDOW_HIDDEN : 0);
+    mWnd = SDL_CreateWindow( ApplicationName, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, windowFlags );
 
     rAssert(mWnd != NULL);
+
+    // Headless: the process is linked as a console app, so a console window
+    // exists; hide it so nothing appears on the desktop. (The game's own
+    // SDL_app window is already created hidden above.)
+    if( headless )
+    {
+        HWND hConsole = ::GetConsoleWindow();
+        if( hConsole != NULL )
+        {
+            ::ShowWindow( hConsole, SW_HIDE );
+        }
+    }
 
 #if defined( PRINT_WINMESSAGES ) && defined( RAD_DEBUG )
     SDL_SetHint( SDL_HINT_EVENT_LOGGING, "1" );
@@ -503,7 +524,12 @@ void Win32Platform::InitializePlatform()
     //
     // Show in fullscreen if fullscreen flag is set.
     //
-    SDL_SetWindowFullscreen( mWnd, mFullscreen ? SDL_WINDOW_FULLSCREEN : 0 );
+    // Headless: never switch the hidden window to fullscreen (that would show it
+    // on the desktop and steal focus from the user's active app).
+    if( !CommandLineOptions::Get( CLO_HEADLESS ) )
+    {
+        SDL_SetWindowFullscreen( mWnd, mFullscreen ? SDL_WINDOW_FULLSCREEN : 0 );
+    }
 
     //
     // Opening the drive is SLOW...
@@ -514,6 +540,14 @@ void Win32Platform::InitializePlatform()
     // Initialize the controller.
     //
     GetInputManager()->Init();
+
+    // Headless: pddi/GL init may have shown the window (SDL_SetWindowFullscreen /
+    // context creation can un-hide it). Re-assert hidden so it never appears on
+    // the desktop or grabs focus, regardless of what ran during initialization.
+    if( CommandLineOptions::Get( CLO_HEADLESS ) )
+    {
+        SDL_HideWindow( mWnd );
+    }
 
     HeapMgr()->PopHeap (GMA_PERSISTENT);
 }
@@ -982,6 +1016,15 @@ int Win32Platform::GetNumProperties() const
 
 void Win32Platform::LoadDefaults()
 {
+    // Headless: force windowed so the hidden window is never switched to
+    // fullscreen (which would show it and steal focus).
+    if( CommandLineOptions::Get( CLO_HEADLESS ) )
+    {
+        SetResolution( StartingResolution, StartingBPP, false );
+        GetRenderFlow()->SetGamma( 1.0f );
+        return;
+    }
+
 #ifdef RAD_DEBUG
     SetResolution( StartingResolution, StartingBPP, !CommandLineOptions::Get( CLO_WINDOW_MODE ) );
 #else
@@ -1778,6 +1821,12 @@ void Win32Platform::ResizeWindow()
 {
     // If fullscreen, no need to change the window size.
     if( mFullscreen )
+    {
+        return;
+    }
+
+    // Headless: keep the window hidden; nothing should ever show it or steal focus.
+    if( CommandLineOptions::Get( CLO_HEADLESS ) )
     {
         return;
     }

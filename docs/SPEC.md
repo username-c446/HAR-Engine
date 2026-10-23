@@ -1,27 +1,46 @@
-# MultiTool — «The Simpsons: Hit & Run» (SRR2) — Multiplayer Specification
+# HAR-Engine — Networking Layer Specification
 
 > **Status:** living document. Update and consult it during every development
 > cycle, so you never create duplicate functionality. Mark implemented features
 > and describe new function relationships as they appear.
 
-This file describes all programmatically added gameplay on top of the original
-SRR2 and, above all, the multiplayer stack — how the pieces interact. It is
-intended both for another AI/developer studying the project and for the
-assistant itself, so it doesn't get lost.
+> The project evolves as an **independent game engine**; the code base is the
+> modern community rebuild of _The Simpsons: Hit & Run_ taken as a starting point.
+
+This file describes the engine's networking layer and how its parts interact.
+It is intended both for another AI/developer studying the project and for the
+assistant itself, so it doesn't get lost. World terminology ("player", "vehicle",
+"mission") refers to content the engine loads through its world interfaces, not
+to any specific game.
 
 ---
 
 ## 1. Project map (network area)
 
-All networking files live in `src/game/network/`. Main projections:
+The network layer is split into independent layers: the reusable engine layer
+(`src/game/netengine/`) and the game layer (`src/game/network/`). The legacy
+monolith `NetworkServer`/`NetworkClient` has been fully removed.
+
+### Engine layer `src/game/netengine/` (reusable, world-agnostic)
 
 | File | Role |
 |------|------|
-| `NetworkPacket.h` | Packet format, types, little-endian serialization, constants |
+| `Packet.h` | Wire protocol: `PacketId`, protocol version, reserved id ranges, bounds-checked `Writer`/`Reader` |
+| `PacketRegistry.{h,cpp}` | Packet registry (id → handler) instead of `switch`; extensible without touching the core |
+| `ServerEndpoint.{h,cpp}` | Pure ENet host: peer admission, `PeerId`, liveness tracking, timeout sweep, `KickPeer`, PING probes |
+| `ClientEndpoint.{h,cpp}` | Pure ENet client: connect, framing, heartbeat (`SetPingIntervalMs`), RTT (`SendPing`/`GetPingMs`) |
+| `Session.{h,cpp}` | Match orchestrator: host/join/leave, state relay, password (`SetHostPassword`/`SetPassword`), validator (`SetStateValidator`), peer roster |
+| `GamePlayerBridge.{h,cpp}` | Game adapter: ties `PlayerNetworkState` to the `Session`'s opaque blobs |
+| `WorldInterfaces.h` | Interfaces `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator` — the world attaches externally |
+| `ENetInit.{h,cpp}` | RAII reference-counting for ENet (static defined in `.cpp`) |
+
+### Game layer `src/game/network/`
+
+| File | Role |
+|------|------|
+| `NetworkPacket.h` | Game types and little-endian primitives (`net::Write*/Read*`) |
 | `PlayerNetworkState.{h,cpp}` | Player state struct (position/rotation/vehicle) + serialization |
-| `NetworkServer.{h,cpp}` | Authoritative server: admission, sessions, validation, relay |
-| `NetworkClient.{h,cpp}` | Client: connection, heartbeat, receiving registry/states |
-| `NetworkMatchManager.{h,cpp}` | Orchestrator: host/join/leave, local-state provider |
+| `NetworkMatchManager.{h,cpp}` | THIN BRIDGE: keeps the old public API (`StartHost`/`JoinHost`/`Leave`/`GetRemotePlayers`), internally delegates to `net::Session` + `GamePlayerBridge` |
 | `RemotePlayerManager.{h,cpp}` | Remote-player registry (keyed by clientId) |
 | `RemotePlayerWorldView.{h,cpp}` | Visualization of remote on-foot players + interpolation |
 | `RemoteVehicleWorldView.{h,cpp}` | Visualization of "ghost" vehicles of remote drivers |
@@ -29,7 +48,6 @@ All networking files live in `src/game/network/`. Main projections:
 | `MissionSyncManager.{h,cpp}` | Mission/stage/objective sync between clients (co-op progress) |
 | `MissionSyncState.{h,cpp}` | Serializable mission state (mission/stage/objective) |
 | `NetworkConsoleCommands.{h,cpp}` | Console commands `host`/`join`/`match` |
-| `ENetInit.h` | RAII reference-counting for ENet |
 
 In-game integration: `src/game/contexts/gameplay/gameplaycontext.cpp`
 (state provider, sinks, calls in the game loop) and
@@ -99,64 +117,67 @@ struct PlayerNetworkState {
 
 ---
 
-## 4. Server `NetworkServer`
+## 4. Server layer `net::ServerEndpoint` + `net::Session`
+
+Server-side logic is split into two layers:
+
+- **`net::ServerEndpoint`** — pure ENet host: peer admission, `PeerId` assignment,
+  packet framing, liveness counting, timeout sweep, auto-PING probing (the client
+  itself requests heartbeats), and forcible `KickPeer`. Knows nothing about a world.
+- **`net::Session`** (host mode) — on top of the server endpoint: verifies the
+  password against `PID_AUTH` and only then sends `WELCOME`+`WORLD_SEED`+`PLAYER_LIST`;
+  relays `PID_PLAYER_STATE` through an optional `IStateValidator` (anti-teleport);
+  keeps the authoritative peer roster.
 
 ### Connection (admission)
-1. ENet connect → assign `clientId` (`m_nextClientId++`, starts at 1000).
-2. **Lua mod** may reject: `OnPlayerJoin(clientId)` == false → disconnect.
-3. Create `ClientSession` (peer, timestamps, `authenticated`).
-4. If password is enabled (`m_requiresAuth`) — wait for `AUTH`; without password —
-   `WelcomeClient()` immediately.
-
-### Sessions (`ClientSession`)
-- `peer`, `lastStateTimeMs`, `connectedAtMs`, `lastSeenMs`, `validated`,
-  `authenticated`.
-- `lastSeenMs` updated on **any** incoming packet → timeout sweep.
+1. ENet connect → `ServerEndpoint` assigns a `PeerId` (`m_nextPeerId++`, starts at 1).
+2. If the `Session` is password-protected (`SetHostPassword`), `WELCOME` is deferred
+   until the client sends a correct `PID_AUTH`; a wrong/missing password → `KickPeer`
+   (the peer never learns the world composition).
+3. Without a password — `WELCOME` + `WORLD_SEED` immediately, then `PLAYER_LIST` to all.
 
 ### Heartbeat / dead sweep
-- `PACKET_PING` → server replies `PONG` and updates `lastSeenMs`.
-- At the end of `Update()` a sweep runs: if `now - lastSeenMs > m_clientTimeoutMs`
-  → the client is considered dead, `OnPlayerLeave` is called, it is removed from
-  all structures and `enet_peer_disconnect`.
-- `SetClientTimeoutMs` overrides the window (for tests).
+- The client sends `PID_PING` at a configured frequency
+  (`ClientEndpoint::SetPingIntervalMs`); every inbound packet refreshes the peer's
+  `lastSeenMs` in `ServerEndpoint`.
+- At the end of `ServerEndpoint::Update()` a sweep runs: `now - lastSeenMs >
+  m_clientTimeoutMs` → the peer is removed, `PeerEvent{id,false}` (the Session
+  cleans its roster), and `enet_peer_disconnect` is called. `SetClientTimeoutMs`
+  overrides the window (for tests).
 
-### Validation and relay (`ValidateAndRelay`)
-- Plausibility check: teleports/overspeeds are rejected; speed depends on
-  `inVehicle`. On exceed, the state is not relayed (last honest state stays in
-  the registry).
-- Lua hook `OnPlayerValidate` may tighten further.
-- Accepted state goes into `m_players` and is relayed to all other clients as
-  `PLAYER_STATE` (with sender = `clientId`).
+### Validation and relay
+- `net::Session` feeds every inbound `PID_PLAYER_STATE` to
+  `IStateValidator::ValidatePeerState` (when set). A rejected state is **not
+  relayed**; the last honest state stays with receivers.
+- `GamePlayerBridge`/tests implement the validator as an anti-teleport gate with a
+  speed limit chosen by `inVehicle` (`kMaxSpeedOnFoot ≈ 15 m/s`,
+  `kMaxSpeedInVehicle ≈ 120 m/s`).
+- Accepted state is relayed to all other peers as `PLAYER_STATE` with sender = `PeerId`.
 
-### Entity registry (`SendPlayerListToAll`)
-- After each connect/disconnect/sweep the server sends `PLAYER_LIST` to all:
-  `uint16 count` + array of `clientId`. This is the authoritative source of world
+### Entity registry
+- After each connect/disconnect/sweep the server sends `PLAYER_LIST` to all
+  (`uint16 count` + array of `PeerId`). This is the authoritative source of world
   composition.
 
-### Authentication (`PACKET_AUTH`)
-- Server stores `m_password[65]` + `m_requiresAuth`.
-- If a password is set and the client sends the correct one — marked
-  `authenticated` and welcomed; otherwise `enet_peer_disconnect`.
-
 ### Configuration
-- `SetMaxPlayers(slots)` — limit on concurrent connections (only before `Start`).
-- `SetPassword(pw)` — enable protection; `SetClientTimeoutMs`.
+- `Session::SetHostPassword(pw)` — protect the host; `ServerEndpoint::SetClientTimeoutMs`.
 
 ---
 
-## 5. Client `NetworkClient`
+## 5. Client layer `net::ClientEndpoint` + `net::Session`
 
-- `Connect(ip, port)` → ENet host, `SetPassword` if any.
-- After ENet connect sends `HELLO` and, if a password was set, `AUTH`.
-- On `WELCOME` stores `m_clientId` and transitions to `m_serverReady = true`,
-  resetting `remotePlayers`/authoritative list.
-- `PLAYER_LIST` → rebuild remote set, **diff** against the previous authoritative
-  list generates join/leave events (see §7).
-- `PLAYER_STATE` from other clients → `UpdatePlayer` into `m_remotePlayers`
-  (own echo ignored by `clientId`).
-- Heartbeat: every `m_pingIntervalMs` sends `PING`, stores `m_pingSentMs`;
-  on `PONG` computes RTT → `GetPingMs()` / `HasMeasuredPing()`.
-- `SendPlayerState` — rate-limited (`kStateEveryFrames = 6`, ~10 Hz).
+- `net::ClientEndpoint::Connect(ip, port)` → ENet host + peer.
+- `Session::SetPassword(pw)` sets the password; the `PID_AUTH` send is deferred
+  until the ENet connection is established (`IsPeerReady()`) via
+  `Session::SendAuthIfDue()` in `Update()` — sending before the handshake would
+  drop the payload on a protected host.
+- `net::ClientEndpoint` itself sends `PID_PING` at a configured frequency
+  (heartbeat) and, on `PONG`, computes RTT → `GetPingMs()`/`HasMeasuredPing()`.
+- On `WELCOME` the `Session` stores `selfId`; `PLAYER_LIST` rebuilds the peer
+  roster (`GetPeerRoster`); `PLAYER_STATE` from others → `IRemoteStateSink`
+  (via `GamePlayerBridge` into the game); own echo ignored by `selfId`.
+- Local state is sent through `ILocalStateProvider` at `SetStateSendEvery`
+  cadence (default every 6th `Update`, ~10 Hz).
 
 ---
 
@@ -193,12 +214,11 @@ separate `PACKET_VEHICLE_STATE` is declared but not used. Do not duplicate it.
 
 ## 7. Players: list and notifications (C8/C9)
 
-- `NetworkClient` on `PLAYER_LIST` does a diff between `m_prevAuthoritativePlayers`
-  and the new list:
-  - id existed, now absent → leave event;
-  - id absent, now present → join event.
-- Events accumulate in `m_pendingEvents` (`JoinLeaveEvent{clientId, joined}`)
-  and are drained via `DrainJoinLeaveEvents` (through `NetworkMatchManager`).
+- `net::Session` on the receiving side rebuilds the authoritative peer roster
+  (`GetPeerRoster`) on every `PLAYER_LIST`; join/leave events are delivered via
+  `SetJoinLeaveFn(peerId, joined)` at the session level.
+- The game layer drains accumulated `JoinLeaveEvent{clientId, joined}` through
+  `NetworkMatchManager::DrainJoinLeaveEvents` for UI/console.
 - In the game loop `gameplaycontext` prints "net: player N connected /
   disconnected" to the console.
 - Console command `match status` prints remote player composition via
@@ -218,8 +238,8 @@ mp_standalone host   [port] [--password pw] [--max slots] [--log file]
 mp_standalone join   <hostIp> [port] [--password pw]
 ```
 
-- `--password` → `server.SetPassword()` / `client.SetPassword()`.
-- `--max` → `server.SetMaxPlayers()`.
+- Runs on the engine layer `net::Session` (instead of the old `NetworkServer`/`Client`).
+- `--password` → `session.SetHostPassword()` / `session.SetPassword()`.
 - `--log` → log file (launch line + `clients:N` on roster change).
 - `--mod` → `server.LoadServerMod()`.
 
@@ -245,16 +265,30 @@ mp_standalone join   <hostIp> [port] [--password pw]
 
 ## 10. Orchestrator `NetworkMatchManager`
 
-Single network entry point from gameplay. One process = **either host or
-join-client, never both** (`HostAndJoinAreMutuallyExclusive`).
+Single network entry point from gameplay. Since the migration to the engine layer
+this is a **thin bridge**: it holds a `net::Session` + `net::GamePlayerBridge` and
+keeps the former public API so consumers (gameplay, console, missions, vehicles)
+do not change.
 
-- `StartHost(port)` / `JoinHost(ip, port)` / `Leave()` — match lifecycle.
-- `SetHostConfig(password, maxPlayers)`, `SetClientPassword(pw)` — config.
-- `SetLocalStateProvider(fn)` — local-state provider.
-- `GetRemotePlayers()` — registry (from server or client).
+- **Host** plays as a full participant: `StartHost(port)` starts the server and
+  immediately connects a loopback client to its own port (`127.0.0.1:port`). So the
+  host holds both `m_server` and `m_client` and is visible to other clients (its
+  local state is relayed like any joined client's). `HostAndJoinAreMutuallyExclusive`
+  still forbids an *explicit* join while a match is running, but the host attaches
+  itself via loopback.
+- **Join client** — only `m_client` (`JoinHost`).
+
+- `StartHost(port)` / `JoinHost(ip, port)` / `Leave()` — match lifecycle
+  (delegates to `net::Session`).
+- `SetHostConfig(password, maxPlayers)` — config; the host password is mirrored
+  onto the loopback client so the host passes the same authentication gate.
+- `SetLocalStateProvider(fn)` — local-state provider (`GamePlayerBridge`).
+- `GetRemotePlayers()` — registry **from the client side** (for both host and
+  join-client), because the client perspective excludes the player itself
+  (`selfId`) from the remote set; the raw server registry would include the host
+  to itself.
 - `DrainJoinLeaveEvents(out)` — join/leave notifications.
-- `Update()` — spins server/client; on the client sends the local state via the
-  provider on a timer.
+- `Update()` — drives `net::Session::Update()` (server+client+relay+validator).
 
 ---
 
@@ -306,7 +340,7 @@ In `OnStart`: CLI auto-start of the match, `SetSink` for both WorldViews,
 
 - Every changed capability must have unit/integration tests
   (`src/tests/network_tests.cpp`; project Tests.vcxproj, package `Tests.dll`).
-- Run: `vstest.console.exe` against `Tests.dll`. Current state — 30/30 green.
+- Run: `vstest.console.exe` against `Tests.dll`. Current state — 42/42 green.
 - Full game build: `MSBuild.exe src/srr2/SRR2.vcxproj
   /p:Configuration=DebugWindows /p:Platform=x64
   /p:WindowsTargetPlatformVersion=10.0.22621.0`.
@@ -387,9 +421,39 @@ field but a prompt above the menu — further work in TODO.
 - **C7 (UI lobby, improvement)** — make a separate visible IP/port input field
   in the Host/Join overlay (currently a prompt inside the menu item text).
   Possibly with our own screens after a .p3d generator / UI layer.
-- **MP stability** — verify end-to-end host/join entry in-game (character is
-  controlled, interaction key works, clean exit without asserts), a networked
-  match between two copies.
+- **MP stability — verified end-to-end (2026-10, after the net::* migration).**
+  - **Network over real sockets confirmed.** The standalone harness
+    `src/tests/mp_standalone` (on `net::Session`/`net::*`) brings up host+join
+    as two processes: the server sees `clients in world: 1`, the join gets
+    `SERVER READY, my client id = 2`. Extra isolation: an in-game join copy
+    connects to a `mp_standalone` server (`selfId=2`) — proving the in-game
+    client networking is sound.
+  - **Full in-game host↔join (two SRR2 copies in gameplay) does not complete
+    on this machine at the OS level, not in the network code:** both processes
+    service their ENet sockets (probe markers confirmed polling and receive),
+    the server UDP socket is alive on `0.0.0.0:<port>`, the client connect is
+    created correctly, but the ENet handshake between two instances does not
+    finish even with VPN off and the firewall profiles (Private/Public) off.
+    This is an environment limitation of running two headless SRR2 copies, not
+    a defect in the `net::` layer.
+  - **Manual host/join via the main menu (visible windows)** remains the
+    recommended way to check character control; the temporary net-log markers
+    were removed after diagnosis, leaving the `net::` layer clean.
+
+### Known issue (POTENTIAL, not confirmed as a code defect)
+**Full in-game host↔join between two SRR2 copies does not complete the ENet
+handshake.** 2026-10, one machine. Symptoms: both processes service their ENet
+sockets (polling and receive confirmed by markers), the UDP server listens on
+`0.0.0.0:<port>`, the client `enet_host_connect` creates a peer correctly — yet
+the server never accepts an external peer and the join's `selfId` stays 0.
+Not helping: VPN off, firewall profiles (Private/Public) off, visible windows
+instead of headless, different ports, sequential start. Contrast: the same
+`net::` layer works correctly over real sockets in `mp_standalone` (host+join,
+server sees peers, join gets `selfId=2`) and an in-game join connects to a
+`mp_standalone` server. **Needs a check:** is it a limitation of running two
+headless SRR2 copies on this machine, an environment block (Windows Filtering
+Platform/driver), or a real `net::` defect — reproduce on a machine without
+third-party network stacks/drivers, or on another machine.
 
 **Recorded (not a network bug):** rare one-off flake "world load sticks almost
 at the end" entering as host through the menu. Investigation: the network

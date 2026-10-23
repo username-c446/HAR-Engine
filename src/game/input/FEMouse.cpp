@@ -6,6 +6,7 @@
 #include <contexts/contextenum.h>
 #include <contexts/gameplay/gameplaycontext.h>
 #include <main/win32platform.h>
+#include <main/commandlineoptions.h>
 #include <SDL2/SDL.h>
 
 #ifdef ENABLE_DYNA_LOADED_IMAGES
@@ -109,6 +110,8 @@ void FEMouse::Update()
     // mode is already set and fixes the condition regardless of what dropped it.
     // Note: we deliberately do NOT call SetupInGameMode() here because it warps
     // the cursor to the window centre every frame, which fights mouse look.
+    // Headless clients must never grab or hide the user's cursor.
+    if( CommandLineOptions::Get( CLO_HEADLESS ) ) return;
     if( ingame )
     {
         m_pCursor->SetVisible( false );

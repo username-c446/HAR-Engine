@@ -1,26 +1,37 @@
 #pragma once
 
-#include "NetworkServer.h"
-#include "NetworkClient.h"
 #include "PlayerNetworkState.h"
 #include "MissionSyncState.h"
+#include "RemotePlayerManager.h"   // placeholder; will be bridged from net::Session
+#include "../netengine/Session.h"
+#include "../netengine/GamePlayerBridge.h"
 
 #include <memory>
 #include <vector>
 
-// Singleton orchestrating an online match on top of NetworkServer/NetworkClient.
-// Provides host/join/leave lifecycle and, each Update, pushes the local player's
-// state (supplied by the game through SetLocalStateProvider) and ingests remote
-// players' states from the network.
+// Singleton orchestrating an online match. This is a THIN BRIDGE: it keeps the
+// same public API the rest of the game already calls (StartHost/JoinHost/Leave/
+// IsInMatch/GetRemotePlayers), but its internals delegate to the reusable engine
+// layer (net::Session + net::GamePlayerBridge) instead of the old
+// NetworkServer/NetworkClient stack.
 //
-// The local-state source is decoupled from the game singletons so the manager
-// stays unit-testable: the playing context wires up a provider that reads the
-// live Avatar.
+// It stays as a process singleton so consumers (gameplay, console, main menu,
+// missions, vehicles) do not need to change while the bridge is being rolled
+// out. After the wiring is proven, this wrapper can be removed and consumers
+// switched to net::Session directly.
 class NetworkMatchManager
 {
 public:
+    // Join/leave notification consumed via DrainJoinLeaveEvents.
+    struct JoinLeaveEvent
+    {
+        unsigned short clientId;
+        bool joined;
+    };
+
     // Returns true and fills out with the current local player state, or false
-    // if no state is available yet.
+    // if no state is available yet. (This is the game-side typed provider that
+    // net::GamePlayerBridge adapts into an opaque blob for net::Session.)
     typedef bool (*LocalStateProvider)(PlayerNetworkState& out);
 
     // Returns true and fills out with the local player's mission progress.
@@ -34,8 +45,8 @@ public:
     bool JoinHost(const char* serverIp, unsigned short port);
     void Leave();
 
-    void SetLocalStateProvider(LocalStateProvider provider) { m_localStateProvider = provider; }
-    void SetMissionStateProvider(MissionStateProvider provider) { m_missionStateProvider = provider; }
+    void SetLocalStateProvider(LocalStateProvider provider);
+    void SetMissionStateProvider(MissionStateProvider provider);
 
     // Host configuration: password and slot cap applied to the server when it is
     // next (re)started via StartHost. Empty password / 0 slots = defaults.
@@ -43,19 +54,23 @@ public:
     // Password for joining a protected host (applied to an existing client).
     void SetClientPassword(const char* password);
 
-    bool IsHosting() const { return m_server != nullptr; }
-    bool IsJoined() const { return m_client != nullptr && m_client->IsConnected(); }
-    bool IsInMatch() const { return m_server != nullptr || (m_client && m_client->IsConnected()); }
+    bool IsHosting() const { return m_session && m_session->IsHost(); }
+    bool IsJoined() const { return m_session && m_session->IsJoined(); }
+    bool IsInMatch() const { return m_session && m_session->IsInMatch(); }
 
-    const RemotePlayerManager& GetRemotePlayers() const;
-    unsigned short GetLocalClientId() const { return m_client ? m_client->GetClientId() : 0; }
+    // The authoritative remote-player registry the game reads each frame to
+    // draw/interpolate remote players. Maintained by the bridge.
+    const RemotePlayerManager& GetRemotePlayers() const { return m_remotePlayers; }
+    unsigned short GetLocalClientId() const { return m_session ? m_session->GetLocalPeerId() : 0; }
     unsigned short GetHostPort() const { return m_hostPort; }
 
     // Drains the client's pending join/leave notifications. Empty unless we are
     // a joined client. Lets the UI print "Player connected/disconnected".
-    void DrainJoinLeaveEvents(std::vector<NetworkClient::JoinLeaveEvent>& out);
+    void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);
 
-    // Drives the network layer. Call once per game frame from the playing context.
+    // Drives the network layer + world bridge. Call once per game frame from
+    // the playing context. (World-view interpolation is done by the caller
+    // from GetRemotePlayers(), kept as before for the bridge rollout.)
     void Update();
 
 private:
@@ -67,11 +82,17 @@ private:
 
     static NetworkMatchManager* spInstance;
 
-    std::unique_ptr<NetworkServer> m_server;
-    std::unique_ptr<NetworkClient> m_client;
+    // Bridge to the reusable engine network layer.
+    std::unique_ptr<net::Session> m_session;
+    std::unique_ptr<net::GamePlayerBridge> m_bridge;
+
     unsigned short m_hostPort;
     LocalStateProvider m_localStateProvider;
     MissionStateProvider m_missionStateProvider;
     char m_hostPassword[65];
     unsigned short m_hostMaxPlayers;
+
+    // Game-side authoritative remote set, fed by the bridge.
+    RemotePlayerManager m_remotePlayers;
+    mutable std::vector<JoinLeaveEvent> m_pendingEvents;
 };
