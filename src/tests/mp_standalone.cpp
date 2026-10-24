@@ -23,6 +23,7 @@
 #include "p3d/p3dwriter.h"
 
 #include "mp_network_fakes.h"
+#include "ServerModManager.h"   // live server-side Lua event bus (--mod)
 
 // Simple game-side typed local provider: a slowly-advancing fake position.
 static struct {
@@ -78,15 +79,38 @@ int main(int argc, char** argv)
     if (strcmp(mode, "server") == 0 || strcmp(mode, "host") == 0) {
         net::Session server;
         if (password != NULL && password[0] != '\0') server.SetHostPassword(password);
+        // Log inbound user-data events (PID_USER) so we can verify the open
+        // custom-event channel over real sockets between two processes.
+        server.SetCustomEventSink([](net::PeerId from, const uint8_t* d, uint16_t size) {
+            printf("[%s] custom-event from peer %u, %u bytes, first=0x%02x\n",
+                   (const char*) ( "host" ), (unsigned)from, (unsigned)size,
+                   size ? d[0] : 0);
+            fflush(stdout);
+        });
         if (!server.StartHost(port, 0x5EED0000u | static_cast<uint32_t>(port))) {
             printf("[%s] failed to start on port %u\n", mode, port);
             return 2;
         }
         if (modPath != NULL) {
-            // Server-side Lua mod hook: the standalone does not embed Lua, so
-            // we acknowledge and continue (mod validation is covered elsewhere).
-            printf("[%s] note: --mod is accepted but Lua mods are loaded by the game's ServerModManager, not the engine session.\n", mode);
+            // Live server-side Lua mod: load it into ServerModManager and, once
+            // a client connects, emit a real event through the session loop so
+            // the event bus is exercised in a running process (not just tests).
+            ServerModManager liveMod;
+            if (liveMod.LoadScript(modPath)) {
+                printf("[%s] loaded Lua mod: %s\n", mode, modPath);
+                fflush(stdout);
+                server.SetJoinLeaveFn([&liveMod](net::PeerId p, bool joined) {
+                    if (joined) {
+                        int ev = static_cast<int>(p);
+                        liveMod.Emit("player.joined", &ev, 1);
+                    }
+                });
+            } else {
+                printf("[%s] WARNING: failed to load Lua mod: %s\n", mode, modPath);
+                fflush(stdout);
+            }
         }
+        else if (strcmp(mode, "server") != 0) { (void)0; }
         fflush(stdout);
         printf("[%s] listening on %u. connect with mp_standalone join ...\n", mode, port);
         fflush(stdout);
@@ -151,8 +175,17 @@ int main(int argc, char** argv)
                     fflush(stdout);
                     announced = true;
                 }
-                // Send a slowly moving signature once ready.
+                // Send a moving signature once ready.
                 if (++tick % 6 == 0) g_fake.st.x += 0.1f;
+                // On the 5th tick, ship a custom user event to prove the open
+                // PID_USER channel works over real sockets between processes.
+                if (tick == 5) {
+                    const uint8_t msg[3] = { 0xDE, 0xAD, 0x07 };
+                    bool sent = client.SendCustomEvent(msg, sizeof(msg));
+                    printf("[join] sent custom event: %s\n", sent ? "yes" : "no");
+                    fflush(stdout);
+                    if (!sent) break;
+                }
             }
         }
     }
