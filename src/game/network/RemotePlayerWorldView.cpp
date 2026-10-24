@@ -27,7 +27,7 @@ void RemotePlayerWorldView::Sync(const RemotePlayerManager& players)
     {
         if (!players.HasPlayer(it->first))
         {
-            if (m_sink.despawn) m_sink.despawn(it->first, it->second.handle);
+            if (m_sink.despawn && it->second.handle) m_sink.despawn(it->first, it->second.handle);
             it = m_entries.erase(it);
         }
         else
@@ -44,20 +44,23 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
     auto it = m_entries.find(playerId);
     if (it == m_entries.end())
     {
-        // New remote player: spawn exactly at the reported pose (no fly-in).
-        void* handle = m_sink.spawn ? m_sink.spawn(playerId) : nullptr;
-        if (handle == nullptr) return;
         Entry& entry = m_entries[playerId];
-        entry.handle = handle;
         entry.lastActionEvent = state.actionEvent; // a held action is not replayed
         entry.jumping = jumpingNow;
         entry.track.Push(serverTimeMs, state);
-        if (m_sink.move) m_sink.move(playerId, handle, state);
+        UpdatePresence(playerId, entry, state);
         return;
     }
 
     Entry& entry = it->second;
-    if (!entry.track.Push(serverTimeMs, state)) return; // the same packet again
+    bool fresh = entry.track.Push(serverTimeMs, state);
+    UpdatePresence(playerId, entry, state);
+    if (!fresh || entry.handle == nullptr) // the same packet again / not shown
+    {
+        entry.jumping = jumpingNow;
+        entry.lastActionEvent = state.actionEvent;
+        return;
+    }
 
     // Rising edge of a jump: play the skeletal jump once.
     if (jumpingNow && !entry.jumping && m_sink.jump) m_sink.jump(playerId, entry.handle);
@@ -73,12 +76,39 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
     entry.lastActionEvent = state.actionEvent;
 }
 
+void RemotePlayerWorldView::UpdatePresence(int playerId, Entry& entry, const PlayerNetworkState& state)
+{
+    bool visible = !m_visible || m_visible(playerId);
+    if (!visible)
+    {
+        if (entry.handle != nullptr && m_sink.despawn) m_sink.despawn(playerId, entry.handle);
+        entry.handle = nullptr;
+        return;
+    }
+    uint32_t version = m_appearance ? m_appearance(playerId) : 0;
+    if (entry.handle == nullptr)
+    {
+        // (Re)appears: spawn exactly at the reported pose (no fly-in), in its
+        // current appearance.
+        entry.handle = m_sink.spawn ? m_sink.spawn(playerId) : nullptr;
+        entry.appearanceVersion = version;
+        if (entry.handle != nullptr && m_sink.move) m_sink.move(playerId, entry.handle, state);
+        return;
+    }
+    if (version != entry.appearanceVersion)
+    {
+        entry.appearanceVersion = version;
+        if (m_sink.restyle) m_sink.restyle(playerId, entry.handle);
+    }
+}
+
 void RemotePlayerWorldView::Update(float dt)
 {
     (void)dt; // poses come from the server clock, not from frame time
     if (!m_sink.move) return;
     for (auto& kv : m_entries)
     {
+        if (kv.second.handle == nullptr) continue;
         PlayerNetworkState s;
         if (kv.second.track.Render(m_timing, s)) m_sink.move(kv.first, kv.second.handle, s);
     }
@@ -96,7 +126,7 @@ void RemotePlayerWorldView::Clear()
 {
     for (auto& kv : m_entries)
     {
-        if (m_sink.despawn) m_sink.despawn(kv.first, kv.second.handle);
+        if (m_sink.despawn && kv.second.handle) m_sink.despawn(kv.first, kv.second.handle);
     }
     m_entries.clear();
 }

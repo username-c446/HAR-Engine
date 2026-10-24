@@ -819,9 +819,26 @@ never knocked locally — with or without PvP (its owner's stream shows the trut
 `HarServer.vcxproj` (Debug/Release x64) copies `lua.dll` after the build;
 `src/server/x64/` is ignored by git.
 
-### 18.9 Still open
-- Player context (level / interior in the world) and appearance (model /
-  costume) — next.
+### 18.9 Player context and appearance (`PlayerPresence`)
+Slow-changing per-player facts are world-state records of the player's own
+object (`MakePlayerObjectId(peer)` = the peer's dynamic id, counter 0;
+`WSP_OWNER` + `WSF_ERASE_ON_OWNER_LEAVE`), not part of the 10 Hz stream — reliable,
+in the late-join snapshot, published only when they change:
+- `WOC_PLAYER_CONTEXT` (6): `u8 level | u64 zone` (interior uid, 0 = outside).
+  `RemotePlayerWorldView::SetPresence` / `RemoteVehicleWorldView::SetVisibility`
+  show a player (and its machine) only in our context; outside it the state is
+  still tracked but there is no puppet. Unknown context = shown.
+- `WOC_APPEARANCE` (7): `char model[32] | char anim[16]` = the real model (skin
+  included) and animation bank of the local character
+  (`CharacterManager::GetModelName/GetAnimName`). The game samples them every frame
+  (`PublishLocalPresence`), so ANY appearance change (clothing purchase, mission,
+  cheat, a future outfit system) replicates without extra hooks. The remote puppet
+  is created with that model and bank (instead of the fixed `homer`/`npd` — the
+  player's own clips are available now) and restyled in place on a change
+  (sink `restyle` → `CharacterManager::SwapData`). Until the record arrives the
+  puppet uses `homer` and is restyled when it does.
+
+### 18.10 Still open
 - Pushed parked cars (entity bound to the static object — `NEK_PARKED_CAR` and
   `AddLocal(handle, spawn, boundId)` are in place, the parked-car hooks are not),
   parked-car entry rollback.

@@ -3,6 +3,7 @@
 #include "RemotePlayerManager.h"
 #include "RemoteStateTrack.h"
 
+#include <functional>
 #include <map>
 #include <string.h>
 #include <cstdint>
@@ -28,6 +29,8 @@ public:
     typedef void  (*JumpFn)(int playerId, void* handle); // rising edge of a remote jump
     typedef void  (*ActionFn)(int playerId, void* handle, uint8_t actionId); // new one-shot ACTION_* id (sequence bits stripped)
     typedef void  (*DespawnFn)(int playerId, void* handle);
+    // The player's appearance changed: restyle the puppet in place.
+    typedef void  (*RestyleFn)(int playerId, void* handle);
 
     struct Sink
     {
@@ -36,7 +39,14 @@ public:
         JumpFn jump;
         ActionFn action;
         DespawnFn despawn;
+        RestyleFn restyle;
     };
+
+    // Presence (PlayerPresence): whether a player shares our context (level /
+    // interior) and its appearance version. A player outside our context has
+    // no puppet (its state is still tracked); a new appearance version restyles.
+    typedef std::function<bool(int playerId)> VisibleFn;
+    typedef std::function<uint32_t(int playerId)> AppearanceVersionFn;
 
     RemotePlayerWorldView();
     ~RemotePlayerWorldView();
@@ -44,6 +54,11 @@ public:
     void SetSink(const Sink& sink) { m_sink = sink; }
     // Server clock + interpolation parameters (no clock: newest state shown).
     void SetTiming(const RemoteStateTrack::Timing& timing) { m_timing = timing; }
+    void SetPresence(VisibleFn visible, AppearanceVersionFn appearance)
+    {
+        m_visible = std::move(visible);
+        m_appearance = std::move(appearance);
+    }
 
     // Called every frame with the authoritative set of remote players. Spawns
     // new players, records new samples (and fires jump / action edges),
@@ -65,14 +80,19 @@ private:
 
     struct Entry
     {
-        void*            handle = nullptr;
+        void*            handle = nullptr;   // null while outside our context
+        uint32_t         appearanceVersion = 0;
         RemoteStateTrack track;
         uint8_t          lastActionEvent = 0; // fires the action sink only on change
         bool             jumping = false;     // FLAG_JUMPING / FLAG_IN_AIR rising edge
     };
 
+    void UpdatePresence(int playerId, Entry& entry, const PlayerNetworkState& state);
+
     Sink m_sink;
     RemoteStateTrack::Timing m_timing;
+    VisibleFn m_visible;
+    AppearanceVersionFn m_appearance;
     std::map<int, Entry> m_entries;
 
     RemotePlayerWorldView(const RemotePlayerWorldView&);

@@ -6,6 +6,7 @@
 #include "NetWorldRegistry.h"
 #include "NetEntityManager.h"
 #include "PlayerEconomy.h"
+#include "PlayerPresence.h"
 #include "GameServer.h"
 #include "../netengine/Session.h"
 #include "../netengine/GamePlayerBridge.h"
@@ -68,6 +69,7 @@ public:
     static NetWorldRegistry& WorldRegistry();
     static NetEntityManager& Entities();
     static PlayerEconomy&    Economy();
+    static PlayerPresence&   Presence();
 
     bool StartHost(unsigned short port);
     bool JoinHost(const char* serverIp, unsigned short port);

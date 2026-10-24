@@ -4,6 +4,7 @@
 #include "RemotePlayerManager.h"
 #include "RemoteStateTrack.h"
 
+#include <functional>
 #include <map>
 #include <cstring>
 
@@ -38,6 +39,9 @@ public:
 
     void SetSink(const Sink& sink) { m_sink = sink; }
     void SetTiming(const RemoteStateTrack::Timing& timing) { m_timing = timing; }
+    // A driver outside our context (level / interior) has no ghost machine.
+    typedef std::function<bool(int playerId)> VisibleFn;
+    void SetVisibility(VisibleFn fn) { m_visible = std::move(fn); }
 
     // Ingest one remote driver's latest state (with its server sample time).
     // Spawns a ghost when the driver is in a machine, despawns it when the
@@ -74,6 +78,7 @@ private:
 
     Sink m_sink;
     RemoteStateTrack::Timing m_timing;
+    VisibleFn m_visible;
     std::map<int, Entry> m_entries;
 
     RemoteVehicleWorldView(const RemoteVehicleWorldView&);

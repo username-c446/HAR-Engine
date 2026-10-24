@@ -361,14 +361,32 @@ namespace
         return true;
     }
 
+    // How a remote player looks: its replicated appearance (PlayerPresence),
+    // or the default character until that record arrives (then restyled).
+    void RemoteAppearanceOf( int playerId, const char*& model, const char*& anim )
+    {
+        model = "homer";
+        anim = "homer";
+        const net::PlayerAppearance* app =
+            NetworkMatchManager::Presence().Appearance( static_cast<net::PeerId>( playerId ) );
+        if ( app != NULL )
+        {
+            model = app->model;
+            if ( app->anim[0] != '\0' ) anim = app->anim;
+        }
+    }
+
     // World sink for remote players: spawn/move/despawn lightweight NPCs that
     // mirror what other network players report through their PlayerNetworkState.
     void* RemotePlayerSpawn( int playerId )
     {
         char name[32];
         sprintf( name, "mp_remote_%d", playerId );
+        const char* model = NULL;
+        const char* anim = NULL;
+        RemoteAppearanceOf( playerId, model, anim );
         Character* c = GetCharacterManager()->AddCharacter(
-            CharacterManager::NPC, name, "homer", "npd", NULL );
+            CharacterManager::NPC, name, model, anim, NULL );
         if ( c == NULL )
         {
             rReleasePrintf( "net: could not spawn remote player %d\n", playerId );
@@ -449,6 +467,40 @@ namespace
             c->SetPosition( pos );
         }
 }
+
+    // The remote player's appearance changed (costume, character): swap the
+    // puppet's model and animation bank in place.
+    void RemotePlayerRestyle( int playerId, void* handle )
+    {
+        Character* c = static_cast<Character*>( handle );
+        if ( c == NULL ) return;
+        const char* model = NULL;
+        const char* anim = NULL;
+        RemoteAppearanceOf( playerId, model, anim );
+        GetCharacterManager()->SwapData( c, model, anim );
+    }
+
+    // Publishes where the local player is and how it looks (PlayerPresence:
+    // replicated only when it changes).
+    void PublishLocalPresence()
+    {
+        AvatarManager* am = GetAvatarManager();
+        Avatar* avatar = am != NULL ? am->GetAvatarForPlayer( 0 ) : NULL;
+        if ( avatar == NULL || avatar->GetCharacter() == NULL ) return;
+
+        net::PlayerContext ctx;
+        ctx.level = static_cast<uint8_t>( GetGameplayManager()->GetCurrentLevelIndex() );
+        ctx.zone = GetInteriorManager()->IsInside() ? static_cast<uint64_t>( GetInteriorManager()->GetInterior() ) : 0;
+        NetworkMatchManager::Presence().SetLocalContext( ctx );
+
+        net::PlayerAppearance app;
+        const char* model = GetCharacterManager()->GetModelName( avatar->GetCharacter() );
+        const char* anim = GetCharacterManager()->GetAnimName( avatar->GetCharacter() );
+        if ( app.Set( model, anim ) )
+        {
+            NetworkMatchManager::Presence().SetLocalAppearance( app );
+        }
+    }
 
     void RemotePlayerDespawn( int playerId, void* handle )
     {
@@ -992,7 +1044,15 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     sink.jump = &RemotePlayerJump;
     sink.action = &RemotePlayerAction;
     sink.despawn = &RemotePlayerDespawn;
+    sink.restyle = &RemotePlayerRestyle;
     GetRemotePlayerWorldView()->SetSink( sink );
+    // A remote player is shown only in our level / interior, in its own
+    // replicated appearance.
+    GetRemotePlayerWorldView()->SetPresence(
+        []( int playerId ) { return NetworkMatchManager::Presence().SharesContext( static_cast<net::PeerId>( playerId ) ); },
+        []( int playerId ) { return NetworkMatchManager::Presence().AppearanceVersion( static_cast<net::PeerId>( playerId ) ); } );
+    GetRemoteVehicleWorldView()->SetVisibility(
+        []( int playerId ) { return NetworkMatchManager::Presence().SharesContext( static_cast<net::PeerId>( playerId ) ); } );
 
     // Wire the ghost-vehicle view so remote drivers are mirrored as machines.
     RemoteVehicleWorldView::Sink vsink;
@@ -1386,6 +1446,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
         }
         else
         {
+        PublishLocalPresence();
         // Remote players are rendered behind the server clock (snapshot
         // interpolation), so their motion does not depend on packet timing.
         {

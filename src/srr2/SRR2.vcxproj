@@ -1096,6 +1096,7 @@
  <ClCompile Include="..\game\netengine\ServerEndpoint.cpp" />
  <ClCompile Include="..\game\netengine\ClientEndpoint.cpp" />
  <ClCompile Include="..\game\netengine\Session.cpp" />
+    <ClCompile Include="..\game\network\PlayerPresence.cpp" />
     <ClCompile Include="..\game\netengine\ServerCore.cpp" />
     <ClCompile Include="..\game\network\PlayerMovementValidator.cpp" />
     <ClCompile Include="..\game\network\GameServer.cpp" />

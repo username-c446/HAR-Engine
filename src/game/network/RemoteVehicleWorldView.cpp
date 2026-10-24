@@ -12,7 +12,8 @@ RemoteVehicleWorldView::~RemoteVehicleWorldView()
 
 void RemoteVehicleWorldView::SyncDriver(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
-    bool inVehicle = (state.inVehicle != 0) && state.vehicleModel[0] != '\0';
+    bool inVehicle = (state.inVehicle != 0) && state.vehicleModel[0] != '\0'
+                  && (!m_visible || m_visible(playerId));
 
     auto it = m_entries.find(playerId);
     if (it == m_entries.end())

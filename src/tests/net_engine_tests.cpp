@@ -8,6 +8,8 @@
 #include "GameServer.h"
 #include "NetEntityManager.h"
 #include "RemoteStateTrack.h"
+#include "PlayerPresence.h"
+#include "RemotePlayerWorldView.h"
 #include "../game/netengine/NetTime.h"
 #include "../game/netengine/ServerCore.h"
 #include "../game/netengine/Session.h"
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <vector>
+#include <string>
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 
@@ -579,6 +582,116 @@ namespace NetworkTests
             MigGhost* g = g_migGhosts.back();
             Assert::AreEqual(5.0f, g->last.x, 0.01f);
             m.OnMatchEnd();
+        }
+    };
+
+    namespace
+    {
+        int g_pvSpawns = 0, g_pvDespawns = 0, g_pvRestyles = 0;
+        void* PvSpawn(int id) { ++g_pvSpawns; return reinterpret_cast<void*>(static_cast<size_t>(0x3000 + id)); }
+        void PvMove(int, void*, const PlayerNetworkState&) {}
+        void PvDespawn(int, void*) { ++g_pvDespawns; }
+        void PvRestyle(int, void*) { ++g_pvRestyles; }
+    }
+
+    TEST_CLASS(PlayerPresenceTests)
+    {
+    public:
+        TEST_METHOD(PublishesOnWelcomeAndOnChangeOnly)
+        {
+            PlayerPresence p;
+            std::vector<net::WorldStateOp> ops;
+            p.SetSender([&](const net::WorldStateOp& op) { ops.push_back(op); return true; });
+            net::PlayerContext c; c.level = 2; c.zone = 0;
+            p.SetLocalContext(c);
+            net::PlayerAppearance a; a.Set("homer", "homer");
+            p.SetLocalAppearance(a);
+            Assert::AreEqual((size_t)0, ops.size(), L"Nothing before our peer id is known.");
+            p.OnWelcomed(4);
+            Assert::AreEqual((size_t)2, ops.size());
+            Assert::IsTrue(ops[0].key.object == net::MakePlayerObjectId(4) && ops[0].policy == net::WSP_OWNER
+                           && (ops[0].flags & net::WSF_ERASE_ON_OWNER_LEAVE));
+            p.SetLocalContext(c);
+            p.SetLocalAppearance(a);
+            Assert::AreEqual((size_t)2, ops.size(), L"Unchanged facts are not resent.");
+            c.zone = 0xABCDEF0123ull; // entered an interior
+            p.SetLocalContext(c);
+            a.Set("h_evil", "homer"); // a costume
+            p.SetLocalAppearance(a);
+            Assert::AreEqual((size_t)4, ops.size());
+            Assert::AreEqual((int)net::WOC_APPEARANCE, (int)ops[3].key.channel);
+            net::PlayerAppearance back;
+            Assert::IsTrue(back.Decode(ops[3].value) && std::string(back.model) == "h_evil");
+            net::PlayerContext cb;
+            Assert::IsTrue(cb.Decode(ops[2].value) && cb.zone == 0xABCDEF0123ull && cb.level == 2);
+        }
+
+        TEST_METHOD(RemoteFactsDriveVisibilityAndRestyle)
+        {
+            PlayerPresence p;
+            p.SetSender([](const net::WorldStateOp&) { return true; });
+            net::PlayerContext mine; mine.level = 1; mine.zone = 0;
+            p.SetLocalContext(mine);
+            p.OnWelcomed(1);
+
+            auto record = [](net::PeerId peer, uint8_t ch, const net::WorldStateValue& v) {
+                net::WorldStateEntry e;
+                e.key.object = net::MakePlayerObjectId(peer); e.key.channel = ch;
+                e.owner = peer; e.policy = net::WSP_OWNER; e.value = v;
+                return e;
+            };
+            Assert::IsTrue(p.SharesContext(2), L"Unknown context: shown.");
+            net::PlayerContext inside; inside.level = 1; inside.zone = 77;
+            net::WorldStateValue v; inside.Encode(v);
+            p.OnAuthoritative(record(2, net::WOC_PLAYER_CONTEXT, v), net::WSR_REMOTE);
+            Assert::IsFalse(p.SharesContext(2), L"In an interior while we are outside.");
+
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            std::memset(&sink, 0, sizeof(sink));
+            sink.spawn = &PvSpawn; sink.move = &PvMove; sink.despawn = &PvDespawn; sink.restyle = &PvRestyle;
+            view.SetSink(sink);
+            view.SetPresence([&](int id) { return p.SharesContext((net::PeerId)id); },
+                             [&](int id) { return p.AppearanceVersion((net::PeerId)id); });
+            g_pvSpawns = g_pvDespawns = g_pvRestyles = 0;
+            RemotePlayerManager players;
+            players.UpdatePlayer(2, StateAt(0, 0));
+            view.Sync(players);
+            Assert::AreEqual(0, g_pvSpawns, L"No puppet outside our context.");
+
+            net::PlayerContext out; out.level = 1; out.zone = 0;
+            out.Encode(v);
+            p.OnAuthoritative(record(2, net::WOC_PLAYER_CONTEXT, v), net::WSR_REMOTE);
+            view.Sync(players);
+            Assert::AreEqual(1, g_pvSpawns, L"Back outside: shown.");
+
+            net::PlayerAppearance a; a.Set("marge", "marge");
+            net::WorldStateValue av; a.Encode(av);
+            p.OnAuthoritative(record(2, net::WOC_APPEARANCE, av), net::WSR_REMOTE);
+            Assert::IsTrue(p.Appearance(2) != nullptr && std::string(p.Appearance(2)->model) == "marge");
+            view.Sync(players);
+            Assert::AreEqual(1, g_pvRestyles, L"A new appearance restyles in place.");
+            Assert::AreEqual(1, g_pvSpawns);
+            view.Sync(players);
+            Assert::AreEqual(1, g_pvRestyles, L"Once per change.");
+
+            inside.Encode(v);
+            p.OnAuthoritative(record(2, net::WOC_PLAYER_CONTEXT, v), net::WSR_REMOTE);
+            view.Sync(players);
+            Assert::AreEqual(1, g_pvDespawns, L"Entering an interior hides the puppet.");
+            view.Clear();
+            Assert::AreEqual(1, g_pvDespawns, L"A hidden player has nothing to despawn.");
+        }
+
+        TEST_METHOD(GarbageAppearanceIsRejected)
+        {
+            net::PlayerAppearance a;
+            net::WorldStateValue v; v.len = 5;
+            Assert::IsFalse(a.Decode(v));
+            net::WorldStateValue big; big.len = 48;
+            std::memset(big.bytes, 'x', 48);
+            Assert::IsTrue(a.Decode(big));
+            Assert::AreEqual((size_t)31, std::strlen(a.model), L"Terminator enforced.");
         }
     };
 }

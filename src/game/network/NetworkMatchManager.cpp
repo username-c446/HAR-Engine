@@ -59,6 +59,12 @@ PlayerEconomy& NetworkMatchManager::Economy()
     return s_economy;
 }
 
+PlayerPresence& NetworkMatchManager::Presence()
+{
+    static PlayerPresence s_presence;
+    return s_presence;
+}
+
 NetworkMatchManager::NetworkMatchManager()
     : m_hostPort(0)
     , m_localStateProvider(nullptr)
@@ -190,6 +196,7 @@ void NetworkMatchManager::AttachSession()
     {
         WorldRegistry().OnAuthoritative(e, reason);
         Entities().OnAuthoritative(e, reason);
+        Presence().OnAuthoritative(e, reason);
     });
     s->SetEntityStateSink([](net::PeerId owner, const net::EntityStateRecord& rec, uint32_t serverTimeMs)
     {
@@ -227,6 +234,7 @@ void NetworkMatchManager::AttachSession()
             return s->SendEntityEvent(entity, kind, data, size);
         });
     Entities().SetClock([s]() { return s->ServerTimeMs(); });
+    Presence().SetSender([s](const net::WorldStateOp& op) { return s->RequestWorldState(op); });
     Economy().SetSender([s](net::CounterId c, uint8_t reason, int32_t delta, uint64_t claim)
     {
         return s->RequestLedgerChange(c, reason, delta, claim);
@@ -259,6 +267,8 @@ void NetworkMatchManager::ResetServices()
     WorldRegistry().ClearState();
     Entities().SetSenders(NetEntityManager::SendOpFn(), NetEntityManager::SendStatesFn());
     Entities().SetClock(NetEntityManager::ClockFn());
+    Presence().SetSender(PlayerPresence::SendFn());
+    Presence().OnMatchEnd();
     Entities().OnMatchEnd();
     Economy().SetSender(PlayerEconomy::SendFn());
     Economy().OnMatchEnd();
@@ -410,6 +420,7 @@ void NetworkMatchManager::Update(float dtSeconds)
     if (!m_entitiesWelcomed && m_session->IsWelcomed())
     {
         Entities().OnWelcomed(m_session->GetLocalPeerId());
+        Presence().OnWelcomed(m_session->GetLocalPeerId());
         m_entitiesWelcomed = true;
     }
 
