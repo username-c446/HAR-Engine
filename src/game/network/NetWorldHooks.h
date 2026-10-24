@@ -47,4 +47,6 @@ namespace networld
     // apply it locally.
     bool     ReportRemotePlayerHit(void* character, float vx, float vy, float vz);
     bool     IsInMatch();
+    // Our peer id in the running match (0 = none).
+    net::PeerId LocalPeerId();
 }

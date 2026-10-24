@@ -93,4 +93,10 @@ namespace networld
         NetworkMatchManager* m = NetworkMatchManager::GetInstance();
         return m != nullptr && m->IsInMatch();
     }
+
+    net::PeerId LocalPeerId()
+    {
+        NetworkMatchManager* m = NetworkMatchManager::GetInstance();
+        return (m != nullptr && m->IsInMatch()) ? static_cast<net::PeerId>(m->GetLocalClientId()) : 0;
+    }
 }

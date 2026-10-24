@@ -941,9 +941,28 @@ The relayed player sample is 31 bytes framed (4 frame + 6 relay header + 21).
   2.4 s per input device (`DIERR_OTHERAPPHASPRIO`). It now tries once; every poll
   re-acquires the device anyway. Two games + server: both in gameplay in 6-14 s.
 
+### 18.12 Parked-car entry: claim and rollback (P5)
+`network/ObjectClaim.h`: an exclusive claim is a record whose value is the
+claimant's peer id (`EncodeClaim`, u16 LE) written with `WSP_FIRST_WRITE`; the
+server keeps the first claim, every client learns the winner from the
+authoritative record (a loser through `WSR_REJECT`, which carries the current
+entry); `ClaimOutcomeOf(value, self)` → `CLAIM_OURS` / `CLAIM_THEIRS` /
+`CLAIM_NONE`. `networld::LocalPeerId()` gives `self`.
+`ParkedCarManager` (parked car `WOC_TAKEN`, previously the constant 1 — two
+simultaneous takers both "won"):
+- `EVENT_GETINTOVEHICLE_START` of the local player into a networked parked car:
+  the current vehicle is remembered (AddRef'd);
+- `EVENT_GETINTOVEHICLE_END`: the claim is sent (the entry is predicted);
+- verdict `CLAIM_OURS`: the entry stands; `CLAIM_THEIRS`: if the player is in
+  (or getting into) the car, the game's own get-out runs (`GetOut`, bailing out at
+  speed) and on `EVENT_GETOUTOFVEHICLE_END` the previous current vehicle is
+  restored and our copy of the car removed — the winner's machine is mirrored by
+  their player stream; otherwise our copy just goes.
+- The manager listened to `EVENT_GETINTOVEHICLE_END` twice (the claim was sent
+  twice); it now listens to START / END / GETOUT_END once each.
+
 ### 18.10 Still open
 - Pushed parked cars (entity bound to the static object — `NEK_PARKED_CAR` and
-  `AddLocal(handle, spawn, boundId)` are in place, the parked-car hooks are not),
-  parked-car entry rollback.
+  `AddLocal(handle, spawn, boundId)` are in place, the parked-car hooks are not).
 - Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
 - No player identity across reconnects (T7).

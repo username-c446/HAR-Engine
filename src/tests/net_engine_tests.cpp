@@ -11,6 +11,7 @@
 #include "PlayerPresence.h"
 #include "RemotePlayerWorldView.h"
 #include "PlayerInterestPolicy.h"
+#include "ObjectClaim.h"
 #include "../game/netengine/NetTime.h"
 #include "../game/netengine/ServerCore.h"
 #include "../game/netengine/Session.h"
@@ -1019,6 +1020,61 @@ namespace NetworkTests
             Assert::AreEqual((size_t)1, g_migGhosts.size());
             Assert::AreEqual(30.0f, g_migGhosts[0]->last.x, 0.01f);
             m.OnMatchEnd();
+        }
+    };
+
+    TEST_CLASS(ObjectClaimTests)
+    {
+    public:
+        TEST_METHOD(ClaimOutcomeNamesTheWinner)
+        {
+            net::WorldStateValue v;
+            v.len = net::EncodeClaim(300, v.bytes); // > 255: both bytes matter
+            Assert::AreEqual((int)net::CLAIM_OURS, (int)net::ClaimOutcomeOf(v, 300));
+            Assert::AreEqual((int)net::CLAIM_THEIRS, (int)net::ClaimOutcomeOf(v, 44));
+            Assert::AreEqual((int)net::CLAIM_THEIRS, (int)net::ClaimOutcomeOf(v, 0), L"Not in a match: never ours.");
+            v.len = 1; v.bytes[0] = 1;
+            Assert::AreEqual((int)net::CLAIM_NONE, (int)net::ClaimOutcomeOf(v, 1), L"Not a claim record.");
+            v.len = net::EncodeClaim(0, v.bytes);
+            Assert::AreEqual((int)net::CLAIM_NONE, (int)net::ClaimOutcomeOf(v, 0));
+        }
+
+        TEST_METHOD(TwoPlayersClaimTheSameCarAndBothLearnTheWinner)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 1));
+            net::Session a, b;
+            const uint64_t car = 0x0000123400000005ull; // a static world object id
+            net::WorldStateValue seenA, seenB;
+            bool gotA = false, gotB = false;
+            a.SetWorldStateSink([&](const net::WorldStateEntry& e, net::WorldStateReason, net::PeerId) {
+                if (e.key.object == car && e.key.channel == 9) { seenA = e.value; gotA = true; }
+            });
+            b.SetWorldStateSink([&](const net::WorldStateEntry& e, net::WorldStateReason, net::PeerId) {
+                if (e.key.object == car && e.key.channel == 9) { seenB = e.value; gotB = true; }
+            });
+            Assert::IsTrue(a.Join("127.0.0.1", port));
+            Assert::IsTrue(b.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpUntil({ &host, &a, &b }, [&] { return a.IsWelcomed() && b.IsWelcomed(); }));
+
+            // Both got in at once: each predicts its own claim.
+            net::WorldStateOp op;
+            op.key.object = car; op.key.channel = 9;
+            op.kind = net::WSO_SET; op.policy = net::WSP_FIRST_WRITE;
+            op.value.len = net::EncodeClaim(a.GetLocalPeerId(), op.value.bytes);
+            Assert::IsTrue(a.RequestWorldState(op));
+            op.value.len = net::EncodeClaim(b.GetLocalPeerId(), op.value.bytes);
+            Assert::IsTrue(b.RequestWorldState(op));
+
+            Assert::IsTrue(PumpUntil({ &host, &a, &b }, [&] {
+                return gotA && gotB && seenA == seenB;
+            }), L"Both converge on one claimant.");
+            net::ClaimOutcome oa = net::ClaimOutcomeOf(seenA, a.GetLocalPeerId());
+            net::ClaimOutcome ob = net::ClaimOutcomeOf(seenB, b.GetLocalPeerId());
+            Assert::IsTrue((oa == net::CLAIM_OURS) != (ob == net::CLAIM_OURS), L"Exactly one wins.");
+            Assert::IsTrue(oa != net::CLAIM_NONE && ob != net::CLAIM_NONE);
+            b.Leave(); a.Leave(); host.Leave();
         }
     };
 }

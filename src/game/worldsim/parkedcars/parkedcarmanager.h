@@ -141,6 +141,18 @@ private:
 
     bool mParkedCarsEnabled;   // little bool to disable these during street races
 
+    // Network claim of a parked car the local player got into (WOC_TAKEN,
+    // first claim wins on the server). Until the verdict the entry is
+    // predicted; if another player won, the player is put out of the car, the
+    // previous current vehicle comes back and our copy of the car goes.
+    Vehicle* mClaimCar;          // car whose claim is pending (or lost)
+    Vehicle* mClaimPrevVehicle;  // current vehicle before the entry (AddRef'd)
+    bool     mClaimLost;         // waiting for the get-out to finish
+    void ClaimBegin( Vehicle* car );
+    void ClaimSettle();          // drop the bookkeeping (entry stands or done)
+    void ClaimLost( Vehicle* car );
+    void ClaimFinishRollback();
+
     //Prevent wasteful constructor creation.
     ParkedCarManager( const ParkedCarManager& parkedcarmanager );
     ParkedCarManager& operator=( const ParkedCarManager& parkedcarmanager );

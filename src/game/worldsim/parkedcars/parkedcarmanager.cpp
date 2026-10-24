@@ -41,6 +41,10 @@
 
 #include <meta/carstartlocator.h>
 #include <network/NetWorldHooks.h>
+#include <network/ObjectClaim.h>
+#include <ai/statemanager.h>
+#include <ai/state.h>
+#include <ai/sequencer/actioncontroller.h>
 #include <worldsim/character/charactermanager.h>
 
 #include <main/commandlineoptions.h>
@@ -463,13 +467,11 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
         }
         break;
 
-    case EVENT_GETINTOVEHICLE_END:
+    case EVENT_GETINTOVEHICLE_START:
         {
-            // The local player drove a parked car away: taken for everyone, so
-            // other clients drop their copy (the car itself is mirrored by our
-            // player stream from now on).
+            // Remember what the player drove before, in case the claim is lost.
             Character* character = static_cast<Character*>( pEventData );
-            if ( character == NULL || character != GetCharacterManager()->GetCharacter( 0 ) )
+            if ( character == NULL || character != GetCharacterManager()->GetCharacter( 0 ) || !networld::IsInMatch() )
             {
                 break;
             }
@@ -479,8 +481,44 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
             FindParkedCarInfo( v, info, isFreeCar );
             if ( info != NULL && !isFreeCar && info->mNetLoc >= 0 )
             {
-                const unsigned char taken = 1;
-                networld::RequestObjectState( v, net::WOC_TAKEN, net::WSP_FIRST_WRITE, &taken, 1 );
+                ClaimBegin( v );
+            }
+        }
+        break;
+    case EVENT_GETINTOVEHICLE_END:
+        {
+            // The local player got into a parked car: claim it. The first claim
+            // wins on the server; other clients drop their copy (the car is
+            // mirrored by the winner's player stream from now on), a loser rolls
+            // back (NetApplyCar).
+            Character* character = static_cast<Character*>( pEventData );
+            if ( character == NULL || character != GetCharacterManager()->GetCharacter( 0 ) )
+            {
+                break;
+            }
+            Vehicle* v = character->GetTargetVehicle();
+            ParkedCarInfo* info = NULL;
+            bool isFreeCar = false;
+            FindParkedCarInfo( v, info, isFreeCar );
+            unsigned char claim[ net::kClaimSize ];
+            if ( info != NULL && !isFreeCar && info->mNetLoc >= 0 &&
+                 networld::RequestObjectState( v, net::WOC_TAKEN, net::WSP_FIRST_WRITE, claim,
+                                               net::EncodeClaim( networld::LocalPeerId(), claim ) ) )
+            {
+                if ( mClaimCar != v ) ClaimBegin( v );
+            }
+            else if ( mClaimCar == v )
+            {
+                ClaimSettle(); // nothing to arbitrate (not in a match)
+            }
+        }
+        break;
+    case EVENT_GETOUTOFVEHICLE_END:
+        {
+            Character* character = static_cast<Character*>( pEventData );
+            if ( character != NULL && character == GetCharacterManager()->GetCharacter( 0 ) && mClaimLost )
+            {
+                ClaimFinishRollback();
             }
         }
         break;
@@ -939,6 +977,89 @@ void ParkedCarManager::RemoveParkedCar( ParkedCarInfo& info )
     mNumParkedCars--;
 }
 
+void ParkedCarManager::ClaimBegin( Vehicle* car )
+{
+    ClaimSettle();
+    mClaimCar = car;
+    mClaimPrevVehicle = GetGameplayManager()->GetCurrentVehicle();
+    if ( mClaimPrevVehicle == car )
+    {
+        mClaimPrevVehicle = NULL;
+    }
+    if ( mClaimPrevVehicle != NULL )
+    {
+        mClaimPrevVehicle->AddRef();
+    }
+}
+
+void ParkedCarManager::ClaimSettle()
+{
+    if ( mClaimPrevVehicle != NULL )
+    {
+        mClaimPrevVehicle->Release();
+    }
+    mClaimPrevVehicle = NULL;
+    mClaimCar = NULL;
+    mClaimLost = false;
+}
+
+void ParkedCarManager::ClaimLost( Vehicle* car )
+{
+    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+    Character* character = avatar != NULL ? avatar->GetCharacter() : NULL;
+    bool inside = avatar != NULL && character != NULL &&
+                  ( avatar->GetVehicle() == car || character->GetTargetVehicle() == car );
+    if ( !inside )
+    {
+        ParkedCarInfo* info = NULL;
+        bool isFreeCar = false;
+        FindParkedCarInfo( car, info, isFreeCar );
+        if ( mClaimCar == car && GetGameplayManager()->GetCurrentVehicle() == car )
+        {
+            GetGameplayManager()->SetCurrentVehicle( mClaimPrevVehicle );
+        }
+        if ( mClaimCar == car )
+        {
+            ClaimSettle();
+        }
+        if ( info != NULL && !isFreeCar && GetGameplayManager()->GetCurrentVehicle() != car )
+        {
+            RemoveParkedCar( *info );
+        }
+        return;
+    }
+    if ( mClaimCar != car )
+    {
+        ClaimBegin( car ); // got in without a START we saw: no previous car to restore
+    }
+    if ( mClaimLost )
+    {
+        return; // already getting out
+    }
+    // Put the player out the way the game does it (the get-out sequence,
+    // bailing out if the car is moving); the car goes once we are out.
+    mClaimLost = true;
+    character->GetActionController()->Clear();
+    character->GetStateManager()->SetState< CharacterAi::GetOut >();
+}
+
+void ParkedCarManager::ClaimFinishRollback()
+{
+    Vehicle* car = mClaimCar;
+    if ( car != NULL && GetGameplayManager()->GetCurrentVehicle() == car )
+    {
+        GetGameplayManager()->SetCurrentVehicle( mClaimPrevVehicle );
+    }
+    ParkedCarInfo* info = NULL;
+    bool isFreeCar = false;
+    FindParkedCarInfo( car, info, isFreeCar );
+    ClaimSettle();
+    if ( info != NULL && !isFreeCar )
+    {
+        RemoveParkedCar( *info );
+    }
+}
+
 void ParkedCarManager::ClearZoneCars( tUID zone )
 {
     for ( unsigned int j = 0; j < mNumCarTypes; ++j )
@@ -1004,7 +1125,7 @@ void ParkedCarManager::NetApplyZone( void* handle, unsigned char channel, const 
 void ParkedCarManager::NetApplyCar( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased )
 {
     Vehicle* v = static_cast<Vehicle*>( handle );
-    if ( v == NULL || erased || value.len < 1 || value.bytes[ 0 ] == 0 )
+    if ( v == NULL || erased || value.len < 1 )
     {
         return;
     }
@@ -1018,14 +1139,26 @@ void ParkedCarManager::NetApplyCar( void* handle, unsigned char channel, const n
     }
     if ( channel == net::WOC_TAKEN )
     {
-        // Another player drove it away (their machine is mirrored by the
-        // player stream). Our copy goes, unless we are sitting in it.
-        if ( GetGameplayManager()->GetCurrentVehicle() != v )
+        switch ( net::ClaimOutcomeOf( value, networld::LocalPeerId() ) )
         {
-            pcm.RemoveParkedCar( *info );
+        case net::CLAIM_OURS:
+            // Our claim stands (the server's confirmation).
+            if ( pcm.mClaimCar == v && !pcm.mClaimLost )
+            {
+                pcm.ClaimSettle();
+            }
+            break;
+        case net::CLAIM_THEIRS:
+            // Another player has it (their machine is mirrored by their player
+            // stream): roll our entry back if we got in too, otherwise our copy
+            // just goes.
+            pcm.ClaimLost( v );
+            break;
+        default:
+            break;
         }
     }
-    else if ( channel == net::WOC_BROKEN && !v->mVehicleDestroyed )
+    else if ( channel == net::WOC_BROKEN && value.bytes[ 0 ] != 0 && !v->mVehicleDestroyed )
     {
         // Blown up elsewhere: run the same husk swap as a local destruction.
         GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( v ) );
@@ -1045,13 +1178,17 @@ ParkedCarManager::ParkedCarManager() :
     mNumParkedCars( 0 ),
     mNumLocators( 0 ),
     mLoadingZoneUID( 0 ),
-    mFreeCarLocator( NULL )
+    mFreeCarLocator( NULL ),
+    mClaimCar( NULL ),
+    mClaimPrevVehicle( NULL ),
+    mClaimLost( false )
 {
     GetEventManager()->AddListener( this, EVENT_DUMP_DYNA_SECTION );
     GetEventManager()->AddListener( this, EVENT_DYNAMIC_ZONE_LOAD_ENDED );
     GetEventManager()->AddListener( this, EVENT_VEHICLE_DESTROYED );
+    GetEventManager()->AddListener( this, EVENT_GETINTOVEHICLE_START );
     GetEventManager()->AddListener( this, EVENT_GETINTOVEHICLE_END );
-    GetEventManager()->AddListener( this, EVENT_GETINTOVEHICLE_END );
+    GetEventManager()->AddListener( this, EVENT_GETOUTOFVEHICLE_END );
     GetEventManager()->AddListener( this, EVENT_REPAIR_CAR );
 
     if ( CommandLineOptions::Get( CLO_PARKED_CAR_TEST ) )
@@ -1083,6 +1220,7 @@ ParkedCarManager::ParkedCarManager() :
 ParkedCarManager::~ParkedCarManager()
 {
     GetEventManager()->RemoveAll( this );
+    ClaimSettle();
 
     //Remove all the car types
     MDKParkedCars();
