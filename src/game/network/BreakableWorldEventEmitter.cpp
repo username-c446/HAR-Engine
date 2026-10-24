@@ -1,6 +1,7 @@
 #include "BreakableWorldEventEmitter.h"
 #include "WorldEvent.h"
 #include "NetworkMatchManager.h"
+#include "WorldEventApply.h"
 
 namespace net
 {
@@ -10,6 +11,8 @@ namespace net
         // server/dedicated build without a networking game session is a no-op.
         NetworkMatchManager* match = NetworkMatchManager::GetInstance();
         if (match == nullptr || !match->IsInMatch()) return;
+        // Mirroring a remote peer's change: never re-broadcast it.
+        if (IsApplyingRemoteWorldEvent()) return;
 
         uint8_t payload[BreakablePayload::SERIALIZED_SIZE];
         BreakablePayload::Encode(payload, persistentId, x, y, z);

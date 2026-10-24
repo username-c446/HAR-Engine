@@ -236,6 +236,7 @@ namespace net
             if (rp.id == kIdWelcome && rp.size >= 2)
             {
                 m_selfId = ReadU16Le(rp.data);
+                m_welcomed = true;
             }
             else if (rp.id == kIdSeed && rp.size >= 4)
             {
@@ -295,6 +296,7 @@ namespace net
         m_port = port;
         m_worldSeed = 0;
         m_selfId = 0;
+        m_welcomed = false;
         m_peerRoster.clear();
         m_authSent = false;
 
@@ -307,7 +309,10 @@ namespace net
         m_client->SetPacketSink([this](const ClientEndpoint::RawPacket& rp)
         {
             if (rp.id == kIdWelcome && rp.size >= 2)
+            {
                 m_selfId = ReadU16Le(rp.data);
+                m_welcomed = true;
+            }
             else if (rp.id == kIdSeed && rp.size >= 4)
                 m_worldSeed = static_cast<uint32_t>(rp.data[0])
                             | static_cast<uint32_t>(rp.data[1]) << 8
@@ -357,6 +362,7 @@ namespace net
         m_client.reset();
         m_server.reset();
         m_selfId = 0;
+        m_welcomed = false;
         m_worldSeed = 0;
         m_port = 0;
         m_peerRoster.clear();

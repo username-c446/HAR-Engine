@@ -77,12 +77,15 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
     {
         m_sink.jump(playerId, entry.handle);
     }
-    // Rising edge of a non-zero one-shot action: fire the general action
-    // channel once (mirrors the jump-latch pattern above). Continuous non-zero
-    // actionEvent must not re-fire.
-    if ( state.actionEvent != 0 && state.actionEvent != entry.targetActionEvent && m_sink.action )
+    // A changed one-shot action byte ([seq|id], held by the sender) is a new
+    // action: fire the general action channel once with the bare ACTION_* id.
+    // The same byte on later packets must not re-fire; a repeat of the same
+    // action differs by its sequence bits.
+    if ( state.actionEvent != entry.targetActionEvent && m_sink.action )
     {
-        m_sink.action(playerId, entry.handle, state.actionEvent);
+        uint8_t id = PlayerNetworkState::ActionId(state.actionEvent);
+        if ( id != PlayerNetworkState::ACTION_NONE )
+            m_sink.action(playerId, entry.handle, id);
     }
     entry.targetX = state.x;
     entry.targetY = state.y;

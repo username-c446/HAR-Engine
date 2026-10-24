@@ -32,6 +32,18 @@
 #endif
 
 #include <worldsim/character/charactermanager.h>
+#include <network/LocalActionLatch.h>
+
+// Network: latch a one-shot action of the LOCAL avatar for the player-state
+// stream (net::LocalActionLatch). NPCs and remote mirrors never report.
+static void ReportLocalNetAction( Character* pCharacter, uint8_t actionId )
+{
+    if ( pCharacter != NULL && pCharacter == GetCharacterManager()->GetCharacter( 0 ) )
+    {
+        net::LocalActionLatch::Report( actionId );
+    }
+}
+
 #include <worldsim/coins/sparkle.h>
 
 #include <sound/soundmanager.h>
@@ -2121,6 +2133,7 @@ void JumpAction::TestForJumpAgain( const rmt::Vector& currentPos, float fUpVeloc
             }
 
             tRefCounted::Assign(mpAnimationDriver,mpCharacter->GetPuppet()->PlayAnimation( "stomp_antic" ));
+            ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_SLAM );
 //            mpAnimationDriver = mpCharacter->GetPuppet()->PlayAnimation( "stomp_in_air" );
             mbPreSlam = true;
             mbSlam = true;
@@ -2133,6 +2146,7 @@ void JumpAction::TestForJumpAgain( const rmt::Vector& currentPos, float fUpVeloc
             }
 
             tRefCounted::Assign(mpAnimationDriver,mpCharacter->GetPuppet()->PlayAnimation( "jump_kick" ));
+            ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_JUMPKICK );
             mbInJumpKick = mbDoJumpKick = true;
             mpCharacter->DoKickwave();
         }
@@ -2366,6 +2380,7 @@ mpAnimationDriver( NULL ) // Set when we start playing the animation and need to
 
 void GetUpAction::WakeUp( float timeins )
 {
+    ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_GETUP );
     /*
     static const float angle = 0.93969262078590838405410927732473f; // cos(20)
     static const rmt::Vector upVector(0.0f, 1.0f, 0.0f);

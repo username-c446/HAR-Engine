@@ -70,6 +70,12 @@ namespace net
         bool IsHost()   const { return m_server != nullptr; }
         bool IsJoined() const { return m_client != nullptr && m_client->IsConnected(); }
         PeerId GetLocalPeerId() const { return m_selfId; }
+        // True once the server has welcomed us (our peer id is final). A host
+        // relays directly, so it is always welcomed. Before that, anything we
+        // send would go out with a provisional origin or be dropped by a
+        // protected host, so callers should hold sends (see
+        // NetworkMatchManager's world-event queue).
+        bool IsWelcomed() const { return m_server != nullptr || m_welcomed; }
         uint32_t GetWorldSeed() const { return m_worldSeed; }
 
         // Blood metro config: the set of peers currently in the match, NOT
@@ -162,6 +168,7 @@ namespace net
         PacketRegistry                  m_registry;
 
         PeerId       m_selfId   = 0;
+        bool         m_welcomed = false; // WELCOME received on the client side
         uint32_t     m_worldSeed = 0;
         uint16_t     m_port     = 0;
         JoinLeaveFn  m_joinLeave;

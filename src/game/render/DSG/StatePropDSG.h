@@ -139,6 +139,10 @@ class StatePropDSG : public DynaPhysDSG, public CStatePropListener
 
 
         void SetState( int state );
+        // Network mirror of a peer breaking this prop (WE_BREAKABLE): removes it
+        // from the world exactly like the eRemoveFromWorld callback, without
+        // re-broadcasting (the caller holds a net::RemoteWorldEventScope).
+        void ApplyRemoteBreak();
         bool HandleEvent( Event );
         unsigned int GetState()const;
         tUID GetStatePropUID()const { return mpStateProp->GetUID(); }

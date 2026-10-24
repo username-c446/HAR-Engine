@@ -143,6 +143,7 @@ void NetworkMatchManager::Leave()
     m_remotePlayers.Clear();
     m_remoteMissionStates.clear();
     m_pendingEvents.clear();
+    m_pendingWorldEvents.clear();
 }
 
 void NetworkMatchManager::AttachMissionChannel()
@@ -235,5 +236,7 @@ void NetworkMatchManager::Update()
         // сетевой peer-id".
         if (m_bridge)
             m_bridge->SetLocalPeerId( static_cast<net::PeerId>(GetLocalClientId()) );
+        // World events raised during the join handshake go out now.
+        FlushPendingWorldEvents();
     }
 }

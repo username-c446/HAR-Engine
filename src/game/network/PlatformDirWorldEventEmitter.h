@@ -18,16 +18,23 @@ namespace net
     {
         uint32_t objectUID = 0;
         int8_t   dir = 0;
+        float    x = 0.0f;        // entity world position: disambiguates same-named instances
+        float    y = 0.0f;
+        float    z = 0.0f;
 
-        static constexpr const int SERIALIZED_SIZE = sizeof(uint32_t) + sizeof(int8_t);
+        static constexpr const int SERIALIZED_SIZE = sizeof(uint32_t) + sizeof(int8_t) + sizeof(float) * 3;
         static_assert(SERIALIZED_SIZE >= 0 && SERIALIZED_SIZE < MAX_PACKET_PAYLOAD,
                       "platform-dir payload must fit a packet");
 
-        static void Encode(uint8_t* out, uint32_t uid, int8_t direction)
+        static void Encode(uint8_t* out, uint32_t uid, int8_t direction,
+                           float px = 0.0f, float py = 0.0f, float pz = 0.0f)
         {
             Writer w(out, SERIALIZED_SIZE);
             w.WriteU32(uid);
             w.WriteU8(static_cast<uint8_t>(direction));
+            w.WriteFloat(px);
+            w.WriteFloat(py);
+            w.WriteFloat(pz);
         }
 
         static bool Decode(const uint8_t* data, uint16_t size, PlatformDirPayload& out)
@@ -38,12 +45,12 @@ namespace net
             uint8_t d = 0;
             if (!r.ReadU8(d)) return false;
             out.dir = static_cast<int8_t>(d);
-            return true;
+            return r.ReadFloat(out.x) && r.ReadFloat(out.y) && r.ReadFloat(out.z);
         }
     };
 
     // Diffuses a platform-direction world event to all peers in the current
     // match. Safe no-op when there is no active match. Invoked from the game's
     // animation-direction apply site (AnimCollisionEntityDSG::SetAnimationDirection).
-    void EmitPlatformDirWorldEvent(uint32_t objectUID, int32_t dir);
+    void EmitPlatformDirWorldEvent(uint32_t objectUID, int32_t dir, float x, float y, float z);
 }

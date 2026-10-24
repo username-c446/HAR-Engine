@@ -118,7 +118,7 @@ struct PlayerNetworkState {
     uint8  speedFactor;       // 0..255 доля максимальной скорости
     uint8  characterState;    // CharacterAi::CharacterState (LOCO и т.п.)
     // --- одноразовое действие ---
-    uint8  actionEvent;       // ACTION_*; 0 = нет (латч по rising-edge)
+    uint8  actionEvent;       // [seq:3 | ACTION_* id:5] последнее действие; 0 = ещё не было
     // --- кинематическое зеркало машины (inVehicle) ---
     float  vehYaw;            // курс машины, рад
     uint8  vehSteer;          // знаковый руль -128..127 -> -45..+45°
@@ -130,8 +130,15 @@ struct PlayerNetworkState {
 
 - `SERIALIZED_SIZE = 42 (база) + 7 (локомоушн) + 1 (actionEvent) + 9 (машина) = 58` байт.
 - В машине поля локомоушна/действия обнуляются, пешком — поля машины.
-- `actionEvent` сейчас заполняется только `ACTION_JUMP` (rising-edge прыжка);
-  остальные `ACTION_*` (SLAM, DODGE, CELEB…) зарезервированы, на приёмнике no-op.
+- `actionEvent` берётся из `net::LocalActionLatch` (`LocalActionLatch.h`): игровые
+  точки действий локального аватара (`GetCharacter(0)`) вызывают `Report(id)`, латч
+  держит последнее действие с 3-битной последовательностью (`MakeActionEvent`/
+  `ActionId`). Отправитель держит значение, приёмник срабатывает на смену байта —
+  повтор того же действия отличается seq, поздняя выборка снапшота не теряет клип.
+  Источники: `state.cpp` (DODGE, CRINGE, ATTACK, CELEB_SMALL/BIG, FLAIL в
+  `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK в `JumpAction`, GETUP в
+  `GetUpAction::WakeUp`). Прыжок идёт через `FLAG_JUMPING` (не `ACTION_JUMP`), чтобы
+  не срабатывать дважды. `ACTION_KD`/`ACTION_SURF` зарезервированы.
 - Сериализация little-endian совместимая, свободна от padding-багов
   (`Serialize`/`Deserialize` в `PlayerNetworkState.cpp` через `net::Write*`).
 - **Связь с валидацией:** поле `inVehicle` выбирает лимит скорости на сервере
@@ -344,8 +351,13 @@ mp_standalone join   <hostIp> [port] [--password pw]
   turbo) передаются в move-sink без предсглаживания: в игре при
   `characterState == LOCO` ими управляет `LocomotionDriver` пуппета
   (`SetFacingDir` + скорость от `GetMaxSpeed()`).
-- `action`-sink вызывается один раз на rising-edge ненулевого `actionEvent`
-  (`RemotePlayerAction`: `ACTION_JUMP` → `RemotePlayerJump`).
+- `action`-sink вызывается один раз при смене байта `actionEvent` с ненулевым id и
+  получает «голый» id (без seq). Удержанное действие при спавне не проигрывается.
+  `RemotePlayerAction` проигрывает клип визуально: dodge/cringe/break_quick/
+  victory_small/victory_large/flail/get_up — отдельной последовательностью
+  `PlayAnimationAction` (no-op, если клипа нет в NPC-банке); jump_kick/stomp_in_air —
+  поверх пуппета (удалённый в этот момент внутри `JumpAction`). Игровые эффекты
+  действий (сломанный пинком проп) приходят событиями мира, не отсюда.
 
 ---
 
@@ -379,17 +391,46 @@ POD-полезная нагрузка без игровых типов). Эми�
 
 | Тип | Эмиттер / точка вызова | Payload |
 |---|---|---|
-| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG` (смена состояния) | uid + state |
-| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (разрушение) | persistentId + xyz |
+| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG::SetState` | uid типа + state + xyz |
+| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (`eRemoveFromWorld`) | persistentId + xyz |
 | `WE_VEHICLE_DESTROYED` 0x03 | `EmitVehicleDestroyedWorldEvent` — `vehicle.cpp` (взрыв) | netVehicleId + xyz |
 | `WE_COIN_COLLECTED` 0x04 | `EmitCoinCollectedWorldEvent` — `CoinManager::CheckCollection` | persistentId + xyz |
-| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `animcollisionentitydsg.h` | uid + direction |
+| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `AnimCollisionEntityDSG::SetAnimationDirection` | uid + direction + xyz |
 
-Приёмник (`gameplaycontext.cpp`, `SetWorldEventSink`) сейчас применяет только
-`WE_VEHICLE_DESTROYED`: находит локальную машину по net id и повторно
-шлёт `EVENT_VEHICLE_DESTROYED` (husk-логика). Призраки удалённых водителей
-не трогаются — их снимает поток drive-state. Остальные типы пока только
-передаются (приём — следующий шаг, см. `PRECISE_MULTIPLAYER_PLAN.ru.md`).
+**Отправка до входа.** `NetworkMatchManager::SendWorldEvent` ставит события в
+очередь, пока `Session::IsWelcomed()` ложно (клиент ещё не получил WELCOME — например,
+монета подобрана на точке спавна во время рукопожатия), и отправляет их по порядку
+из `Update()`, уже с окончательным `originPeer`. Очередь ограничена 64 событиями
+(старые вытесняются) и очищается в `Leave()`.
+
+**Приём** — `WorldEventApply.h`: `net::DispatchWorldEvent(ev, WorldEventHandlers)`
+декодирует событие и вызывает типизированный обработчик внутри
+`RemoteWorldEventScope`. Все эмиттеры молчат, пока
+`IsApplyingRemoteWorldEvent()` (счётчик глубины, каскад stateprop → break), —
+зеркальное изменение не уходит обратно в матч. Неизвестные типы (новее нас) и
+обрезанные payload пропускаются.
+
+**Идентификация экземпляра.** uid stateprop'а — это uid **типа** (общий у всех
+однотипных пропов), слоты `VehicleCentral` у каждого клиента свои (трафик
+локальный). Поэтому приёмник берёт ближайший объект с тем же uid к позиции
+отправителя (`FindNearestWorldObject`, `AnimEntityDSGManager::FindStateProp` /
+`FindCollEntity` / `FindNearestStateProp`): 1 м для статики, 6 м для машин.
+
+Обработчики в `gameplaycontext.cpp`:
+- `WE_STATEPROP` → `StatePropDSG::SetState` (если состояние отличается);
+- `WE_BREAKABLE` → поиск по persistentId (или по позиции при id < 0),
+  `StatePropDSG::ApplyRemoteBreak()` (как `eRemoveFromWorld`); если сектор не
+  загружен — только `PersistentWorldManager::OnObjectBreak`, проп не появится;
+- `WE_VEHICLE_DESTROYED` → ближайшая живая машина в `VehicleCentral` →
+  `EVENT_VEHICLE_DESTROYED` (husk). Призраков снимает поток drive-state;
+- `WE_COIN_COLLECTED` → `CoinManager::ApplyRemoteCoinCollected`: отметка в
+  persistent-мире + мгновенное исчезновение лежащей монеты (без зачисления в банк —
+  монеты у каждого свои; затухающую монету можно было бы подобрать);
+- `WE_PLATFORM_DIR` → `AnimCollisionEntityDSG::SetAnimationDirection`.
+
+Не синхронизируется (открыто): состояние мира для **поздно подключившихся**
+(события только живые, снапшота сломанного/собранного нет), дробный ущерб машин
+(`WE_VEHICLE_DAMAGE`), анимации разрушения на приёмнике (проп убирается сразу).
 
 ## 13. Точки интеграции в игровой цикл (`gameplaycontext.cpp`)
 

@@ -100,6 +100,13 @@ protected:
 	CoinManager& operator=( const CoinManager& That );
 
     void OnVehicleDestroyed( Vehicle* DestroyedVehicle );
+public:
+    // Network mirror of a peer picking up a permanent world coin
+    // (WE_COIN_COLLECTED): marks it collected in the persistent world so it never
+    // respawns here, and makes a currently resting copy spin away. No bank credit
+    // (coins are per player). Returns true if a live coin was removed.
+    bool ApplyRemoteCoinCollected( short persistentId );
+protected:
     struct ActiveCoin;
     void SpawnCoin( ActiveCoin& Coin, const rmt::Vector& Start, float Ground, const rmt::Vector* Direction = 0, bool InstaCollect = false );
     void CheckCollection( ActiveCoin& Coin, const rmt::Vector& AvatarPos, float RangeMultiplier = 1.0f );

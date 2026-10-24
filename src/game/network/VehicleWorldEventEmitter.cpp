@@ -1,6 +1,7 @@
 #include "VehicleWorldEventEmitter.h"
 #include "WorldEvent.h"
 #include "NetworkMatchManager.h"
+#include "WorldEventApply.h"
 
 #include <worldsim/redbrick/vehicle.h>
 
@@ -12,6 +13,8 @@ namespace net
         // server/dedicated build without a networking game session is a no-op.
         NetworkMatchManager* match = NetworkMatchManager::GetInstance();
         if (match == nullptr || !match->IsInMatch()) return;
+        // Mirroring a remote peer's change: never re-broadcast it.
+        if (IsApplyingRemoteWorldEvent()) return;
         if (vehicle == nullptr) return;
 
         // Stable net vehicle id: mirror the player-state convention, which uses

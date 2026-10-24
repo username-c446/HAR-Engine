@@ -110,7 +110,7 @@ struct PlayerNetworkState {
     uint8  speedFactor;       // 0..255 fraction of max speed
     uint8  characterState;    // CharacterAi::CharacterState (LOCO etc.)
     // --- one-shot action ---
-    uint8  actionEvent;       // ACTION_*; 0 = none (rising-edge latched)
+    uint8  actionEvent;       // [seq:3 | ACTION_* id:5] latest action; 0 = none yet
     // --- kinematic vehicle mirror (inVehicle) ---
     float  vehYaw;            // machine heading, rad
     uint8  vehSteer;          // signed steer -128..127 -> -45..+45 deg
@@ -122,8 +122,15 @@ struct PlayerNetworkState {
 
 - `SERIALIZED_SIZE = 42 (base) + 7 (locomotion) + 1 (actionEvent) + 9 (vehicle) = 58` bytes.
 - In a vehicle the locomotion/action fields are zeroed; on foot the vehicle fields are.
-- `actionEvent` is currently populated only with `ACTION_JUMP` (jump rising edge);
-  the other `ACTION_*` ids (SLAM, DODGE, CELEB…) are reserved and no-op on receive.
+- `actionEvent` comes from `net::LocalActionLatch` (`LocalActionLatch.h`): the game's
+  action sites for the local avatar (`GetCharacter(0)`) call `Report(id)`; the latch
+  holds the latest action with a 3-bit sequence (`MakeActionEvent`/`ActionId`). The
+  sender holds the value and the receiver fires on a byte change, so a repeat of the
+  same action differs by seq and a late snapshot sample never loses a clip.
+  Sources: `state.cpp` (DODGE, CRINGE, ATTACK, CELEB_SMALL/BIG, FLAIL in
+  `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK in `JumpAction`, GETUP in
+  `GetUpAction::WakeUp`). Jumps ride `FLAG_JUMPING` (not `ACTION_JUMP`) so they do
+  not double-fire. `ACTION_KD`/`ACTION_SURF` are reserved.
 - Little-endian-compatible serialization, free of padding bugs
   (`Serialize`/`Deserialize` in `PlayerNetworkState.cpp` via `net::Write*`).
 - **Validation link:** `inVehicle` picks the speed limit on the server
@@ -338,8 +345,13 @@ do not change.
   turbo) reach the move sink unsmoothed: in game, when `characterState == LOCO`,
   the puppet's `LocomotionDriver` drives them (`SetFacingDir` + speed from
   `GetMaxSpeed()`).
-- The `action` sink fires once on the rising edge of a non-zero `actionEvent`
-  (`RemotePlayerAction`: `ACTION_JUMP` → `RemotePlayerJump`).
+- The `action` sink fires once when the `actionEvent` byte changes to a non-zero id
+  and receives the bare id (seq stripped). A held action is not replayed on spawn.
+  `RemotePlayerAction` replays the clip visually: dodge/cringe/break_quick/
+  victory_small/victory_large/flail/get_up as their own `PlayAnimationAction`
+  sequence (no-op if the NPC bank lacks the clip); jump_kick/stomp_in_air are
+  overlaid on the puppet (the remote is inside `JumpAction` then). Gameplay effects
+  of actions (a prop broken by a kick) arrive as world events, not from here.
 
 ---
 
@@ -377,17 +389,45 @@ and are a safe no-op outside a match:
 
 | Type | Emitter / call site | Payload |
 |---|---|---|
-| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG` (state change) | uid + state |
-| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (destroyed) | persistentId + xyz |
+| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG::SetState` | type uid + state + xyz |
+| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (`eRemoveFromWorld`) | persistentId + xyz |
 | `WE_VEHICLE_DESTROYED` 0x03 | `EmitVehicleDestroyedWorldEvent` — `vehicle.cpp` (explosion) | netVehicleId + xyz |
 | `WE_COIN_COLLECTED` 0x04 | `EmitCoinCollectedWorldEvent` — `CoinManager::CheckCollection` | persistentId + xyz |
-| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `animcollisionentitydsg.h` | uid + direction |
+| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `AnimCollisionEntityDSG::SetAnimationDirection` | uid + direction + xyz |
 
-The receiver (`gameplaycontext.cpp`, `SetWorldEventSink`) currently applies only
-`WE_VEHICLE_DESTROYED`: it finds the local vehicle by net id and re-fires
-`EVENT_VEHICLE_DESTROYED` (husk logic). Remote drivers' ghosts are left alone —
-the drive-state stream despawns them. Other types are transmitted only
-(receiving is the next step, see `PRECISE_MULTIPLAYER_PLAN.ru.md`).
+**Sending before join.** `NetworkMatchManager::SendWorldEvent` queues events while
+`Session::IsWelcomed()` is false (the client has not received WELCOME yet, e.g. a
+coin picked up on the spawn point during the handshake) and ships them in order
+from `Update()` with the final `originPeer`. The queue is bounded at 64 events
+(oldest dropped) and cleared on `Leave()`.
+
+**Receiving** — `WorldEventApply.h`: `net::DispatchWorldEvent(ev, WorldEventHandlers)`
+decodes the event and runs the typed handler inside a `RemoteWorldEventScope`.
+Every emitter stays silent while `IsApplyingRemoteWorldEvent()` (a depth counter,
+for the stateprop → break cascade), so a mirrored change never goes back into the
+match. Unknown types (newer peers) and truncated payloads are skipped.
+
+**Instance identification.** A stateprop uid names the prop **type** (shared by
+every instance), and `VehicleCentral` slots differ per client (traffic is local).
+So the receiver takes the nearest object with the same uid to the sender's
+position (`FindNearestWorldObject`, `AnimEntityDSGManager::FindStateProp` /
+`FindCollEntity` / `FindNearestStateProp`): 1 m for static objects, 6 m for vehicles.
+
+Handlers in `gameplaycontext.cpp`:
+- `WE_STATEPROP` → `StatePropDSG::SetState` (if the state differs);
+- `WE_BREAKABLE` → look up by persistentId (by position when id < 0),
+  `StatePropDSG::ApplyRemoteBreak()` (same as `eRemoveFromWorld`); if the sector is
+  not loaded, only `PersistentWorldManager::OnObjectBreak`, so the prop never spawns;
+- `WE_VEHICLE_DESTROYED` → nearest live vehicle in `VehicleCentral` →
+  `EVENT_VEHICLE_DESTROYED` (husk). Ghosts are despawned by the drive-state stream;
+- `WE_COIN_COLLECTED` → `CoinManager::ApplyRemoteCoinCollected`: marks the
+  persistent world and removes a resting coin at once (no bank credit — coins are
+  per player; a decaying coin would still be collectable);
+- `WE_PLATFORM_DIR` → `AnimCollisionEntityDSG::SetAnimationDirection`.
+
+Not synchronized (open): world state for **late joiners** (events are live only,
+there is no snapshot of broken/collected objects), fractional vehicle damage
+(`WE_VEHICLE_DAMAGE`), break animations on the receiver (the prop is removed at once).
 
 ## 13. Game-loop integration points (`gameplaycontext.cpp`)
 

@@ -1,6 +1,7 @@
 #include "CoinWorldEventEmitter.h"
 #include "WorldEvent.h"
 #include "NetworkMatchManager.h"
+#include "WorldEventApply.h"
 
 namespace net
 {
@@ -8,8 +9,9 @@ namespace net
     {
         // No match (or no manager yet): nowhere to send. Guard first so a
         // server/dedicated build without a networking game session is a no-op.
-        NetworkMatchManager* match = NetworkMatchManager::GetInstance();
-        if (match == nullptr || !match->IsInMatch()) return;
+        NetworkMatchManager* match = NetworkMatchManager::GetInstance();        if (match == nullptr || !match->IsInMatch()) return;
+        // Mirroring a remote peer's change: never re-broadcast it.
+        if (IsApplyingRemoteWorldEvent()) return;
 
         uint8_t payload[CoinCollectedPayload::SERIALIZED_SIZE];
         CoinCollectedPayload::Encode(payload, persistentId, x, y, z);

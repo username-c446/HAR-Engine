@@ -637,6 +637,29 @@ void CoinManager::CheckCollection( ActiveCoin& Coin, const rmt::Vector& AvatarPo
     }
 }
 
+bool CoinManager::ApplyRemoteCoinCollected( short persistentId )
+{
+    if( persistentId < 0 )
+    {
+        return false;
+    }
+    GetPersistentWorldManager()->OnObjectBreak( persistentId );
+    for( int i = 0; i < NUM_COINS; ++i )
+    {
+        ActiveCoin& c = mActiveCoins[ i ];
+        if( c.State == CS_RestingIndefinitely && c.PersistentObjectID == persistentId )
+        {
+            // Remove it outright (a decaying coin is still collectable here and
+            // would credit the local bank), with the same vanish sparkle as expiry.
+            c.State = CS_Inactive;
+            --mNumActiveCoins;
+            GetSparkleManager()->AddSparkle( rmt::Vector( c.Position.x, c.Position.y + mCoinBounding.radius, c.Position.z ), 0.25f, 0.5f, rmt::Vector( 0.0f, 0.01f, 0.0f ), Sparkle::SE_Vanish );
+            return true;
+        }
+    }
+    return false;
+}
+
 /*=============================================================================
 Player has picked up a coin. This will increase the player's bank value, fire
 a coin collected event so that we can play a sound

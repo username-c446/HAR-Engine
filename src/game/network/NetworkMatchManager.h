@@ -94,16 +94,33 @@ public:
     // type tag + origin. Returns false if not in a match or the payload is too
     // large. This is the mechanism for replicating destructible world state
     // (broken props, destroyed vehicles, state transitions, coins).
+    //
+    // Events raised before the server WELCOMEs us (a coin picked up on the
+    // spawn point while the join handshake is still in flight) are queued and
+    // flushed from Update() once our peer id is final, so they are neither lost
+    // nor stamped with a provisional origin. The queue is bounded
+    // (kMaxPendingWorldEvents, oldest dropped first).
     bool SendWorldEvent(net::WorldEventType type, const uint8_t* payload, uint16_t payloadSize)
     {
-        if (!m_session) return false;
-        uint8_t buf[net::MAX_PACKET_PAYLOAD];
-        uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), type,
-                                                  static_cast<uint16_t>(GetLocalClientId()),
-                                                  payload, payloadSize);
-        if (n == 0) return false;
-        return m_session->SendCustomEvent(buf, n);
+        if (!m_session || !m_session->IsInMatch()) return false;
+        if (payloadSize > net::MAX_PACKET_PAYLOAD - net::WORLD_EVENT_HEADER_SIZE) return false;
+        if (!m_session->IsWelcomed() || !m_pendingWorldEvents.empty())
+        {
+            // Keep ordering: once anything is queued, later events queue too.
+            if (m_pendingWorldEvents.size() >= kMaxPendingWorldEvents)
+                m_pendingWorldEvents.erase(m_pendingWorldEvents.begin());
+            PendingWorldEvent pe;
+            pe.type = type;
+            pe.bytes.assign(payload, payload + payloadSize);
+            m_pendingWorldEvents.push_back(pe);
+            FlushPendingWorldEvents();
+            return true;
+        }
+        return SendWorldEventNow(type, payload, payloadSize);
     }
+
+    // Number of world events waiting for WELCOME (diagnostics/tests).
+    size_t GetPendingWorldEventCount() const { return m_pendingWorldEvents.size(); }
 
     // Registers the callback for inbound world events. Receives the decoded
     // event (type + origin + payload). Self-echo is already filtered by the
@@ -170,4 +187,39 @@ private:
 
     // Decoded world-event sink (see SetWorldEventSink).
     net::WorldEventCodec::InboundFn m_worldEventSink;
+
+    // World events raised before WELCOME (see SendWorldEvent).
+    struct PendingWorldEvent
+    {
+        net::WorldEventType  type;
+        std::vector<uint8_t> bytes;
+    };
+    static constexpr const size_t kMaxPendingWorldEvents = 64;
+    std::vector<PendingWorldEvent> m_pendingWorldEvents;
+
+    bool SendWorldEventNow(net::WorldEventType type, const uint8_t* payload, uint16_t payloadSize)
+    {
+        uint8_t buf[net::MAX_PACKET_PAYLOAD];
+        uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), type,
+                                                  static_cast<uint16_t>(GetLocalClientId()),
+                                                  payload, payloadSize);
+        if (n == 0) return false;
+        return m_session->SendCustomEvent(buf, n);
+    }
+
+    // Ships queued events in order once welcomed; stops at the first send
+    // failure so nothing is reordered or lost.
+    void FlushPendingWorldEvents()
+    {
+        if (!m_session || !m_session->IsWelcomed()) return;
+        size_t sent = 0;
+        while (sent < m_pendingWorldEvents.size())
+        {
+            const PendingWorldEvent& pe = m_pendingWorldEvents[sent];
+            const uint8_t* data = pe.bytes.empty() ? nullptr : &pe.bytes[0];
+            if (!SendWorldEventNow(pe.type, data, static_cast<uint16_t>(pe.bytes.size()))) break;
+            ++sent;
+        }
+        m_pendingWorldEvents.erase(m_pendingWorldEvents.begin(), m_pendingWorldEvents.begin() + sent);
+    }
 };

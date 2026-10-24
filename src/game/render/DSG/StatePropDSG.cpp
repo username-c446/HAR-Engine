@@ -978,7 +978,24 @@ StatePropDSG::SetState( int state )
     mpStateProp->SetState( state );
     if ( mpStateProp != NULL && GetState() != oldState )
     {
-        net::EmitStatePropWorldEvent( GetStatePropUID(), static_cast<uint8_t>( GetState() ) );
+        // The stateprop uid names the prop TYPE (shared by every instance), so
+        // the position lets receivers pick the right instance.
+        const rmt::Vector& pos = rPosition();
+        net::EmitStatePropWorldEvent( static_cast<uint32_t>( GetStatePropUID() ),
+                                      static_cast<uint8_t>( GetState() ),
+                                      pos.x, pos.y, pos.z );
+    }
+}
+
+void
+StatePropDSG::ApplyRemoteBreak()
+{
+    short persistentId = mPersistentObjectID;
+    GetBreakablesManager()->RemoveBrokenObjectFromWorld( this, RenderEnums::LevelSlot, m_IsDynaLoaded );
+    // NOTE: `this` may be released by the removal above; only locals from here.
+    if ( persistentId >= 0 )
+    {
+        GetPersistentWorldManager()->OnObjectBreak( persistentId );
     }
 }
 

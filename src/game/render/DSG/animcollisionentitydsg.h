@@ -133,7 +133,8 @@ public:
             mfDirection = fDirection;
             // Direction really changed: mirror the new playback direction.
             net::EmitPlatformDirWorldEvent( static_cast<uint32_t>( GetUID() ),
-                                            static_cast<int32_t>( mfDirection ) );
+                                            static_cast<int32_t>( mfDirection ),
+                                            mTransform.m[3][0], mTransform.m[3][1], mTransform.m[3][2] );
         }
     }
     

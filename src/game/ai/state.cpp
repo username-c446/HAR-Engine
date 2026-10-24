@@ -65,6 +65,18 @@
 #include <presentation/gui/guisystem.h>
 #include <presentation/gui/ingame/guimanageringame.h>
 #include <presentation/gui/ingame/guiscreeniriswipe.h>
+#include <network/LocalActionLatch.h>
+
+// Network: latch a one-shot action of the LOCAL avatar for the player-state
+// stream (net::LocalActionLatch). NPCs and remote mirrors never report.
+static void ReportLocalNetAction( Character* pCharacter, uint8_t actionId )
+{
+    if ( pCharacter != NULL && pCharacter == GetCharacterManager()->GetCharacter( 0 ) )
+    {
+        net::LocalActionLatch::Report( actionId );
+    }
+}
+
 
 
 namespace CharacterAi
@@ -700,6 +712,7 @@ void Loco::SequenceAction( void )
             pSeq->EndSequence();
         }
 
+        ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_DODGE );
         pSeq->BeginSequence();
         Action* pAction = new DodgeAction( mpCharacter );
         pSeq->AddAction( pAction );
@@ -754,6 +767,7 @@ void Loco::SequenceAction( void )
             pSeq->EndSequence();
         }
 
+        ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_CRINGE );
         pSeq->BeginSequence();
         Action* pAction = new CringeAction( mpCharacter );
         pSeq->AddAction( pAction );
@@ -804,6 +818,7 @@ void Loco::SequenceAction( void )
     {
         Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
 
+        ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_ATTACK );
         pSeq->BeginSequence();
         pSeq->AddAction( new PlayAnimationAction( mpCharacter, "break_quick" ));
         pSeq->AddAction( new KickAction( mpCharacter, 0.25f ));
@@ -816,6 +831,7 @@ void Loco::SequenceAction( void )
     {
         Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
 
+        ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_CELEB_SMALL );
         pSeq->BeginSequence();
         PlayAnimationAction* action = new PlayAnimationAction( mpCharacter, "victory_small" );
         action->AbortWhenMovementOccurs(true);
@@ -829,6 +845,7 @@ void Loco::SequenceAction( void )
     {
         Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
 
+        ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_CELEB_BIG );
         pSeq->BeginSequence();
         pSeq->AddAction( new PlayAnimationAction( mpCharacter, "victory_large" ));
         pSeq->EndSequence();
@@ -1844,6 +1861,7 @@ void InSim::Enter( void )
     // Sequence in the flail and get-up actions
     Sequencer* pSeq = mpCharacter->GetActionController()->GetNextSequencer();
 
+    ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_FLAIL );
     pSeq->BeginSequence();
     pSeq->AddAction( new FlailAction( mpCharacter ) );
     pSeq->EndSequence();

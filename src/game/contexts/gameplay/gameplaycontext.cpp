@@ -47,6 +47,7 @@
 #include <contexts/gameplay/gameplaycontext.h>
 #include <contexts/contextenum.h>
 #include <events/eventmanager.h>
+#include <data/persistentworldmanager.h>
 #include <gameflow/gameflow.h>
 
 #include <choreo/locomotion.hpp>
@@ -93,6 +94,10 @@
 #include <network/MissionSyncState.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
+#include <network/WorldEventApply.h>
+#include <network/LocalActionLatch.h>
+#include <render/DSG/StatePropDSG.h>
+#include <render/DSG/animcollisionentitydsg.h>
 #include <console/console.h>
 #include <worldsim/redbrick/vehicle.h>
 #include <worldsim/redbrick/geometryvehicle.h>
@@ -150,9 +155,6 @@ namespace
     const uint16_t kAngleMax = 65535;
     // Steer-angle wire scale: byte units per degree. -45..+45 deg ~ -128..127.
     const float kSteerUnitsPerDeg = 255.0f / 90.0f;
-    // Jump never clears DURING the action; latch the rising edge so actionEvent
-    // is non-zero only for the single snapshot where the local jump started.
-    static uint8_t s_lastJumpFlag = 0;
 
     bool GameplayLocalStateProvider( PlayerNetworkState& outState )
     {
@@ -291,15 +293,10 @@ namespace
                     outState.characterState = static_cast<uint8_t>( sm->GetState() );
                 }
 
-                // One-shot action: rising edge of the local jump -> ACTION_JUMP on
-                // exactly this snapshot, then back to ACTION_NONE. Kept minimal;
-                // the remaining ACTION_* ids are reserved for later passes.
-                uint8_t jumpNow = ( outState.flags & PlayerNetworkState::FLAG_JUMPING ) ? 1u : 0u;
-                if ( jumpNow && s_lastJumpFlag == 0 )
-                {
-                    outState.actionEvent = static_cast<uint8_t>( PlayerNetworkState::ACTION_JUMP );
-                }
-                s_lastJumpFlag = jumpNow;
+                // One-shot action: the latest [seq|id] latched by the game's
+                // action sites (dodge, attack, celebrate, knock-down, ...). Jumps
+                // ride FLAG_JUMPING instead, so they are not double-fired.
+                outState.actionEvent = net::LocalActionLatch::Current();
             }
         }
         return true;
@@ -447,20 +444,143 @@ namespace
         c->GetActionController()->GetNextSequencer()->EndSequence();
     }
 
-    // The remote player started a one-shot action (rising edge of actionEvent):
-    // play the matching skeletal animation locally. This pass plumbs the
-    // transport/rising-edge and routes ACTION_JUMP to RemotePlayerJump; the
-    // other ids are reserved for later passes (no-op for now).
-    void RemotePlayerAction( int playerId, void* handle, uint8_t actionEvent )
+    // Plays a one-shot clip on the remote character as its own sequence.
+    // PlayAnimationAction degrades to a no-op when the remote's animation bank
+    // lacks the clip (remote players use an NPC bank), so nothing asserts.
+    void RemotePlayClip( Character* c, const char* clip, bool clearFirst )
     {
-        switch ( actionEvent )
+        if ( clearFirst )
         {
-        case static_cast<uint8_t>( PlayerNetworkState::ACTION_JUMP ):
+            c->GetActionController()->Clear();
+        }
+        Sequencer* pSeq = c->GetActionController()->GetNextSequencer();
+        pSeq->BeginSequence();
+        pSeq->AddAction( new PlayAnimationAction( c, clip ) );
+        pSeq->EndSequence();
+        c->GetWalkerLocomotionAction()->StopDriver();
+    }
+
+    // The remote player started a one-shot action (a new [seq|id] byte): replay
+    // the matching skeletal clip locally. Visual only: gameplay effects of the
+    // action (a kick breaking a prop, ...) reach us as world events instead.
+    void RemotePlayerAction( int playerId, void* handle, uint8_t actionId )
+    {
+        Character* c = static_cast<Character*>( handle );
+        if ( c == NULL || c->GetActionController() == NULL ) return;
+
+        switch ( actionId )
+        {
+        case PlayerNetworkState::ACTION_JUMP:
             RemotePlayerJump( playerId, handle );
             break;
-        default:
-            // Reserved for later passes (SLAM, DODGE, CELEBRATION, ...): no-op.
+        // Airborne moves: the remote is mid-JumpAction, whose sequence would hold
+        // a queued clip until landing, so overlay the clip on the puppet directly.
+        case PlayerNetworkState::ACTION_JUMPKICK:
+            if ( c->GetPuppet() != NULL ) c->GetPuppet()->PlayAnimation( "jump_kick" );
             break;
+        case PlayerNetworkState::ACTION_SLAM:
+            if ( c->GetPuppet() != NULL ) c->GetPuppet()->PlayAnimation( "stomp_in_air" );
+            break;
+        case PlayerNetworkState::ACTION_DODGE:       RemotePlayClip( c, "dodge", false ); break;
+        case PlayerNetworkState::ACTION_CRINGE:      RemotePlayClip( c, "cringe", false ); break;
+        case PlayerNetworkState::ACTION_ATTACK:      RemotePlayClip( c, "break_quick", false ); break;
+        case PlayerNetworkState::ACTION_CELEB_SMALL: RemotePlayClip( c, "victory_small", false ); break;
+        case PlayerNetworkState::ACTION_CELEB_BIG:   RemotePlayClip( c, "victory_large", false ); break;
+        // Knocked down: drop whatever it was doing and flail; the sender reports
+        // ACTION_GETUP when its own get-up starts.
+        case PlayerNetworkState::ACTION_FLAIL:       RemotePlayClip( c, "flail", true ); break;
+        case PlayerNetworkState::ACTION_GETUP:       RemotePlayClip( c, "get_up", true ); break;
+        default:
+            break; // reserved / unknown (newer peer)
+        }
+    }
+
+    // ---- inbound world events (see net::DispatchWorldEvent) ----------------
+    // Search radii for matching the sender's object instance to ours. Static
+    // world objects sit at identical coordinates on every client; vehicles move,
+    // so they get a looser radius.
+    const float kWorldObjectMatchDist = 1.0f;
+    const float kVehicleMatchDist = 6.0f;
+
+    void RemoteWorldStateProp( uint16_t origin, const net::StatePropPayload& p )
+    {
+        (void)origin;
+        if ( GetAnimEntityDSGManager() == NULL ) return;
+        StatePropDSG* prop = GetAnimEntityDSGManager()->FindStateProp(
+            p.objectUID, rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
+        if ( prop != NULL && prop->GetState() != p.state )
+        {
+            prop->SetState( p.state );
+        }
+    }
+
+    void RemoteWorldBreakable( uint16_t origin, const net::BreakablePayload& p )
+    {
+        (void)origin;
+        short persistentId = static_cast<short>( p.persistentId );
+        StatePropDSG* prop = NULL;
+        if ( GetAnimEntityDSGManager() != NULL )
+        {
+            prop = ( persistentId >= 0 )
+                ? GetAnimEntityDSGManager()->FindStatePropByPersistentId( persistentId )
+                : GetAnimEntityDSGManager()->FindNearestStateProp( rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
+        }
+        if ( prop != NULL )
+        {
+            prop->ApplyRemoteBreak();
+        }
+        else if ( persistentId >= 0 )
+        {
+            // Sector not loaded here: record it so the prop never spawns.
+            GetPersistentWorldManager()->OnObjectBreak( persistentId );
+        }
+    }
+
+    void RemoteWorldVehicleDestroyed( uint16_t origin, const net::VehicleDestroyedPayload& p )
+    {
+        (void)origin;
+        // VehicleCentral slot indices differ per client (traffic is local), so
+        // the sender's id alone could name an unrelated car here. Take the
+        // nearest live vehicle to the blast instead. Remote drivers' ghosts are
+        // not in VehicleCentral; the drive-state stream despawns them.
+        VehicleCentral* vc = GetVehicleCentral();
+        if ( vc == NULL ) return;
+        int count = VehicleCentral::GetMaxActiveVehicles();
+        int i = net::FindNearestWorldObject( count, false, 0u, p.x, p.y, p.z, kVehicleMatchDist,
+            []( int ) { return 0u; },
+            [vc]( int k, float& x, float& y, float& z )
+            {
+                Vehicle* v = vc->GetVehicle( k );
+                if ( v == NULL || v->IsVehicleDestroyed() ) { x = y = z = 1.0e9f; return; }
+                const rmt::Vector& pos = v->GetPosition();
+                x = pos.x; y = pos.y; z = pos.z;
+            } );
+        if ( i < 0 ) return;
+        Vehicle* local = vc->GetVehicle( i );
+        if ( local != NULL )
+        {
+            GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( local ) );
+        }
+    }
+
+    void RemoteWorldCoinCollected( uint16_t origin, const net::CoinCollectedPayload& p )
+    {
+        (void)origin;
+        if ( GetCoinManager() != NULL )
+        {
+            GetCoinManager()->ApplyRemoteCoinCollected( static_cast<short>( p.persistentId ) );
+        }
+    }
+
+    void RemoteWorldPlatformDir( uint16_t origin, const net::PlatformDirPayload& p )
+    {
+        (void)origin;
+        if ( GetAnimEntityDSGManager() == NULL ) return;
+        AnimCollisionEntityDSG* e = GetAnimEntityDSGManager()->FindCollEntity(
+            p.objectUID, rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
+        if ( e != NULL )
+        {
+            e->SetAnimationDirection( static_cast<float>( p.dir ) );
         }
     }
 
@@ -684,24 +804,24 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     pMatchMgr->SetLocalStateProvider( &GameplayLocalStateProvider );
     pMatchMgr->SetMissionStateProvider( &GameplayMissionStateProvider );
 
-    // Consume replicated world events from remote peers. Today we mirror
-    // WE_VEHICLE_DESTROYED: when a peer reports a machine exploded, we find the
-    // matching local Vehicle (by its stable net id) and re-fire the local
-    // EVENT_VEHICLE_DESTROYED so the usual husk-swap / destruction logic reacts.
-    // If the vehicle is not ours (e.g. a remote driver's ghost, which is not in
-    // VehicleCentral), we do nothing — the ghost is despawned by the drive-state
-    // stream once the remote driver reports "no longer in a vehicle".
-    pMatchMgr->SetWorldEventSink(
-        []( const net::WorldEventCodec::Decoded* ev )
-        {
-            if ( ev == nullptr || ev->type != net::WE_VEHICLE_DESTROYED ) return;
-            net::VehicleDestroyedPayload payload;
-            if ( !net::VehicleDestroyedPayload::Decode( ev->payload, ev->payloadSize, payload ) )
-                return;
-            Vehicle* local = GetVehicleCentral()->GetVehicle( payload.netVehicleId );
-            if ( local == nullptr ) return;   // not one of ours; ghost handled by state stream
-            GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( local ) );
-        } );
+    // Consume replicated world events from remote peers: door/mechanism
+    // states, broken props, destroyed vehicles, collected world coins and
+    // platform directions. DispatchWorldEvent applies each inside a
+    // RemoteWorldEventScope so the mirrored change is not re-broadcast.
+    net::LocalActionLatch::Reset();
+    {
+        net::WorldEventHandlers handlers;
+        handlers.stateProp = &RemoteWorldStateProp;
+        handlers.breakable = &RemoteWorldBreakable;
+        handlers.vehicleDestroyed = &RemoteWorldVehicleDestroyed;
+        handlers.coinCollected = &RemoteWorldCoinCollected;
+        handlers.platformDir = &RemoteWorldPlatformDir;
+        pMatchMgr->SetWorldEventSink(
+            [handlers]( const net::WorldEventCodec::Decoded* ev )
+            {
+                net::DispatchWorldEvent( ev, handlers );
+            } );
+    }
 
     // Auto-start a match from the command line (-host <port> / -join <ip:port>).
     // Useful for scripted/testing launches of host and client copies.

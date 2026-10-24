@@ -12,6 +12,8 @@
 #include "BreakableWorldEventEmitter.h"
 #include "PlatformDirWorldEventEmitter.h"
 #include "StatePropWorldEventEmitter.h"
+#include "WorldEventApply.h"
+#include "LocalActionLatch.h"
 #include "MissionSyncManager.h"
 #include "../game/netengine/Packet.h"
 #include "../game/netengine/PacketRegistry.h"
@@ -703,6 +705,70 @@ namespace NetworkTests
             Assert::IsFalse(mgr->IsInMatch());
         }
 
+        TEST_METHOD(WorldEventBeforeWelcomeIsQueuedThenDelivered)
+        {
+            // A world event raised while the join handshake is in flight (coin
+            // picked up on the spawn point) must not be lost: it is queued until
+            // WELCOME and then delivered with the final origin peer id.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA57));
+            // A bare host relays to OTHER peers only, so observe from a second joiner.
+            net::Session observer;
+            Assert::IsTrue(observer.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, observer), L"Observer did not get WELCOME.");
+
+            int got = 0;
+            uint16_t gotOrigin = 0xFFFF;
+            net::CoinCollectedPayload gotCoin;
+            observer.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
+                auto e = net::WorldEventCodec::Decode(data, size);
+                if (!e.valid || e.type != net::WE_COIN_COLLECTED) return;
+                if (net::CoinCollectedPayload::Decode(e.payload, e.payloadSize, gotCoin)) { ++got; gotOrigin = e.originPeer; }
+            });
+
+            NetworkMatchManager* mgr = NetworkMatchManager::CreateInstance();
+            Assert::IsTrue(mgr->JoinHost("127.0.0.1", port));
+
+            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
+            net::CoinCollectedPayload::Encode(coin, 1799, 1.0f, 2.0f, 3.0f);
+            Assert::IsTrue(mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin)),
+                L"Send before WELCOME must be accepted (queued).");
+            Assert::AreEqual((size_t)1, mgr->GetPendingWorldEventCount(), L"Event must wait for WELCOME.");
+
+            for (int i = 0; i < 500 && got == 0; ++i) { host.Update(); mgr->Update(); observer.Update(); }
+            Assert::AreEqual(1, got, L"Queued event must be delivered after WELCOME.");
+            Assert::AreEqual(1799, (int)gotCoin.persistentId);
+            Assert::AreEqual((int)mgr->GetLocalClientId(), (int)gotOrigin,
+                L"Queued event must carry the final (welcomed) origin id.");
+            Assert::IsTrue(mgr->GetLocalClientId() != 0, L"Joiner must have a real peer id.");
+            Assert::AreEqual((size_t)0, mgr->GetPendingWorldEventCount(), L"Queue must drain.");
+
+            mgr->Leave();
+            observer.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(PendingWorldEventsAreBoundedAndClearedOnLeave)
+        {
+            // Joining a host that never answers: the queue keeps only the newest
+            // kMaxPendingWorldEvents and Leave() discards it.
+            NetworkMatchManager* mgr = NetworkMatchManager::CreateInstance();
+            unsigned short port = PickFreePort();
+            Assert::IsTrue(mgr->JoinHost("127.0.0.1", port));
+            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
+            for (int i = 0; i < 100; ++i)
+            {
+                net::CoinCollectedPayload::Encode(coin, i, 0, 0, 0);
+                mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin));
+            }
+            Assert::AreEqual((size_t)64, mgr->GetPendingWorldEventCount(), L"Queue must be bounded.");
+            mgr->Leave();
+            Assert::AreEqual((size_t)0, mgr->GetPendingWorldEventCount(), L"Leave must clear the queue.");
+            Assert::IsFalse(mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin)),
+                L"No match: send must be refused.");
+        }
+
         TEST_METHOD(HostAndJoinAreMutuallyExclusive)
         {
             // The manager is a singleton: a single process can be a host OR a
@@ -1237,6 +1303,74 @@ namespace NetworkTests
             players.UpdatePlayer(6, p);
             view.Sync(players);
             Assert::AreEqual(3, g_fakeWorld.actionCount, L"Returning to a cleared action re-arms the edge.");
+
+            view.Clear();
+        }
+
+        TEST_METHOD(LocalActionLatchSequencesRepeatedActions)
+        {
+            // The latch holds the latest action with a 3-bit sequence, so two
+            // dodges in a row produce DIFFERENT bytes with the SAME bare id.
+            net::LocalActionLatch::Reset();
+            Assert::AreEqual(0, (int)net::LocalActionLatch::Current(), L"Fresh latch holds no action.");
+
+            net::LocalActionLatch::Report(PlayerNetworkState::ACTION_NONE);
+            Assert::AreEqual(0, (int)net::LocalActionLatch::Current(), L"ACTION_NONE is not latched.");
+
+            net::LocalActionLatch::Report(PlayerNetworkState::ACTION_DODGE);
+            uint8_t first = net::LocalActionLatch::Current();
+            net::LocalActionLatch::Report(PlayerNetworkState::ACTION_DODGE);
+            uint8_t second = net::LocalActionLatch::Current();
+            Assert::AreNotEqual((int)first, (int)second, L"A repeated action must change the held byte.");
+            Assert::AreEqual((int)PlayerNetworkState::ACTION_DODGE, (int)PlayerNetworkState::ActionId(first));
+            Assert::AreEqual((int)PlayerNetworkState::ACTION_DODGE, (int)PlayerNetworkState::ActionId(second));
+
+            // Sequence wraps in 3 bits but never yields 0 for a real action.
+            for (int i = 0; i < 20; ++i)
+            {
+                net::LocalActionLatch::Report(PlayerNetworkState::ACTION_ATTACK);
+                Assert::AreNotEqual(0, (int)net::LocalActionLatch::Current(), L"Held action byte is never 0.");
+            }
+            net::LocalActionLatch::Reset();
+            Assert::AreEqual(0, (int)net::LocalActionLatch::Current(), L"Reset clears the held action.");
+        }
+
+        TEST_METHOD(RepeatedActionFiresAgainWithBareId)
+        {
+            // Receiver: a new [seq|id] byte fires the sink once with the bare id,
+            // the same byte held over several packets does not re-fire, and a
+            // peer that spawns with an already-held action does not replay it.
+            g_fakeWorld.actionCount = 0;
+            g_fakeWorld.lastActions.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.action = &FakeAction;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
+            p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_CELEB_BIG, 5);
+            players.UpdatePlayer(9, p);
+            view.Sync(players);
+            Assert::AreEqual(0, g_fakeWorld.actionCount, L"Spawning with a held action must not replay it.");
+
+            p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_DODGE, 6);
+            players.UpdatePlayer(9, p);
+            view.Sync(players);
+            view.Sync(players);
+            Assert::AreEqual(1, g_fakeWorld.actionCount, L"New action fires once even when held.");
+            Assert::AreEqual((int)PlayerNetworkState::ACTION_DODGE, (int)g_fakeWorld.lastActions.back(),
+                L"Sink receives the bare id (sequence bits stripped).");
+
+            p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_DODGE, 7);
+            players.UpdatePlayer(9, p);
+            view.Sync(players);
+            Assert::AreEqual(2, g_fakeWorld.actionCount, L"Same action with a new sequence fires again.");
 
             view.Clear();
         }
@@ -2718,6 +2852,140 @@ namespace NetworkTests
                            L"Payload decode should succeed.");
             Assert::IsTrue(out.objectUID == kUid, L"objectUID must round-trip.");
             Assert::AreEqual((int)kState, (int)out.state, L"state must round-trip.");
+        }
+
+        TEST_METHOD(StatePropAndPlatformPayloadsCarryInstancePosition)
+        {
+            uint8_t sp[net::StatePropPayload::SERIALIZED_SIZE];
+            net::StatePropPayload::Encode(sp, 0xABCD0001u, 2, 10.5f, -3.0f, 77.25f);
+            net::StatePropPayload spOut;
+            Assert::IsTrue(net::StatePropPayload::Decode(sp, sizeof(sp), spOut));
+            Assert::AreEqual(10.5f, spOut.x); Assert::AreEqual(-3.0f, spOut.y); Assert::AreEqual(77.25f, spOut.z);
+            Assert::IsFalse(net::StatePropPayload::Decode(sp, sizeof(sp) - 1, spOut),
+                L"Truncated stateprop payload must be rejected.");
+
+            uint8_t pd[net::PlatformDirPayload::SERIALIZED_SIZE];
+            net::PlatformDirPayload::Encode(pd, 0x55u, -1, 1.0f, 2.0f, 3.0f);
+            net::PlatformDirPayload pdOut;
+            Assert::IsTrue(net::PlatformDirPayload::Decode(pd, sizeof(pd), pdOut));
+            Assert::AreEqual(-1, (int)pdOut.dir);
+            Assert::AreEqual(1.0f, pdOut.x); Assert::AreEqual(2.0f, pdOut.y); Assert::AreEqual(3.0f, pdOut.z);
+        }
+
+        TEST_METHOD(WorldEventDispatchRoutesEveryTypeInsideEchoScope)
+        {
+            // Each inbound type reaches its typed handler with decoded fields,
+            // and runs with the echo guard raised (so emitters stay silent).
+            int calls = 0;
+            bool guardSeen = true;
+            net::WorldEventHandlers h;
+            h.stateProp = [&](uint16_t origin, const net::StatePropPayload& p) {
+                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
+                Assert::AreEqual(7, (int)origin); Assert::AreEqual(4, (int)p.state); };
+            h.breakable = [&](uint16_t, const net::BreakablePayload& p) {
+                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
+                Assert::AreEqual(321, (int)p.persistentId); };
+            h.vehicleDestroyed = [&](uint16_t, const net::VehicleDestroyedPayload& p) {
+                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
+                Assert::AreEqual(5.0f, p.x); };
+            h.coinCollected = [&](uint16_t, const net::CoinCollectedPayload& p) {
+                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
+                Assert::AreEqual(99, (int)p.persistentId); };
+            h.platformDir = [&](uint16_t, const net::PlatformDirPayload& p) {
+                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
+                Assert::AreEqual(1, (int)p.dir); };
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            auto send = [&](net::WorldEventType t, const uint8_t* pl, uint16_t n) {
+                uint16_t len = net::WorldEventCodec::Encode(buf, sizeof(buf), t, 7, pl, n);
+                auto d = net::WorldEventCodec::Decode(buf, len);
+                return net::DispatchWorldEvent(&d, h);
+            };
+
+            uint8_t a[net::StatePropPayload::SERIALIZED_SIZE];
+            net::StatePropPayload::Encode(a, 1u, 4, 0, 0, 0);
+            Assert::IsTrue(send(net::WE_STATEPROP, a, sizeof(a)));
+            uint8_t b[net::BreakablePayload::SERIALIZED_SIZE];
+            net::BreakablePayload::Encode(b, 321, 0, 0, 0);
+            Assert::IsTrue(send(net::WE_BREAKABLE, b, sizeof(b)));
+            uint8_t c[net::VehicleDestroyedPayload::SERIALIZED_SIZE];
+            net::VehicleDestroyedPayload::Encode(c, 3, 5.0f, 0, 0);
+            Assert::IsTrue(send(net::WE_VEHICLE_DESTROYED, c, sizeof(c)));
+            uint8_t d[net::CoinCollectedPayload::SERIALIZED_SIZE];
+            net::CoinCollectedPayload::Encode(d, 99, 0, 0, 0);
+            Assert::IsTrue(send(net::WE_COIN_COLLECTED, d, sizeof(d)));
+            uint8_t e[net::PlatformDirPayload::SERIALIZED_SIZE];
+            net::PlatformDirPayload::Encode(e, 2u, 1, 0, 0, 0);
+            Assert::IsTrue(send(net::WE_PLATFORM_DIR, e, sizeof(e)));
+
+            Assert::AreEqual(5, calls, L"Every world event type must reach its handler.");
+            Assert::IsTrue(guardSeen, L"Handlers must run inside the echo-suppression scope.");
+            Assert::IsFalse(net::IsApplyingRemoteWorldEvent(), L"Echo guard must drop after dispatch.");
+        }
+
+        TEST_METHOD(WorldEventDispatchSkipsTruncatedUnknownAndUnhandled)
+        {
+            int calls = 0;
+            net::WorldEventHandlers h;
+            h.coinCollected = [&](uint16_t, const net::CoinCollectedPayload&) { ++calls; };
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
+            net::CoinCollectedPayload::Encode(coin, 1, 0, 0, 0);
+
+            // Truncated payload: header claims fewer bytes than the struct needs.
+            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_COIN_COLLECTED, 1, coin, 4);
+            auto d1 = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsFalse(net::DispatchWorldEvent(&d1, h), L"Truncated payload must be skipped.");
+
+            // Unknown type from a newer peer.
+            n = net::WorldEventCodec::Encode(buf, sizeof(buf), static_cast<net::WorldEventType>(0x7E), 1, coin, sizeof(coin));
+            auto d2 = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsFalse(net::DispatchWorldEvent(&d2, h), L"Unknown type must be skipped.");
+
+            // Known type without a handler bound.
+            uint8_t sp[net::StatePropPayload::SERIALIZED_SIZE];
+            net::StatePropPayload::Encode(sp, 1u, 1, 0, 0, 0);
+            n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_STATEPROP, 1, sp, sizeof(sp));
+            auto d3 = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsFalse(net::DispatchWorldEvent(&d3, h), L"Unhandled type must be skipped.");
+
+            Assert::IsFalse(net::DispatchWorldEvent(nullptr, h), L"Null event must be skipped.");
+            Assert::AreEqual(0, calls);
+            Assert::IsFalse(net::IsApplyingRemoteWorldEvent(), L"Guard must not leak on skipped events.");
+        }
+
+        TEST_METHOD(EchoScopeNestsAndUnwinds)
+        {
+            Assert::IsFalse(net::IsApplyingRemoteWorldEvent());
+            {
+                net::RemoteWorldEventScope outer;
+                {
+                    net::RemoteWorldEventScope inner; // stateprop -> break cascade
+                    Assert::IsTrue(net::IsApplyingRemoteWorldEvent());
+                }
+                Assert::IsTrue(net::IsApplyingRemoteWorldEvent(), L"Outer scope still applies.");
+            }
+            Assert::IsFalse(net::IsApplyingRemoteWorldEvent());
+        }
+
+        TEST_METHOD(FindNearestWorldObjectMatchesUidThenDistance)
+        {
+            // Three instances of the same prop type + one other type right on
+            // the target: the nearest SAME-type instance within range wins.
+            const uint32_t uids[] = { 10u, 10u, 20u, 10u };
+            const float xs[] = { 50.0f, 0.4f, 0.0f, 3.0f };
+            auto getUid = [&](int i) { return uids[i]; };
+            auto getPos = [&](int i, float& x, float& y, float& z) { x = xs[i]; y = 0.0f; z = 0.0f; };
+
+            Assert::AreEqual(1, net::FindNearestWorldObject(4, true, 10u, 0.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
+                L"Nearest instance of the matching uid must be chosen.");
+            Assert::AreEqual(2, net::FindNearestWorldObject(4, false, 0u, 0.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
+                L"Without uid matching the closest object wins.");
+            Assert::AreEqual(-1, net::FindNearestWorldObject(4, true, 10u, 20.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
+                L"Nothing within range -> -1 (do not touch an unrelated object).");
+            Assert::AreEqual(-1, net::FindNearestWorldObject(4, true, 30u, 0.0f, 0.0f, 0.0f, 100.0f, getUid, getPos),
+                L"Unknown uid -> -1.");
         }
     };
 }

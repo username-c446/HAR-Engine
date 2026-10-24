@@ -21,7 +21,7 @@ public:
     typedef void* (*SpawnFn)(int playerId);
     typedef void  (*MoveFn)(int playerId, void* handle, const PlayerNetworkState& state);
     typedef void  (*JumpFn)(int playerId, void* handle); // rising edge of a remote jump
-    typedef void  (*ActionFn)(int playerId, void* handle, uint8_t actionEvent); // rising edge of a non-zero ACTION_*
+    typedef void  (*ActionFn)(int playerId, void* handle, uint8_t actionId); // new one-shot ACTION_* id (sequence bits stripped)
     typedef void  (*DespawnFn)(int playerId, void* handle);
 
     struct Sink

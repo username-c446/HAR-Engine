@@ -22,7 +22,7 @@ struct PlayerNetworkState
     uint8_t  characterState;    // CharacterAi::CharacterState value (gating: LOCO etc.)
 
     // ---- One-shot animation event (rising-edge latched by the receiver) ----
-    uint8_t  actionEvent;       // PlayerNetworkState::ACTION_* one-shot; 0 = none
+    uint8_t  actionEvent;       // [seq:3 | ACTION_* id:5] latest one-shot; 0 = none yet
 
     // ---- Faithful kinematic vehicle mirror (meaningful when inVehicle) ----
     float    vehYaw;            // machine heading, radians (shortest-arc smoothed)
@@ -38,15 +38,29 @@ struct PlayerNetworkState
     static constexpr const uint8_t FLAG_IN_AIR  = 0x02;
     static constexpr const uint8_t FLAG_LOCO_TURBO = 0x04; // local driver's max-speed clamp runs higher
 
-    // One-shot animation/action channel ids (rising-edge events, see ACTION_*).
-    // Only ACTION_NONE / ACTION_JUMP are currently populated by the local provider;
-    // the rest are reserved for later passes (slam, dodge, celebration, ...).
+    // One-shot animation/action channel ids. The sender HOLDS the latest action
+    // in actionEvent together with a 3-bit sequence number (see LocalActionLatch),
+    // so the receiver fires whenever the byte changes: a repeat of the same action
+    // still differs by its sequence, and a snapshot sampled late cannot lose it.
+    // Jumps ride FLAG_JUMPING (the receiver's jump sink), not ACTION_JUMP.
+    // ACTION_KD / ACTION_SURF are reserved (no local source yet).
     enum {
         ACTION_NONE=0, ACTION_JUMP,
         ACTION_SLAM, ACTION_JUMPKICK, ACTION_DODGE, ACTION_CRINGE, ACTION_FLAIL,
         ACTION_GETUP, ACTION_KD, ACTION_ATTACK, ACTION_CELEB_SMALL, ACTION_CELEB_BIG,
         ACTION_SURF
     };
+    static constexpr const uint8_t ACTION_ID_MASK   = 0x1F;
+    static constexpr const int     ACTION_SEQ_SHIFT = 5;
+
+    static uint8_t MakeActionEvent(uint8_t id, uint8_t seq)
+    {
+        return static_cast<uint8_t>(((seq & 0x07) << ACTION_SEQ_SHIFT) | (id & ACTION_ID_MASK));
+    }
+    static uint8_t ActionId(uint8_t actionEvent)
+    {
+        return static_cast<uint8_t>(actionEvent & ACTION_ID_MASK);
+    }
 
     // Vehicle mirror bits.
     static constexpr const uint8_t VEH_FLAG_BRAKE   = 0x01;
