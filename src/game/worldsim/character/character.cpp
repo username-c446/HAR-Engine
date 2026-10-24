@@ -343,6 +343,8 @@ mfRadius( 0.35f ),
 mbCollided( false ),
 mCurrentCollision( 0 ),
 mbIsStanding( true ),
+mNetworkPuppet( false ),
+mNetworkAirborne( false ),
 mpWalkerLocomotion( 0 ),
 mpJumpLocomotion( 0 ),
 mpStandingCollisionVolume( 0 ),
@@ -3418,6 +3420,16 @@ rmt::Vector playerPos;
 
     if(mpSimStateObj->GetControl() == sim::simSimulationCtrl)
     {
+        END_PROFILE("Character::UpdateGroundHeight")
+        return;
+    }
+
+    // A network puppet stands or flies as its owner reports (an NPC in AI
+    // control would otherwise always "stand" and be pressed to the ground,
+    // which ended every remote jump on its first frame).
+    if( mNetworkPuppet )
+    {
+        mbIsStanding = !mNetworkAirborne;
         END_PROFILE("Character::UpdateGroundHeight")
         return;
     }

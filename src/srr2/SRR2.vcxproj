@@ -1605,6 +1605,7 @@
     <ClCompile Include="..\game\worldsim\character\aicharactercontroller.cpp" />
     <ClCompile Include="..\game\worldsim\character\character.cpp" />
     <ClCompile Include="..\game\worldsim\character\charactercontroller.cpp" />
+    <ClCompile Include="..\game\worldsim\character\networkpuppetcontroller.cpp" />
     <ClCompile Include="..\game\worldsim\character\charactermanager.cpp" />
     <ClCompile Include="..\game\worldsim\character\charactermappable.cpp" />
     <ClCompile Include="..\game\worldsim\character\characterrenderable.cpp" />

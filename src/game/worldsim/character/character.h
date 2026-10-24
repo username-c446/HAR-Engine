@@ -233,6 +233,13 @@ public: // MEMBERS
     eCollisionType SolveCollisionWithStatic( const rmt::Vector& desiredPos, rmt::Vector& outPos );
     
     bool IsStanding( void ) const;
+
+    // Network puppet (shows another player): its position is the owner's
+    // replicated pose and whether it stands or is in the air is what the owner
+    // reports — it is never snapped to our ground or dropped into simulation.
+    void SetNetworkPuppet( bool puppet ) { mNetworkPuppet = puppet; }
+    bool IsNetworkPuppet( void ) const { return mNetworkPuppet; }
+    void SetNetworkAirborne( bool airborne ) { mNetworkAirborne = airborne; }
     void SetGroundPoint( const rmt::Vector& groundPoint );
 
     WalkerLocomotionAction* GetWalkerLocomotionAction( void ) const;
@@ -530,6 +537,8 @@ private: // MEMBERS
     CollisionData mCollisionData[ CollisionData::MAX_COLLISIONS ];
 
     bool mbIsStanding;
+    bool mNetworkPuppet;
+    bool mNetworkAirborne;
     WalkerLocomotionAction* mpWalkerLocomotion;
     JumpAction* mpJumpLocomotion;
 

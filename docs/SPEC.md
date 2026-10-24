@@ -988,6 +988,31 @@ id with `WSP_OWNER`, so the first mover owns it and a second one gets
   reloaded zone places the car where it was left instead of at its locator.
 - `RemoveParkedCar` stops our stream and clears network driving first.
 
+### 18.14 Remote player puppet: the game's own locomotion
+The puppet showing another player is an NPC character (`CharacterManager::NPC`)
+with two changes, because an NPC is animated and grounded by its own AI:
+- **Controller.** `NetworkPuppetController` (`worldsim/character/`, an
+  `NPCController` subclass — game code casts NPC controllers unchecked) replaces
+  the NPC one. `Update` does nothing (no paths, panic, dodging); `GetDirection`
+  returns the shown pose's measured horizontal velocity as a fraction of
+  `GetMaxSpeed()` (NPC desired speed = |direction| · maxSpeed); `Dash` is down
+  with `FLAG_LOCO_TURBO`; `RequestJump` sets the `Jump` intention. So
+  `Character::UpdateDesiredDirAndSpeed` → `WalkerLocomotionAction` pick the walk /
+  run cycle and `Loco::SequenceAction` starts the jump exactly as for a pressed
+  button. Previously `RemotePlayerMove` wrote the walker driver directly and
+  `WalkerLocomotionAction::DoSimulation` overwrote it every frame from the NPC
+  controller (speed 0): no walk / run animation.
+- **Ground.** `Character::SetNetworkPuppet` / `SetNetworkAirborne`: in
+  `UpdateGroundHeight` a puppet stands iff the owner's shown state has neither
+  `FLAG_JUMPING` nor `FLAG_IN_AIR`, and is never pressed to our ground or dropped
+  into simulation. An NPC in AI control otherwise ALWAYS stands and is snapped to
+  the ground: the jump action "landed" on its first frame (cut jump) while the
+  pose jumped between the ground and the network height (jerky jumps).
+- Edges: a `FLAG_JUMPING` rising edge → `RequestJump`; `FLAG_IN_AIR` alone (walked
+  off a ledge) → the game's fall (`JumpAction::Reset(0, true)`); nothing while a
+  jump action runs. The position is still the interpolated network pose every
+  frame; standing still takes the owner's facing.
+
 ### 18.10 Still open
 - Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
 - No player identity across reconnects (T7).

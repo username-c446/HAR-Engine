@@ -88,6 +88,7 @@
 #include <worldsim/character/character.h>
 #include <worldsim/traffic/trafficmanager.h>
 #include <worldsim/parkedcars/parkedcarmanager.h>
+#include <worldsim/character/networkpuppetcontroller.h>
 #include <worldsim/ped/pedestrianmanager.h>
 
 #include <network/NetworkMatchManager.h>
@@ -399,12 +400,23 @@ namespace
         // so the skeleton stays in the bind pose (the "T pose"). Put it into the
         // LOCO state so its walk/jump locomotion drivers run and animate it.
         c->AddToWorldScene();
+        // Driven by the owner's replicated input, animated by the game's own
+        // locomotion (walk / run / jump exactly like the local player).
+        NetworkPuppetController* ctrl = new( GMA_LEVEL_OTHER ) NetworkPuppetController;
+        c->SetController( ctrl );
+        ctrl->SetCharacter( c );
+        c->SetNetworkPuppet( true );
         CharacterAi::StateManager* sm = c->GetStateManager();
         if ( sm != NULL && sm->GetState() != CharacterAi::LOCO )
         {
             sm->SetState<CharacterAi::Loco>();
         }
         return c;
+    }
+
+    NetworkPuppetController* PuppetControllerOf( Character* c )
+    {
+        return ( c != NULL && c->IsNetworkPuppet() ) ? static_cast<NetworkPuppetController*>( c->GetController() ) : NULL;
     }
 
     void RemotePlayerMove( int playerId, void* handle, const PlayerNetworkState& state, const RemoteMotion& motion )
@@ -422,28 +434,21 @@ namespace
         // it drifted was the rubber-banding.)
         c->SetPosition( rmt::Vector( state.x, state.y, state.z ) );
 
-        CharacterAi::StateManager* sm = c->GetStateManager();
-        if ( sm == NULL || sm->GetState() != CharacterAi::LOCO ) return;
-        choreo::LocomotionDriver* driver = c->GetWalkerLocomotionAction()->GetDriver();
-        if ( driver == NULL ) return;
-
-        float facingRad = state.facingAngle / 1000.0f;
-        if ( state.characterState == static_cast<uint8_t>( CharacterAi::LOCO ) )
+        // The game animates it from the owner's input: the measured velocity
+        // of the shown pose (walk / run cycle), turbo, and whether it is in the
+        // air (the jump action lands when the owner did).
+        const bool jumping = ( state.flags & PlayerNetworkState::FLAG_JUMPING ) != 0;
+        const bool airborne = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
+        c->SetNetworkAirborne( airborne );
+        NetworkPuppetController* ctrl = PuppetControllerOf( c );
+        if ( ctrl == NULL ) return;
+        const bool walking = state.characterState == static_cast<uint8_t>( CharacterAi::LOCO );
+        ctrl->SetMotion( walking ? motion.vx : 0.0f, walking ? motion.vz : 0.0f, c->GetMaxSpeed(),
+                         ( state.flags & PlayerNetworkState::FLAG_LOCO_TURBO ) != 0, jumping, airborne );
+        if ( !walking || motion.HorizontalSpeed() < 0.15f )
         {
-            const float kStillSpeed = 0.15f; // m/s: below this the player stands
-            float speed = motion.HorizontalSpeed();
-            float motionRad = speed > kStillSpeed ? choreo::GetWorldAngle( motion.vx, motion.vz )
-                                                  : facingRad;
-            driver->SetDesiredMotionAngle( motionRad );
-            driver->SetDesiredFacingAngle( facingRad );
-            driver->SetDesiredVelocity( speed > kStillSpeed ? speed : 0.0f );
-            c->SetFacingDir( facingRad );
-            c->SetDesiredDir( motionRad );
-        }
-        else
-        {
-            // Not walking (an action, getting in/out): stand still in place.
-            driver->SetDesiredVelocity( 0.0f );
+            // Standing: no direction input, so take the owner's facing.
+            c->SetFacingDir( state.facingAngle / 1000.0f );
         }
     }
 
@@ -498,14 +503,26 @@ namespace
         Character* c = static_cast<Character*>( handle );
         if ( c == NULL ) return;
         if ( c->GetStateManager() == NULL || c->GetStateManager()->GetState() != CharacterAi::LOCO ) return;
-
+        NetworkPuppetController* ctrl = PuppetControllerOf( c );
         JumpAction* jump = c->GetJumpLocomotionAction();
-        if ( jump == NULL ) return;
-        jump->Reset( CharacterTune::sfJumpHeight, false );
-        c->GetWalkerLocomotionAction()->StopDriver();
-        c->GetActionController()->GetNextSequencer()->BeginSequence();
-        c->GetActionController()->GetNextSequencer()->AddAction( jump );
-        c->GetActionController()->GetNextSequencer()->EndSequence();
+        if ( ctrl == NULL || jump == NULL || jump->IsInJump() ) return;
+
+        if ( ctrl->IsJumping() )
+        {
+            // A jump: Loco sequences it from the intention, as for a pressed button.
+            ctrl->RequestJump();
+        }
+        else
+        {
+            // Walked off a ledge: the game's own fall (as Character does for a
+            // character that loses the ground).
+            jump->Reset( 0.0f, true );
+            c->GetActionController()->Clear();
+            Sequencer* seq = c->GetActionController()->GetNextSequencer();
+            seq->BeginSequence();
+            seq->AddAction( jump );
+            seq->EndSequence();
+        }
     }
 
     // Plays a one-shot clip on the remote character as its own sequence.
