@@ -111,7 +111,9 @@ namespace net
     //   - counters / economy (LedgerServer);
     //   - relays: player / mission streams (timestamped, validated), owner-
     //     checked entity streams, entity and player events, user data;
-    //   - per-peer rate limits.
+    //   - interest management of the player and entity streams (an optional
+    //     game policy decides who receives what, the core enforces it);
+    //   - per-peer rate limits, traffic accounting.
     // Nothing is accepted from a peer before it is admitted.
     class ServerCore
     {
@@ -158,6 +160,10 @@ namespace net
         // Plausibility gate for relayed player state (anti-teleport / speed).
         void SetStateValidator(IStateValidator* v) { m_validator = v; }
 
+        // Who receives which player / entity stream samples (null = everyone
+        // receives everything).
+        void SetInterestPolicy(IInterestPolicy* p) { m_interest = p; }
+
         // Final say on admission after the built-in checks (e.g. a server mod).
         using AdmissionFn = std::function<bool(PeerId)>;
         void SetAdmissionFilter(AdmissionFn fn) { m_admission = std::move(fn); }
@@ -185,6 +191,8 @@ namespace net
         const LedgerServer&    GetLedgerServer() const { return m_ledger; }
         uint32_t NowMs() const { return m_endpoint ? m_endpoint->NowMs() : 0; }
         uint32_t GetPeerRttMs(PeerId peer) const { return m_endpoint ? m_endpoint->GetPeerRttMs(peer) : 0; }
+        bool GetPeerLink(PeerId peer, ServerEndpoint::PeerLink& out) const
+        { return m_endpoint != nullptr && m_endpoint->GetPeerLink(peer, out); }
 
         // Refuses / removes a peer with a reason it is told about.
         void Kick(PeerId peer, RefuseReason reason);
@@ -196,8 +204,12 @@ namespace net
             uint32_t stateDropped = 0; // player states refused by the validator
             uint32_t corrections  = 0; // PID_STATE_CORRECTION sent
             uint32_t floodKicks   = 0;
+            uint64_t samplesFiltered       = 0; // player samples not forwarded to a peer (interest)
+            uint64_t entityRecordsFiltered = 0; // entity records not forwarded to a peer (interest)
         };
         const Stats& GetStats() const { return m_stats; }
+        // Transport traffic of the running server (null when stopped).
+        const TrafficStats* GetTraffic() const { return m_endpoint ? &m_endpoint->GetTraffic() : nullptr; }
 
         // Server-side framing of a relayed stream: [u16 from][u32 time][payload].
         static constexpr const uint16_t kStreamRelayHeader = 2 + 4;
@@ -221,6 +233,8 @@ namespace net
             TokenBucket bytes;
             uint32_t    violations = 0;
             uint32_t    violationWindowStart = 0;
+            // Interest: sender -> time of its last player sample forwarded here.
+            std::map<PeerId, uint32_t> forwardedAt;
         };
 
         void OnPacket(const ServerEndpoint::RawPacket& rp);
@@ -233,6 +247,11 @@ namespace net
         bool AllowPacket(PeerId from, PacketId id, uint16_t size);
         void HandleState(PeerId from, const uint8_t* data, uint16_t size);
         void RelayStream(PacketId id, PeerId from, const uint8_t* data, uint16_t size);
+        void RelayPlayerState(PeerId from, const uint8_t* data, uint16_t size);
+        uint32_t ClampStreamTime(uint32_t t) const;
+        uint16_t FrameStream(PeerId from, uint32_t t, const uint8_t* payload, uint16_t size, uint8_t* out) const;
+        void SendEntityBatches(PeerId from, uint32_t t, const std::vector<EntityStateRecord>& records,
+                               const PeerId* to, size_t count);
         void HandleWorldStateRequest(PeerId from, const uint8_t* data, uint16_t size);
         void HandleLedgerRequest(PeerId from, const uint8_t* data, uint16_t size);
         void RelayEntityStates(PeerId from, const uint8_t* data, uint16_t size);
@@ -255,6 +274,7 @@ namespace net
         uint32_t        m_options = SO_NONE;
         uint32_t        m_claimWindowMs = 3000;
         IStateValidator* m_validator = nullptr;
+        IInterestPolicy* m_interest = nullptr;
         AdmissionFn     m_admission;
 
         // observers
@@ -268,5 +288,6 @@ namespace net
         WorldStateTable m_world;
         LedgerServer    m_ledger;
         Stats           m_stats;
+        std::vector<PeerId> m_to; // recipients scratch (one shared packet per send)
     };
 }

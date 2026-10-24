@@ -10,6 +10,7 @@
 namespace net { class Session; }
 
 #include <cstdint>
+#include <functional>
 #include <map>
 
 // Forward declarations (game world side).
@@ -55,6 +56,16 @@ namespace net
         // The network peer id of ourselves; used to skip our own echo.
         void SetLocalPeerId(PeerId id) { m_selfId = id; }
 
+        // Sees every local state before it is serialized (the game publishes
+        // what the stream does not carry, e.g. the vehicle model, as presence).
+        typedef std::function<void(const PlayerNetworkState&)> LocalStateObserver;
+        void SetLocalStateObserver(LocalStateObserver fn) { m_localObserver = std::move(fn); }
+
+        // Completes a decoded remote state before it is applied (fills what
+        // the stream does not carry from the sender's presence records).
+        typedef std::function<void(PeerId, PlayerNetworkState&)> RemoteStateDecorator;
+        void SetRemoteStateDecorator(RemoteStateDecorator fn) { m_remoteDecorator = std::move(fn); }
+
         // ---- ILocalStateProvider ---------------------------------------------
 
         bool GetLocalState(uint8_t* out, uint16_t capacity, uint16_t& size) override;
@@ -74,6 +85,8 @@ namespace net
         TypedLocalProvider m_typedLocal = nullptr;   // game-typed Avatar reader
         RemotePlayerManager* m_remotePlayers = nullptr;
         PeerId m_selfId = 0;
+        LocalStateObserver   m_localObserver;
+        RemoteStateDecorator m_remoteDecorator;
         // Scratch for local serialization.
         uint8_t m_scratch[MAX_PACKET_PAYLOAD];
     };

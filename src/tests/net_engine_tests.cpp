@@ -1,7 +1,7 @@
 // Tests for the transport / server-core layer and the game server rules:
 // clock sync, snapshot buffers, rate limits, handshake refusals, embedded and
 // dedicated-style servers, movement validation, ownership migration, entity
-// and player (PvP) events.
+// and player (PvP) events, interest management and the compact streams.
 #include "CppUnitTest.h"
 #include "PlayerNetworkState.h"
 #include "PlayerMovementValidator.h"
@@ -10,6 +10,7 @@
 #include "RemoteStateTrack.h"
 #include "PlayerPresence.h"
 #include "RemotePlayerWorldView.h"
+#include "PlayerInterestPolicy.h"
 #include "../game/netengine/NetTime.h"
 #include "../game/netengine/ServerCore.h"
 #include "../game/netengine/Session.h"
@@ -18,6 +19,7 @@
 #include <windows.h>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <vector>
 #include <string>
 
@@ -57,8 +59,8 @@ namespace NetworkTests
 
         std::vector<uint8_t> Blob(const PlayerNetworkState& st)
         {
-            std::vector<uint8_t> b(PlayerNetworkState::SERIALIZED_SIZE);
-            st.Serialize(reinterpret_cast<char*>(b.data()));
+            std::vector<uint8_t> b(PlayerNetworkState::MAX_SERIALIZED_SIZE);
+            b.resize(static_cast<size_t>(st.Serialize(reinterpret_cast<char*>(b.data()))));
             return b;
         }
     }
@@ -378,7 +380,7 @@ namespace NetworkTests
             Assert::AreEqual((int)net::SV_ACCEPT, (int)check(StateAt(1.5f, 0), 1100), L"Running pace.");
             Assert::AreEqual((int)net::SV_CORRECT, (int)check(StateAt(500, 0), 1200), L"Teleport refused...");
             PlayerNetworkState back;
-            back.Deserialize(reinterpret_cast<const char*>(corr.data()));
+            Assert::IsTrue(back.Deserialize(reinterpret_cast<const char*>(corr.data()), static_cast<int>(corr.size())));
             Assert::AreEqual(1.5f, back.x, L"... with the last accepted state to snap back to.");
             Assert::AreEqual((int)net::SV_DROP, (int)check(StateAt(500, 0), 1300), L"No correction spam.");
             Assert::AreEqual((int)net::SV_ACCEPT, (int)check(StateAt(2.0f, 0), 1400), L"Back on track.");
@@ -387,8 +389,14 @@ namespace NetworkTests
             Assert::AreEqual((int)net::SV_ACCEPT, (int)check(StateAt(1900, 0, 2), 1600));
             Assert::AreEqual((int)net::SV_ACCEPT, (int)check(StateAt(2900, 0, 3), 1700));
             Assert::AreNotEqual((int)net::SV_ACCEPT, (int)check(StateAt(3900, 0, 4), 1800), L"Teleport rate limited.");
-            // Garbage never passes.
-            Assert::AreNotEqual((int)net::SV_ACCEPT, (int)check(StateAt(std::numeric_limits<float>::quiet_NaN(), 0), 5000));
+            // Garbage never passes: a truncated record is dropped, and a
+            // non-finite position cannot even be encoded.
+            corr.clear();
+            std::vector<uint8_t> cut = Blob(StateAt(3000, 0, 3));
+            Assert::AreEqual((int)net::SV_DROP, (int)v.ValidatePeerState(1, cut.data(), (uint16_t)(cut.size() - 1), 5000, corr));
+            PlayerNetworkState nan;
+            std::vector<uint8_t> nb = Blob(StateAt(std::numeric_limits<float>::quiet_NaN(), 0));
+            Assert::IsTrue(nan.Deserialize(reinterpret_cast<const char*>(nb.data()), (int)nb.size()) && nan.x == 0.0f);
         }
 
         TEST_METHOD(ValidatorCorrectsTheClientThroughTheSession)
@@ -404,10 +412,9 @@ namespace NetworkTests
                 PlayerNetworkState st = StateAt(0, 0);
                 bool GetLocalState(uint8_t* out, uint16_t cap, uint16_t& size) override
                 {
-                    if (cap < PlayerNetworkState::SERIALIZED_SIZE) return false;
-                    st.Serialize(reinterpret_cast<char*>(out));
-                    size = PlayerNetworkState::SERIALIZED_SIZE;
-                    return true;
+                    if (cap < PlayerNetworkState::MAX_SERIALIZED_SIZE) return false;
+                    size = static_cast<uint16_t>(st.Serialize(reinterpret_cast<char*>(out)));
+                    return size > 0;
                 }
             } prov;
             net::Session cheater;
@@ -692,6 +699,326 @@ namespace NetworkTests
             std::memset(big.bytes, 'x', 48);
             Assert::IsTrue(a.Decode(big));
             Assert::AreEqual((size_t)31, std::strlen(a.model), L"Terminator enforced.");
+        }
+    };
+
+    namespace
+    {
+        net::WorldStateOp ContextOp(net::PeerId peer, uint8_t level, uint64_t zone)
+        {
+            net::WorldStateOp op;
+            op.key.object = net::MakePlayerObjectId(peer);
+            op.key.channel = net::WOC_PLAYER_CONTEXT;
+            op.kind = net::WSO_SET;
+            op.policy = net::WSP_OWNER;
+            op.flags = net::WSF_ERASE_ON_OWNER_LEAVE;
+            net::PlayerContext c;
+            c.level = level;
+            c.zone = zone;
+            c.Encode(op.value);
+            return op;
+        }
+
+        void Place(PlayerInterestPolicy& p, net::PeerId peer, float x, float z)
+        {
+            std::vector<uint8_t> b = Blob(StateAt(x, z));
+            p.OnPlayerState(peer, b.data(), static_cast<uint16_t>(b.size()), 0);
+        }
+
+        uint32_t g_entityClock = 0;
+    }
+
+    TEST_CLASS(InterestTests)
+    {
+    public:
+        TEST_METHOD(PolicyTiersPlayersByContextAndDistance)
+        {
+            net::WorldStateTable world;
+            PlayerInterestPolicy policy;
+            policy.SetWorld(&world);
+            net::WorldStateEntry e;
+            bool existed = false;
+            world.Apply(1, ContextOp(1, 1, 0), e, existed);
+            world.Apply(2, ContextOp(2, 1, 0), e, existed);
+            world.Apply(3, ContextOp(3, 1, 0x77), e, existed); // inside an interior
+            // peer 4 has no context record yet
+
+            Place(policy, 1, 0.0f, 0.0f);
+            Place(policy, 2, 100.0f, 0.0f);
+            Place(policy, 3, 5.0f, 0.0f);
+            Place(policy, 4, 5000.0f, 0.0f);
+
+            Assert::AreEqual(0u, policy.PlayerStateIntervalMs(1, 2), L"Near: every sample.");
+            Assert::AreEqual(PlayerInterestPolicy::kNotRelevant, policy.PlayerStateIntervalMs(1, 3),
+                             L"Another context: nothing, however close.");
+            Assert::AreEqual(PlayerInterestPolicy::kNotRelevant, policy.PlayerStateIntervalMs(3, 1));
+            Assert::AreEqual(200u, policy.PlayerStateIntervalMs(1, 4), L"Unknown context is relevant; far = 5 Hz.");
+
+            // Hysteresis: a near pair stays near up to nearRadius + 25 m.
+            Place(policy, 2, 170.0f, 0.0f);
+            Assert::AreEqual(0u, policy.PlayerStateIntervalMs(1, 2));
+            Place(policy, 2, 180.0f, 0.0f);
+            Assert::AreEqual(200u, policy.PlayerStateIntervalMs(1, 2));
+            Place(policy, 2, 160.0f, 0.0f);
+            Assert::AreEqual(200u, policy.PlayerStateIntervalMs(1, 2), L"Far again only below nearRadius.");
+            Place(policy, 2, 140.0f, 0.0f);
+            Assert::AreEqual(0u, policy.PlayerStateIntervalMs(1, 2));
+
+            // Entities: in the owner's context and within entityRadius of the receiver.
+            net::NetEntityMotion m;
+            net::EntityStateRecord rec;
+            m.x = 290.0f; m.Encode(rec, 42);
+            Assert::IsTrue(policy.EntityRelevant(1, 2, rec));
+            Assert::IsFalse(policy.EntityRelevant(3, 2, rec), L"Not inside the interior.");
+            m.x = 320.0f; m.Encode(rec, 42);
+            Assert::IsFalse(policy.EntityRelevant(1, 2, rec), L"Beyond entityRadius.");
+
+            // A receiver without a known position gets everything; a peer that
+            // left is forgotten.
+            policy.OnPeerLeft(1);
+            Assert::AreEqual(0u, policy.PlayerStateIntervalMs(1, 4));
+            Assert::IsTrue(policy.EntityRelevant(1, 2, rec));
+
+            PlayerInterestPolicy::Config off;
+            off.enabled = false;
+            policy.SetConfig(off);
+            Assert::AreEqual(0u, policy.PlayerStateIntervalMs(3, 2), L"Disabled: everything to everyone.");
+        }
+
+        TEST_METHOD(ServerForwardsByInterestAndCountsTraffic)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            GameServer rules;
+            GameServer::Options opt;
+            rules.Attach(host.GetServerCore(), opt);
+            Assert::IsTrue(host.StartHost(port, 1));
+
+            struct Provider : net::ILocalStateProvider
+            {
+                PlayerNetworkState st;
+                bool GetLocalState(uint8_t* out, uint16_t cap, uint16_t& size) override
+                {
+                    if (cap < PlayerNetworkState::MAX_SERIALIZED_SIZE) return false;
+                    size = static_cast<uint16_t>(st.Serialize(reinterpret_cast<char*>(out)));
+                    return size > 0;
+                }
+            };
+            struct Sink : net::IRemoteStateSink
+            {
+                std::map<net::PeerId, int> got;
+                void ApplyRemoteState(net::PeerId from, const uint8_t*, uint16_t, uint32_t) override { ++got[from]; }
+                void OnPeerLeft(net::PeerId) override {}
+            } sink;
+
+            // a at the origin; b near it; c 1 km away; d next to a but indoors.
+            Provider pa, pb, pc, pd;
+            pa.st = StateAt(0.0f, 0.0f);
+            pb.st = StateAt(20.0f, 0.0f);
+            pc.st = StateAt(1000.0f, 0.0f);
+            pd.st = StateAt(10.0f, 0.0f);
+            net::Session a, b, c, d;
+            a.SetRemoteStateSink(&sink);
+            net::Session* joiners[4] = { &a, &b, &c, &d };
+            Provider* provs[4] = { &pa, &pb, &pc, &pd };
+            for (int i = 0; i < 4; ++i)
+            {
+                joiners[i]->SetLocalStateProvider(provs[i]);
+                joiners[i]->SetStateSendIntervalMs(50);
+                Assert::IsTrue(joiners[i]->Join("127.0.0.1", port));
+            }
+            Assert::IsTrue(PumpUntil({ &host, &a, &b, &c, &d }, [&] {
+                return a.IsWelcomed() && b.IsWelcomed() && c.IsWelcomed() && d.IsWelcomed();
+            }));
+            for (int i = 0; i < 4; ++i)
+                joiners[i]->RequestWorldState(ContextOp(joiners[i]->GetLocalPeerId(), 1, i == 3 ? 0x99u : 0u));
+            const net::WorldStateTable& world = host.GetServerCore().GetWorldStateTable();
+            Assert::IsTrue(PumpUntil({ &host, &a, &b, &c, &d }, [&] {
+                for (int i = 0; i < 4; ++i)
+                {
+                    net::WorldStateKey k;
+                    k.object = net::MakePlayerObjectId(joiners[i]->GetLocalPeerId());
+                    k.channel = net::WOC_PLAYER_CONTEXT;
+                    net::WorldStateEntry e;
+                    if (!world.Find(k, e)) return false;
+                }
+                return sink.got.count(b.GetLocalPeerId()) && sink.got.count(c.GetLocalPeerId());
+            }), L"Contexts recorded, streams flowing.");
+
+            PumpAll(host, { &a, &b, &c, &d }, 50);
+            sink.got.clear();
+            uint32_t t0 = host.GetServerCore().NowMs();
+            net::TrafficStats before = *host.GetServerCore().GetTraffic();
+            PumpUntil({ &host, &a, &b, &c, &d }, [&] { return host.GetServerCore().NowMs() - t0 >= 2000; }, 20000);
+            double secs = (host.GetServerCore().NowMs() - t0) / 1000.0;
+            double nearRate = sink.got[b.GetLocalPeerId()] / secs;
+            double farRate = sink.got[c.GetLocalPeerId()] / secs;
+            int indoor = sink.got[d.GetLocalPeerId()];
+
+            Assert::AreEqual(0, indoor, L"A player in another context is never sent.");
+            Assert::IsTrue(nearRate > 12.0, L"A near player arrives at the full 20 Hz.");
+            Assert::IsTrue(farRate > 2.5 && farRate < 7.0, L"A far player arrives at about 5 Hz.");
+            Assert::IsTrue(host.GetServerCore().GetStats().samplesFiltered > 0);
+
+            // Traffic is counted per packet id: every player sample is the
+            // 4-byte frame + [u16 from][u32 time] + the 21-byte on-foot state.
+            const net::TrafficStats& after = *host.GetServerCore().GetTraffic();
+            const net::TrafficCounter& out = after.sent.at(net::PID_PLAYER_STATE);
+            const net::TrafficCounter& was = before.sent.at(net::PID_PLAYER_STATE);
+            uint64_t pk = out.packets - was.packets;
+            Assert::IsTrue(pk > 0);
+            Assert::AreEqual<uint64_t>(pk * (4 + 6 + 21), out.bytes - was.bytes);
+            Assert::IsTrue(after.wireSent.bytes > before.wireSent.bytes, L"ENet wire totals are collected.");
+            for (net::Session* s : joiners) s->Leave();
+            host.Leave();
+            rules.Detach();
+        }
+
+        TEST_METHOD(AdaptiveDelayFollowsTheSampleSpacingAndGapsReset)
+        {
+            static uint32_t clock = 0;
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return clock; };
+            timing.interpolationDelayMs = 100;
+            timing.adaptive = true;
+
+            RemoteStateTrack track;
+            PlayerNetworkState s = StateAt(0, 0);
+            PlayerNetworkState out;
+            uint32_t t = 1000;
+            for (int i = 0; i < 40; ++i) // 20 Hz: the delay stays at its base
+            {
+                s.x = i * 0.25f;
+                track.Push(t, s);
+                clock = t + 10;
+                track.Render(timing, out);
+                t += 50;
+            }
+            Assert::AreEqual(100.0f, track.CurrentDelayMs(), 0.5f);
+
+            for (int i = 0; i < 60; ++i) // 5 Hz (far tier): two intervals, reached gradually
+            {
+                track.Push(t, s);
+                for (int f = 0; f < 12; ++f)
+                {
+                    clock = t + f * 16;
+                    track.Render(timing, out);
+                    if (i == 0 && f == 1) Assert::IsTrue(track.CurrentDelayMs() < 120.0f, L"No jump in the delay.");
+                }
+                t += 200;
+            }
+            Assert::AreEqual(400.0f, track.CurrentDelayMs(), 20.0f);
+
+            // A sample 5 s after the last one starts a new history: the shown
+            // pose is the new one, not a slide from the old position.
+            PlayerNetworkState away = StateAt(500.0f, 0.0f);
+            t += 5000;
+            track.Push(t, away);
+            clock = t + 1;
+            Assert::IsTrue(track.Render(timing, out));
+            Assert::AreEqual(500.0f, out.x, 0.01f);
+        }
+
+        TEST_METHOD(VehicleModelRidesPresence)
+        {
+            PlayerPresence p;
+            std::vector<net::WorldStateOp> ops;
+            p.SetSender([&](const net::WorldStateOp& op) { ops.push_back(op); return true; });
+            net::PlayerVehicle v;
+            v.Set(12, "famil_v");
+            p.SetLocalVehicle(v);
+            Assert::AreEqual((size_t)0, ops.size());
+            p.OnWelcomed(3);
+            Assert::AreEqual((size_t)1, ops.size(), L"Published on welcome.");
+            p.SetLocalVehicle(v);
+            Assert::AreEqual((size_t)1, ops.size(), L"Unchanged: not resent.");
+            net::PlayerVehicle none;
+            p.SetLocalVehicle(none); // got out
+            Assert::AreEqual((size_t)2, ops.size());
+            Assert::AreEqual((int)net::WOC_VEHICLE, (int)ops[1].key.channel);
+
+            PlayerPresence other;
+            other.OnWelcomed(9);
+            net::WorldStateEntry e;
+            e.key = ops[0].key;
+            e.owner = 3;
+            e.value = ops[0].value;
+            other.OnAuthoritative(e, net::WSR_REMOTE);
+            const net::PlayerVehicle* got = other.Vehicle(3);
+            Assert::IsNotNull(got);
+            Assert::AreEqual(12, got->netVehicleId);
+            Assert::AreEqual(std::string("famil_v"), std::string(got->model));
+            other.OnAuthoritative(e, net::WSR_ERASED);
+            Assert::IsNull(other.Vehicle(3));
+        }
+
+        TEST_METHOD(EntityMotionIsCompactAndExact)
+        {
+            net::NetEntityMotion m;
+            m.x = -1234.56f; m.y = 7.5f; m.z = 0.01f; m.yaw = 3.0f;
+            m.speedKmh = 77; m.steer = -40; m.flags = net::NetEntityMotion::MF_BRAKE; m.damage = 9; m.state = 4;
+            net::EntityStateRecord rec;
+            m.Encode(rec, 5);
+            Assert::AreEqual(17, (int)rec.len);
+            Assert::AreEqual(17, (int)net::NetEntityMotion::SIZE);
+            net::NetEntityMotion back;
+            Assert::IsTrue(back.Decode(rec));
+            Assert::AreEqual(m.x, back.x, 0.005f);
+            Assert::AreEqual(m.y, back.y, 0.005f);
+            Assert::AreEqual(m.z, back.z, 0.005f);
+            Assert::AreEqual(m.yaw, back.yaw, 0.0002f);
+            Assert::AreEqual(77, (int)back.speedKmh);
+            Assert::AreEqual(-40, (int)back.steer);
+            Assert::AreEqual(9, (int)back.damage);
+            Assert::AreEqual(4, (int)back.state);
+        }
+
+        TEST_METHOD(EntityWithoutFreshSamplesIsNotShown)
+        {
+            // The server stops forwarding an entity once it is far from us; its
+            // last known pose must not become a ghost when we walk there.
+            for (MigGhost* g : g_migGhosts) delete g;
+            g_migGhosts.clear();
+            NetEntityManager m;
+            NetEntityManager::Sink s = { &MigSpawn, &MigMove, &MigDespawn, &MigAdopt, &MigHit };
+            m.SetSink(s);
+            m.SetClock([]() -> uint32_t { return g_entityClock; });
+            m.SetRelevanceRadius(200.0f);
+            m.SetPresence([](float& x, float& z) { x = 0.0f; z = 0.0f; return true; },
+                          NetEntityManager::RemotePlayerNearFn(), NetEntityManager::CanAdoptFn());
+            m.OnWelcomed(2);
+
+            g_entityClock = 10000;
+            net::NetEntitySpawn sp; sp.kind = net::NEK_TRAFFIC_CAR; sp.x = 10.0f;
+            net::WorldStateEntry e;
+            e.key.object = net::MakeDynamicEntityId(5, 1);
+            e.key.channel = net::WS_CHANNEL_ENTITY;
+            e.owner = 5; e.policy = net::WSP_OWNER;
+            sp.Encode(e.value);
+            m.OnAuthoritative(e, net::WSR_REMOTE);
+            m.Update(0.016f);
+            Assert::AreEqual((size_t)0, g_migGhosts.size(), L"No sample yet: not shown.");
+
+            net::NetEntityMotion mo; mo.x = 12.0f;
+            net::EntityStateRecord rec;
+            mo.Encode(rec, e.key.object);
+            m.OnEntityState(5, rec, g_entityClock);
+            g_entityClock += 200;
+            m.Update(0.016f);
+            Assert::AreEqual((size_t)1, g_migGhosts.size(), L"Fresh samples: shown.");
+
+            g_entityClock += 2000; // nothing more arrives
+            m.Update(0.016f);
+            Assert::AreEqual((size_t)0, g_migGhosts.size(), L"Stale: hidden.");
+
+            // Released: the record's final pose is authoritative again.
+            e.owner = 0; e.flags = net::WSF_CLAIMABLE;
+            sp.x = 30.0f; sp.Encode(e.value);
+            m.OnAuthoritative(e, net::WSR_REMOTE);
+            m.Update(0.016f);
+            Assert::AreEqual((size_t)1, g_migGhosts.size());
+            Assert::AreEqual(30.0f, g_migGhosts[0]->last.x, 0.01f);
+            m.OnMatchEnd();
         }
     };
 }

@@ -123,6 +123,8 @@ namespace net
         m_peers.erase(e.peer);
         bool wasAdmitted = m_admitted.erase(e.peer) != 0;
         if (!wasAdmitted) return;
+        for (auto& kv : m_peers) kv.second.forwardedAt.erase(e.peer);
+        if (m_interest) m_interest->OnPeerLeft(e.peer);
 
         // Its owner-bound world state goes with it (dynamic entities), and its
         // session balances are dropped.
@@ -341,9 +343,11 @@ namespace net
     void ServerCore::SendToAdmitted(PacketId id, const uint8_t* data, uint16_t size, PeerId omit)
     {
         // Never Broadcast on the endpoint: peers still in the handshake must
-        // not see the world.
+        // not see the world. One shared packet for all recipients.
+        m_to.clear();
         for (PeerId p : m_admitted)
-            if (p != omit) m_endpoint->SendTo(p, id, data, size);
+            if (p != omit) m_to.push_back(p);
+        if (!m_to.empty()) m_endpoint->SendToMany(m_to.data(), m_to.size(), id, data, size);
     }
 
     void ServerCore::Relay(PacketId id, PeerId from, const uint8_t* data, uint16_t size)
@@ -356,24 +360,88 @@ namespace net
         SendToAdmitted(id, framed, static_cast<uint16_t>(size + 2), from);
     }
 
+    uint32_t ServerCore::ClampStreamTime(uint32_t t) const
+    {
+        // The time is the sender's estimate of OUR clock; it may lag (bounded)
+        // but never lead it.
+        uint32_t now = NowMs();
+        if (TimeDiff(t, now) > 0) return now;
+        if (TimeDiff(now, t) > static_cast<int32_t>(kMaxStreamLagMs)) return now - kMaxStreamLagMs;
+        return t;
+    }
+
+    uint16_t ServerCore::FrameStream(PeerId from, uint32_t t, const uint8_t* payload, uint16_t size, uint8_t* out) const
+    {
+        // Relayed stream: [u16 from][u32 time][payload].
+        if (static_cast<uint32_t>(size) + kStreamRelayHeader > MAX_PACKET_PAYLOAD) return 0;
+        Writer w(out, MAX_PACKET_PAYLOAD);
+        w.WriteU16(from);
+        w.WriteU32(t);
+        if (size > 0) w.WriteBytes(payload, size);
+        return w.Ok() ? w.Position() : 0;
+    }
+
     void ServerCore::RelayStream(PacketId id, PeerId from, const uint8_t* data, uint16_t size)
     {
-        // Client stream: [u32 sample time][payload]. The time is the sender's
-        // estimate of OUR clock; it may lag (bounded) but never lead it.
+        // Client stream: [u32 sample time][payload], to every other peer.
         if (size < kStreamClientHeader) return;
         Reader r(data, size);
         uint32_t t = 0;
         r.ReadU32(t);
-        uint32_t now = NowMs();
-        if (TimeDiff(t, now) > 0) t = now;
-        if (TimeDiff(now, t) > static_cast<int32_t>(kMaxStreamLagMs)) t = now - kMaxStreamLagMs;
+        uint8_t framed[MAX_PACKET_PAYLOAD];
+        uint16_t n = FrameStream(from, ClampStreamTime(t), data + kStreamClientHeader,
+                                 static_cast<uint16_t>(size - kStreamClientHeader), framed);
+        if (n) SendToAdmitted(id, framed, n, from);
+    }
 
-        uint8_t body[MAX_PACKET_PAYLOAD];
-        Writer w(body, sizeof(body));
-        w.WriteU32(t);
-        w.WriteBytes(data + kStreamClientHeader, static_cast<uint16_t>(size - kStreamClientHeader));
-        if (!w.Ok()) return;
-        Relay(id, from, body, w.Position());
+    void ServerCore::RelayPlayerState(PeerId from, const uint8_t* data, uint16_t size)
+    {
+        // Like RelayStream, but each recipient gets the sample only if the
+        // interest policy finds it relevant, at most once per the interval it
+        // asks for (a distant player at a lower rate).
+        if (size < kStreamClientHeader) return;
+        Reader r(data, size);
+        uint32_t t = 0;
+        r.ReadU32(t);
+        t = ClampStreamTime(t);
+        uint8_t framed[MAX_PACKET_PAYLOAD];
+        uint16_t n = FrameStream(from, t, data + kStreamClientHeader,
+                                 static_cast<uint16_t>(size - kStreamClientHeader), framed);
+        if (!n) return;
+
+        m_to.clear();
+        for (PeerId p : m_admitted)
+        {
+            if (p == from) continue;
+            if (m_interest)
+            {
+                uint32_t interval = m_interest->PlayerStateIntervalMs(p, from);
+                if (interval == IInterestPolicy::kNotRelevant)
+                {
+                    ++m_stats.samplesFiltered;
+                    continue;
+                }
+                auto info = m_peers.find(p);
+                if (interval > 0 && info != m_peers.end())
+                {
+                    // A tenth of the interval of slack absorbs the sender's
+                    // cadence jitter (a 200 ms tier stays 5 Hz at 20 Hz input).
+                    auto last = info->second.forwardedAt.find(from);
+                    if (last != info->second.forwardedAt.end())
+                    {
+                        int32_t since = TimeDiff(t, last->second);
+                        if (since >= 0 && since < static_cast<int32_t>(interval - interval / 10))
+                        {
+                            ++m_stats.samplesFiltered;
+                            continue;
+                        }
+                    }
+                    info->second.forwardedAt[from] = t;
+                }
+            }
+            m_to.push_back(p);
+        }
+        if (!m_to.empty()) m_endpoint->SendToMany(m_to.data(), m_to.size(), PID_PLAYER_STATE, framed, n);
     }
 
     void ServerCore::HandleState(PeerId from, const uint8_t* data, uint16_t size)
@@ -397,7 +465,10 @@ namespace net
                 return; // the last accepted state stays authoritative
             }
         }
-        RelayStream(PID_PLAYER_STATE, from, data, size);
+        if (m_interest)
+            m_interest->OnPlayerState(from, data + kStreamClientHeader,
+                                      static_cast<uint16_t>(size - kStreamClientHeader), NowMs());
+        RelayPlayerState(from, data, size);
     }
 
     void ServerCore::BroadcastErase(const WorldStateKey& key, PeerId origin, uint32_t seq)
@@ -498,16 +569,54 @@ namespace net
                 owned.push_back(rec);
         }
 
-        size_t first = 0;
-        while (first < owned.size())
+        if (owned.empty()) return;
+
+        Reader r(data, size);
+        uint32_t t = 0;
+        r.ReadU32(t);
+        t = ClampStreamTime(t);
+
+        if (m_interest == nullptr)
         {
-            uint8_t batch[MAX_PACKET_PAYLOAD];
-            std::memcpy(batch, data, kStreamClientHeader); // keep the sample time
-            uint16_t n = EntityStreamCodec::Encode(batch + kStreamClientHeader,
+            m_to.clear();
+            for (PeerId p : m_admitted)
+                if (p != from) m_to.push_back(p);
+            if (!m_to.empty()) SendEntityBatches(from, t, owned, m_to.data(), m_to.size());
+            return;
+        }
+
+        // Each recipient gets the records relevant to it (entities near it).
+        std::vector<EntityStateRecord> relevant;
+        relevant.reserve(owned.size());
+        for (const PeerId& p : m_admitted)
+        {
+            if (p == from) continue;
+            relevant.clear();
+            for (const EntityStateRecord& rec : owned)
+            {
+                if (m_interest->EntityRelevant(p, from, rec)) relevant.push_back(rec);
+                else ++m_stats.entityRecordsFiltered;
+            }
+            if (!relevant.empty()) SendEntityBatches(from, t, relevant, &p, 1);
+        }
+    }
+
+    void ServerCore::SendEntityBatches(PeerId from, uint32_t t, const std::vector<EntityStateRecord>& records,
+                                       const PeerId* to, size_t count)
+    {
+        // [u16 owner][u32 time][batch], as many packets as the records need.
+        size_t first = 0;
+        while (first < records.size())
+        {
+            uint8_t framed[MAX_PACKET_PAYLOAD];
+            Writer w(framed, sizeof(framed));
+            w.WriteU16(from);
+            w.WriteU32(t);
+            uint16_t n = EntityStreamCodec::Encode(framed + kStreamRelayHeader,
                                                    MAX_PACKET_PAYLOAD - kStreamRelayHeader,
-                                                   owned, first);
+                                                   records, first);
             if (n == 0) break;
-            RelayStream(PID_ENTITY_STATE, from, batch, static_cast<uint16_t>(n + kStreamClientHeader));
+            m_endpoint->SendToMany(to, count, PID_ENTITY_STATE, framed, static_cast<uint16_t>(n + kStreamRelayHeader));
         }
     }
 

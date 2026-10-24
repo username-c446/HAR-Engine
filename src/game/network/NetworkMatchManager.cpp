@@ -181,6 +181,20 @@ void NetworkMatchManager::AttachSession()
     m_lastRefusal = net::REFUSE_NONE;
     m_lastLost = false;
     m_bridge->AttachToSession(s);
+    // The vehicle model is not streamed: it is the driver's presence record,
+    // published when it changes and put back into each received state.
+    m_bridge->SetLocalStateObserver([](const PlayerNetworkState& st)
+    {
+        net::PlayerVehicle v;
+        if (st.inVehicle != 0) v.Set(st.netVehicleId, st.vehicleModel);
+        Presence().SetLocalVehicle(v);
+    });
+    m_bridge->SetRemoteStateDecorator([](net::PeerId from, PlayerNetworkState& st)
+    {
+        const net::PlayerVehicle* v = st.inVehicle != 0 ? Presence().Vehicle(from) : nullptr;
+        if (v != nullptr && v->netVehicleId == st.netVehicleId)
+            std::memcpy(st.vehicleModel, v->model, sizeof(st.vehicleModel));
+    });
     s->SetJoinLeaveFn([this](net::PeerId peer, bool joined)
     {
         JoinLeaveEvent ev;
@@ -206,9 +220,9 @@ void NetworkMatchManager::AttachSession()
     });
     s->SetStateCorrectionSink([this](const uint8_t* data, uint16_t size)
     {
-        if (m_correctionHandler == nullptr || size < PlayerNetworkState::SERIALIZED_SIZE) return;
+        if (m_correctionHandler == nullptr) return;
         PlayerNetworkState st;
-        st.Deserialize(reinterpret_cast<const char*>(data));
+        if (!st.Deserialize(reinterpret_cast<const char*>(data), size)) return;
         m_correctionHandler(st);
     });
     s->SetLedgerSink([s](const net::LedgerOutcome& o)

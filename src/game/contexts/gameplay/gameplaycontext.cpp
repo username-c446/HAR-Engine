@@ -1429,6 +1429,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
         // interpolation), so their motion does not depend on packet timing.
         {
             RemoteStateTrack::Timing timing;
+            timing.adaptive = true; // distant players arrive at a lower rate
             timing.clock = []() -> uint32_t
             {
                 NetworkMatchManager* m = NetworkMatchManager::GetInstance();

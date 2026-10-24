@@ -34,6 +34,8 @@
   <ItemGroup>
     <ClCompile Include="mp_standalone.cpp" />
     <ClCompile Include="..\game\netengine\Session.cpp" />
+    <ClCompile Include="..\game\network\PlayerPresence.cpp" />
+    <ClCompile Include="..\game\network\NetEntityManager.cpp" />
     <ClCompile Include="..\game\netengine\ServerCore.cpp" />
     <ClCompile Include="..\game\netengine\WorldState.cpp" />
     <ClCompile Include="..\game\netengine\Ledger.cpp" />

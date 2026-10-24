@@ -32,6 +32,11 @@ void GameServer::Attach(net::ServerCore& core, const Options& options)
     });
     core.SetStateValidator(&m_movement);
 
+    m_interest.Clear();
+    m_interest.SetConfig(options.interest);
+    m_interest.SetWorld(&core.GetWorldStateTable());
+    core.SetInterestPolicy(&m_interest);
+
     core.SetAdmissionFilter([this](net::PeerId peer)
     {
         for (auto& mod : m_mods)
@@ -54,6 +59,8 @@ void GameServer::Detach()
 {
     if (m_core == nullptr) return;
     m_core->SetStateValidator(nullptr);
+    m_core->SetInterestPolicy(nullptr);
+    m_interest.SetWorld(nullptr);
     m_core->SetAdmissionFilter(nullptr);
     m_core->SetJoinLeaveFn(nullptr);
     m_core = nullptr;

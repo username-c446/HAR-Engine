@@ -62,6 +62,9 @@
     <ClCompile Include="..\game\netengine\Packet.cpp" />
     <ClCompile Include="..\game\netengine\PacketRegistry.cpp" />
     <ClCompile Include="..\game\network\GameServer.cpp" />
+    <ClCompile Include="..\game\network\PlayerInterestPolicy.cpp" />
+    <ClCompile Include="..\game\network\PlayerPresence.cpp" />
+    <ClCompile Include="..\game\network\NetEntityManager.cpp" />
     <ClCompile Include="..\game\network\PlayerMovementValidator.cpp" />
     <ClCompile Include="..\game\network\ServerModManager.cpp" />
     <ClCompile Include="..\game\network\PlayerNetworkState.cpp" />

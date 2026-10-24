@@ -1,6 +1,7 @@
 #include "ServerEndpoint.h"
 
 #include <cstring>
+#include <vector>
 
 namespace net
 {
@@ -31,6 +32,7 @@ namespace net
         m_peersById.clear();
         m_liveness.clear();
         m_startMs = enet_time_get();
+        m_traffic = TrafficStats();
         m_running = true;
         return true;
     }
@@ -64,6 +66,7 @@ namespace net
                     m_peerIds[ev.peer] = id;
                     m_peersById[id] = ev.peer;
                     m_liveness[id].lastSeenMs = enet_time_get();
+                    ConfigureLink(ev.peer);
                     if (m_peerEvent) m_peerEvent({ id, true });
                     break;
                 }
@@ -84,6 +87,9 @@ namespace net
                              | static_cast<uint16_t>(ev.packet->data[3]) << 8;
                         if (static_cast<uint32_t>(kHeaderBytes) + size <= ev.packet->dataLength)
                         {
+                            TrafficCounter& in = m_traffic.received[pid];
+                            ++in.packets;
+                            in.bytes += kHeaderBytes + size;
                             auto it = m_peerIds.find(ev.peer);
                             PeerId from = (it != m_peerIds.end()) ? it->second : 0;
                             if (pid == PID_PING)
@@ -169,31 +175,59 @@ namespace net
         }
 
         enet_host_flush(m_host);
+        CollectWireTotals();
+    }
+
+    void ServerEndpoint::CollectWireTotals()
+    {
+        // ENet's host totals are 32-bit: move them into 64-bit counters.
+        m_traffic.wireSent.bytes += m_host->totalSentData;
+        m_traffic.wireSent.packets += m_host->totalSentPackets;
+        m_traffic.wireReceived.bytes += m_host->totalReceivedData;
+        m_traffic.wireReceived.packets += m_host->totalReceivedPackets;
+        m_host->totalSentData = 0;
+        m_host->totalSentPackets = 0;
+        m_host->totalReceivedData = 0;
+        m_host->totalReceivedPackets = 0;
     }
 
     bool ServerEndpoint::SendTo(PeerId peer, PacketId id, const uint8_t* payload, uint16_t payloadSize)
     {
-        if (!m_host || payloadSize > MAX_PACKET_PAYLOAD) return false;
-        auto it = m_peersById.find(peer);
-        if (it == m_peersById.end()) return false;
+        return SendToMany(&peer, 1, id, payload, payloadSize) == 1;
+    }
+
+    size_t ServerEndpoint::SendToMany(const PeerId* peers, size_t count, PacketId id,
+                                      const uint8_t* payload, uint16_t payloadSize)
+    {
+        if (!m_host || count == 0 || payloadSize > MAX_PACKET_PAYLOAD) return 0;
 
         // Delivery follows the packet id (Packet.h ChannelOf).
         Channel ch = ChannelOf(id);
         ENetPacket* pkt = enet_packet_create(nullptr, kHeaderBytes + payloadSize,
                                              ch == CH_RELIABLE ? ENET_PACKET_FLAG_RELIABLE : 0);
-        if (!pkt) return false;
+        if (!pkt) return 0;
         uint8_t* d = pkt->data;
         d[0] = static_cast<uint8_t>(id & 0xFF);
         d[1] = static_cast<uint8_t>((id >> 8) & 0xFF);
         d[2] = static_cast<uint8_t>(payloadSize & 0xFF);
         d[3] = static_cast<uint8_t>((payloadSize >> 8) & 0xFF);
         if (payloadSize > 0) std::memcpy(d + kHeaderBytes, payload, payloadSize);
-        if (enet_peer_send(it->second, ch, pkt) != 0)
+
+        // Every successful enet_peer_send takes a reference; ENet frees the
+        // packet once the last peer has sent it.
+        size_t queued = 0;
+        for (size_t i = 0; i < count; ++i)
         {
-            enet_packet_destroy(pkt);
-            return false;
+            auto it = m_peersById.find(peers[i]);
+            if (it == m_peersById.end()) continue;
+            if (enet_peer_send(it->second, ch, pkt) == 0) ++queued;
         }
-        return true;
+        if (pkt->referenceCount == 0) enet_packet_destroy(pkt);
+
+        TrafficCounter& out = m_traffic.sent[id];
+        out.packets += queued;
+        out.bytes += static_cast<uint64_t>(queued) * (kHeaderBytes + payloadSize);
+        return queued;
     }
 
     void ServerEndpoint::KickPeer(PeerId id)
@@ -214,6 +248,17 @@ namespace net
         enet_peer_disconnect_later(peer, 1);
     }
 
+    bool ServerEndpoint::GetPeerLink(PeerId id, PeerLink& out) const
+    {
+        auto it = m_peersById.find(id);
+        if (it == m_peersById.end()) return false;
+        const ENetPeer* p = it->second;
+        out.rttMs = p->roundTripTime;
+        out.throttle = p->packetThrottle;
+        out.packetLoss = static_cast<float>(p->packetLoss) / static_cast<float>(ENET_PEER_PACKET_LOSS_SCALE);
+        return true;
+    }
+
     uint32_t ServerEndpoint::GetPeerRttMs(PeerId id) const
     {
         auto it = m_peersById.find(id);
@@ -223,10 +268,10 @@ namespace net
     void ServerEndpoint::Broadcast(PacketId id, const uint8_t* payload, uint16_t payloadSize, PeerId omit)
     {
         if (!m_host) return;
+        std::vector<PeerId> to;
+        to.reserve(m_peersById.size());
         for (auto& kv : m_peersById)
-        {
-            if (kv.first == omit) continue;
-            SendTo(kv.first, id, payload, payloadSize);
-        }
+            if (kv.first != omit) to.push_back(kv.first);
+        if (!to.empty()) SendToMany(to.data(), to.size(), id, payload, payloadSize);
     }
 }

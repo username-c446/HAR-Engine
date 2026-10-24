@@ -1,60 +1,69 @@
 #include "PlayerNetworkState.h"
-#include "NetworkPacket.h"
+#include "../netengine/Quantize.h"
 
-void PlayerNetworkState::Serialize(char* buffer) const
+#include <cstring>
+
+int PlayerNetworkState::Serialize(char* out) const
 {
-    char* p = buffer;
-    net::WriteFloat(p, x);
-    net::WriteFloat(p, y);
-    net::WriteFloat(p, z);
-    net::WriteFloat(p, rotY);
-    for (int i = 0; i < static_cast<int>(sizeof(vehicleModel)); ++i) *p++ = vehicleModel[i];
-    net::WriteU32(p, static_cast<uint32_t>(netVehicleId));
-    net::WriteFloat(p, vehicleSpeed);
-    *p++ = inVehicle;
-    *p++ = flags;
-    // ---- loco ----
-    net::WriteU16(p, motionAngle);
-    net::WriteU16(p, facingAngle);
-    *p++ = speedFactor;
-    *p++ = characterState;
-    // ---- action ----
-    *p++ = actionEvent;
-    // ---- vehicle mirror ----
-    net::WriteFloat(p, vehYaw);
-    *p++ = vehSteer;
-    net::WriteU16(p, vehSpeedKmh);
-    *p++ = vehState;
-    *p++ = vehFlags;
-    *p++ = vehDamage;
-    *p++ = teleportSeq;
+    uint8_t* buf = reinterpret_cast<uint8_t*>(out);
+    net::Writer w(buf, MAX_SERIALIZED_SIZE);
+    const bool vehicle = inVehicle != 0;
+    w.WriteU8(vehicle ? SEC_VEHICLE : SEC_LOCO);
+    net::WriteCentimetres24(w, x);
+    net::WriteCentimetres24(w, y);
+    net::WriteCentimetres24(w, z);
+    w.WriteU16(net::EncodeAngle16(rotY));
+    w.WriteU8(flags);
+    w.WriteU8(characterState);
+    w.WriteU8(actionEvent);
+    w.WriteU8(teleportSeq);
+    if (vehicle)
+    {
+        w.WriteU32(static_cast<uint32_t>(netVehicleId));
+        w.WriteU16(net::EncodeAngle16(vehYaw));
+        w.WriteU8(vehSteer);
+        w.WriteU16(vehSpeedKmh);
+        w.WriteU8(vehState);
+        w.WriteU8(vehFlags);
+        w.WriteU8(vehDamage);
+    }
+    else
+    {
+        w.WriteU16(motionAngle);
+        w.WriteU16(facingAngle);
+        w.WriteU8(speedFactor);
+    }
+    return w.Ok() ? static_cast<int>(w.Position()) : 0;
 }
 
-void PlayerNetworkState::Deserialize(const char* buffer)
+bool PlayerNetworkState::Deserialize(const char* data, int size)
 {
-    const char* p = buffer;
-    x = net::ReadFloat(p);
-    y = net::ReadFloat(p);
-    z = net::ReadFloat(p);
-    rotY = net::ReadFloat(p);
-    for (int i = 0; i < static_cast<int>(sizeof(vehicleModel)); ++i) vehicleModel[i] = *p++;
-    netVehicleId = static_cast<int32_t>(net::ReadU32(p));
-    vehicleSpeed = net::ReadFloat(p);
-    inVehicle = static_cast<uint8_t>(*p++);
-    flags = static_cast<uint8_t>(*p++);
-    // ---- loco ----
-    motionAngle = net::ReadU16(p);
-    facingAngle = net::ReadU16(p);
-    speedFactor = static_cast<uint8_t>(*p++);
-    characterState = static_cast<uint8_t>(*p++);
-    // ---- action ----
-    actionEvent = static_cast<uint8_t>(*p++);
-    // ---- vehicle mirror ----
-    vehYaw = net::ReadFloat(p);
-    vehSteer = static_cast<uint8_t>(*p++);
-    vehSpeedKmh = net::ReadU16(p);
-    vehState = static_cast<uint8_t>(*p++);
-    vehFlags = static_cast<uint8_t>(*p++);
-    vehDamage = static_cast<uint8_t>(*p++);
-    teleportSeq = static_cast<uint8_t>(*p++);
+    std::memset(this, 0, sizeof(*this));
+    if (data == nullptr || size <= 0 || size > 0xFFFF) return false;
+    net::Reader r(reinterpret_cast<const uint8_t*>(data), static_cast<uint16_t>(size));
+    uint8_t sections = 0;
+    uint16_t rot = 0;
+    if (!r.ReadU8(sections)) return false;
+    if ((sections & ~(SEC_LOCO | SEC_VEHICLE)) != 0) return false;
+    if (!net::ReadCentimetres24(r, x) || !net::ReadCentimetres24(r, y) || !net::ReadCentimetres24(r, z) || !r.ReadU16(rot)) return false;
+    rotY = net::DecodeAngle16(rot);
+    if (!r.ReadU8(flags) || !r.ReadU8(characterState) || !r.ReadU8(actionEvent) || !r.ReadU8(teleportSeq))
+        return false;
+    if (sections & SEC_VEHICLE)
+    {
+        uint32_t id = 0;
+        uint16_t yaw = 0;
+        if (!r.ReadU32(id) || !r.ReadU16(yaw) || !r.ReadU8(vehSteer) || !r.ReadU16(vehSpeedKmh)
+            || !r.ReadU8(vehState) || !r.ReadU8(vehFlags) || !r.ReadU8(vehDamage))
+            return false;
+        inVehicle = 1;
+        netVehicleId = static_cast<int32_t>(id);
+        vehYaw = net::DecodeAngle16(yaw);
+        vehicleSpeed = static_cast<float>(vehSpeedKmh);
+    }
+    if (sections & SEC_LOCO)
+    {
+        if (!r.ReadU16(motionAngle) || !r.ReadU16(facingAngle) || !r.ReadU8(speedFactor)) return false;
+    }
+    return r.Remaining() == 0;
 }

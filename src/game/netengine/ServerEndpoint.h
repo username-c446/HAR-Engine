@@ -28,6 +28,23 @@ namespace net
 
     using PeerEventFn = std::function<void(const PeerEvent&)>;
 
+    // Traffic accounting of an endpoint. Per packet id: framed packets (our
+    // 4-byte header + payload) counted once per recipient / sender. Wire:
+    // the UDP payload bytes ENet put on / took off the network (its own
+    // headers, acks and resends included; IP/UDP headers are not).
+    struct TrafficCounter
+    {
+        uint64_t packets = 0;
+        uint64_t bytes = 0;
+    };
+    struct TrafficStats
+    {
+        std::map<PacketId, TrafficCounter> sent;
+        std::map<PacketId, TrafficCounter> received;
+        TrafficCounter wireSent;
+        TrafficCounter wireReceived;
+    };
+
     // net::ServerEndpoint
     // -------------------
     // Pure ENet host on a server that:
@@ -100,6 +117,17 @@ namespace net
         // Transport-measured round-trip time to a peer (ENet's estimate).
         uint32_t GetPeerRttMs(PeerId id) const;
 
+        // Link quality of a peer as ENet sees it: RTT, the unreliable-packet
+        // throttle (32 = nothing dropped, lower = that share of unreliable
+        // packets is dropped before sending) and the measured loss.
+        struct PeerLink
+        {
+            uint32_t rttMs = 0;
+            uint32_t throttle = 0;      // 0..32
+            float    packetLoss = 0.0f; // 0..1
+        };
+        bool GetPeerLink(PeerId id, PeerLink& out) const;
+
         // How many milliseconds the server keeps a peer with no inbound activity
         // before considering it dead. Defaults to kDefaultClientTimeoutMs.
         static constexpr unsigned kDefaultClientTimeoutMs = 30000;
@@ -108,8 +136,16 @@ namespace net
         // Returns false on failure (unknown peer, oversize, host gone).
         bool SendTo(PeerId peer, PacketId id, const uint8_t* payload, uint16_t payloadSize);
 
+        // Sends the same framed packet to several peers: one ENet packet,
+        // shared by reference (no copy per recipient). Unknown peers are
+        // skipped; returns how many peers it was queued to.
+        size_t SendToMany(const PeerId* peers, size_t count, PacketId id, const uint8_t* payload, uint16_t payloadSize);
         // Sends to every peer except `omit` (0 = none omitted).
         void Broadcast(PacketId id, const uint8_t* payload, uint16_t payloadSize, PeerId omit);
+
+        // Traffic since Start() (or the last ResetTraffic()).
+        const TrafficStats& GetTraffic() const { return m_traffic; }
+        void ResetTraffic() { m_traffic = TrafficStats(); }
 
     private:
 
@@ -132,6 +168,9 @@ namespace net
         unsigned int                   m_clientTimeoutMs = kDefaultClientTimeoutMs;
 
         enet_uint32                    m_startMs = 0;
+        TrafficStats                   m_traffic;
+
+        void CollectWireTotals();
 
         // Staging buffer for framed inbound (id+size+payload) so sinks can hold
         // a stable pointer across the dispatch call.

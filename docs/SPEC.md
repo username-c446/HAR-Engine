@@ -90,7 +90,7 @@ In-game integration: `src/game/contexts/gameplay/gameplaycontext.cpp`
 - Liveness: the client pings every 500 ms (`SetPingIntervalMs`); the server drops a
   peer silent for 30 s (`SetClientTimeoutMs`).
 
-### Packet ids (`Packet.h`, `PROTOCOL_VERSION = 2`)
+### Packet ids (`Packet.h`, `PROTOCOL_VERSION = 3`)
 
 | Id | Name | Dir | Purpose |
 |----|------|-----|---------|
@@ -148,7 +148,23 @@ struct PlayerNetworkState {
 };
 ```
 
-- `SERIALIZED_SIZE = 42 (base) + 7 (locomotion) + 1 (actionEvent) + 8 (vehicle) + 2 = 60` bytes.
+- Wire format (protocol 3, `Serialize` returns the size, `Deserialize(data,
+  size)` refuses a truncated / oversized record or an unknown section bit). Only
+  what the player is doing is sent:
+  ```
+  u8  sections            SEC_LOCO 0x01 (on foot) | SEC_VEHICLE 0x02 (in a machine)
+  i24 x, y, z             centimetres (+-83.88 km, clamped; NaN -> 0)
+  u16 rotY                angle 2pi/65536, decodes into (-pi, pi]
+  u8  flags | u8 characterState | u8 actionEvent | u8 teleportSeq
+  [SEC_LOCO]    u16 motionAngle | u16 facingAngle | u8 speedFactor
+  [SEC_VEHICLE] i32 netVehicleId | u16 vehYaw | u8 vehSteer | u16 vehSpeedKmh
+                | u8 vehState | u8 vehFlags | u8 vehDamage
+  ```
+  On foot 21 bytes, in a machine 28 (`MAX_SERIALIZED_SIZE`); protocol 2 sent a
+  fixed 60. Fields of an absent block decode as 0; `vehicleSpeed` is restored
+  from `vehSpeedKmh` (the sender filled both from `GetSpeedKmh`). The shared
+  fixed-point helpers are `netengine/Quantize.h` (`WriteCentimetres24`,
+  `EncodeAngle16`, ...).
 - In a vehicle the locomotion/action fields are zeroed; on foot the vehicle fields are.
 - `actionEvent` comes from `net::LocalActionLatch` (`LocalActionLatch.h`): the game's
   action sites for the local avatar call `Report(id)`; the latch holds the latest
@@ -163,9 +179,10 @@ struct PlayerNetworkState {
   samples that no vehicle (110 m/s) or runner (20 m/s) can make, plus 25 m. A
   server correction is not counted (the server already knows that pose). The server
   lets a jump through only together with a new value, rate-limited (§18.3).
-- Serialization is little-endian and padding-free (`net::Write*`).
-- `vehicleModel` + `netVehicleId` go to `RemoteVehicleWorldView`, so the receiver
-  spawns a ghost of the same model.
+- `vehicleModel` is not on the wire: it is the `WOC_VEHICLE` presence record
+  (§18.11), filled back in on receipt; with `netVehicleId` it goes to
+  `RemoteVehicleWorldView`, so the receiver spawns a ghost of the same model
+  (until the record arrives the state counts as on foot for the vehicle view).
 
 ---
 
@@ -321,17 +338,19 @@ It is the same server a hosting game embeds.
 ```
 har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...
            [--pvp] [--cheats] [--game-version <n>] [--seed <n>]
-           [--log <file>] [--verbose]
+           [--no-interest] [--stats <seconds>] [--log <file>] [--verbose]
 ```
+- `--stats` / `--no-interest`: traffic report and interest management off (§18.11).
 - Default port 3737; no password = open session; `--max` = player slots.
 - `--mod` may repeat (one `ServerModManager` per script).
 - `--verbose` logs every world-state change; refusals / flood kicks / movement
   corrections are logged from `ServerCore::GetStats()`.
 - Ctrl+C / SIGTERM stop it cleanly. The build copies `lua.dll` next to the exe.
 
-`src/tests/mp_standalone` is now only a headless TEST client (`join`, `genui`):
-it joins a hosting game or `har_server`, sends a fake moving state and prints the
-remote players and the late-join snapshot it receives.
+`src/tests/mp_standalone` is now only a headless TEST client (`join`, `bots`,
+`genui`): `join` joins a hosting game or `har_server`, sends a fake moving state
+and prints the remote players and the late-join snapshot it receives; `bots` is
+the load test (§18.11).
 
 ### Main game CLI (`CommandLineOptions`)
 - `HOSTPORT=<port>` — auto-start host.
@@ -810,7 +829,7 @@ announcing a new entity). Traffic is announced with `WSF_RELEASE_ON_OWNER_LEAVE`
   back.
 - Damage is replicated: `NetEntityMotion::damage` and `PlayerNetworkState::
   vehDamage`; ghosts show it with `ApplyNetworkDamage` (only ever more damage).
-- `NetEntityMotion` (22 bytes) gained `damage` and `state`; flags gained
+- `NetEntityMotion` (17 bytes since protocol 3, §18.11) gained `damage` and `state`; flags gained
   `MF_KNOCKED`.
 - Interest management: a ghost of a dynamic entity exists only within the
   relevance radius (200 m in game, removed beyond 1.25×; the record is kept); a
@@ -834,7 +853,7 @@ never knocked locally — with or without PvP (its owner's stream shows the trut
 ### 18.9 Player context and appearance (`PlayerPresence`)
 Slow-changing per-player facts are world-state records of the player's own
 object (`MakePlayerObjectId(peer)` = the peer's dynamic id, counter 0;
-`WSP_OWNER` + `WSF_ERASE_ON_OWNER_LEAVE`), not part of the 10 Hz stream — reliable,
+`WSP_OWNER` + `WSF_ERASE_ON_OWNER_LEAVE`), not part of the 20 Hz stream — reliable,
 in the late-join snapshot, published only when they change:
 - `WOC_PLAYER_CONTEXT` (6): `u8 level | u64 zone` (interior uid, 0 = outside).
   `RemotePlayerWorldView::SetPresence` / `RemoteVehicleWorldView::SetVisibility`
@@ -849,6 +868,78 @@ in the late-join snapshot, published only when they change:
   player's own clips are available now) and restyled in place on a change
   (sink `restyle` → `CharacterManager::SwapData`). Until the record arrives the
   puppet uses `homer` and is restyled when it does.
+- `WOC_VEHICLE` (8): `i32 netVehicleId | char model[16]` — the machine the player
+  drives (§18.11).
+
+### 18.11 Traffic: measurement, interest management, compact streams (protocol 3)
+Measured with the load test below: 16 players in 4 groups 1 km apart, 2 of them
+in an interior, 5 streamed traffic cars each, 20 Hz player stream:
+
+| | server out (ENet wire) | player state | per player received |
+|---|---|---|---|
+| everything to everyone (`--no-interest`) | 4.4 Mbit/s | 4740 pkt/s | 297 states/s |
+| interest management | 0.9 Mbit/s | 1450 pkt/s | 6 / 95 / 110 (interior / group of 3 / of 4) |
+
+The relayed player sample is 31 bytes framed (4 frame + 6 relay header + 21).
+- **Accounting.** `ServerEndpoint::GetTraffic()` (`net::TrafficStats`): framed
+  packets/bytes per packet id, sent (once per recipient) and received, plus the
+  ENet wire totals (UDP payload incl. ENet headers/acks/resends, collected into
+  64-bit counters every `Update`). `GetPeerLink(peer)`: RTT, the unreliable
+  throttle (0..32) and loss. `ServerCore::GetTraffic()`, `GetPeerLink()`,
+  `Stats::samplesFiltered` / `entityRecordsFiltered`.
+- **Interest management** (`net::IInterestPolicy`, `ServerCore::SetInterestPolicy`;
+  without a policy everything goes to everyone). The core cannot read game
+  payloads, so the game decides and the core enforces: `OnPlayerState` (every
+  accepted state, after the validator), `PlayerStateIntervalMs(receiver, sender)`
+  (0 = every sample, `kNotRelevant` = none, otherwise the minimum spacing — the
+  core keeps per receiver the time of the last forwarded sample of each sender,
+  with a tenth of the interval as slack), `EntityRelevant(receiver, owner, rec)`
+  (each receiver gets its own subset of an owner's batch), `OnPeerLeft`.
+  The game's `PlayerInterestPolicy` (installed by `GameServer`, config
+  `GameServer::Options::interest`): another context (`WOC_PLAYER_CONTEXT`) →
+  nothing; within `nearRadius` 150 m every sample; beyond, one per 200 ms (5 Hz),
+  with 25 m hysteresis; an entity record only in the owner's context within
+  `entityRadius` 300 m of the receiver (the client hides ghosts beyond 250 m).
+  Unknown facts (no context record / no accepted state yet) are relevant.
+- **Receivers.** `RemoteStateTrack::Timing::adaptive` (on in game): the delay is
+  twice the measured sample spacing, never below `interpolationDelayMs`, slewing
+  at 0.25 ms per ms (a far 5 Hz player is shown 400 ms behind, smoothly; a tier
+  change speeds playback up/down slightly instead of jumping). A sample more than
+  `kGapResetMs` (1 s) after the newest one starts a new history (no slide across
+  the time the player was not relevant). `NetEntityManager`: with a clock and a
+  relevance radius, a moving entity is shown (and counted by `CountRemoteNear`)
+  only while its newest sample is younger than `kStaleMs` (1 s) — the server
+  stops forwarding it once it is far; a released entity takes its final pose
+  from the release record.
+- **Compact streams.** `PlayerNetworkState` (§3: 21/28 bytes instead of 60) and
+  `NetEntityMotion` (17 bytes instead of 22: `i24 x,y,z | u16 yaw | u16 speedKmh
+  | i8 steer | u8 flags | u8 damage | u8 state`). The vehicle model left the
+  stream: presence record `WOC_VEHICLE` (8) `i32 netVehicleId | char model[16]`,
+  published by the bridge's local-state observer when it changes and put back
+  into each received state by the bridge's decorator (`NetworkMatchManager`),
+  when the ids match. `PROTOCOL_VERSION = 3`.
+- **One packet for all recipients.** `ServerEndpoint::SendToMany` creates one
+  ENet packet and queues it to every recipient (ENet reference-counts it);
+  `SendTo`, `Broadcast` and every `ServerCore` fan-out use it.
+- **ENet throttle.** ENet drops a share of unreliable packets whenever an RTT
+  sample exceeds the previous one plus twice the variance. On a quiet 1-2 ms link
+  that is jitter: the load test lost up to 7/8 of the stream to 11-13 peers with
+  0 % loss on the wire (the same applies to real games). `net::ConfigureLink`
+  (both ends, on connect) configures the throttle to never decelerate; the
+  stream rates are bounded by the engine (cadences, interest, per-peer budgets).
+- **Load test / diagnostics.** `har_server --stats <s>` prints every N seconds the
+  totals (framed and wire, both directions), the samples / records interest kept
+  off the wire, the worst link (RTT, throttled peers, loss) and every sent packet
+  id (pkt/s, kbit/s, bytes/pkt); `--no-interest` disables the policy for
+  comparison. `mp_standalone bots <count> <ip> [port] [--seconds] [--groups]
+  [--spread] [--interiors] [--entities]`: that many full engine clients in one
+  process (own Session / ENet peer each), circling at 5 m/s, with context
+  records and owned streamed entities; prints the states each bot received per
+  second.
+- **Background launch.** A game started without window focus spent minutes in
+  `InputManager::Init`: `radControllerDirectInput` retried `Acquire()` up to
+  2.4 s per input device (`DIERR_OTHERAPPHASPRIO`). It now tries once; every poll
+  re-acquires the device anyway. Two games + server: both in gameplay in 6-14 s.
 
 ### 18.10 Still open
 - Pushed parked cars (entity bound to the static object — `NEK_PARKED_CAR` and

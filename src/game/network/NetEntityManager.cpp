@@ -1,4 +1,5 @@
 #include "NetEntityManager.h"
+#include "../netengine/Quantize.h"
 
 #include <cmath>
 #include <cstring>
@@ -29,7 +30,10 @@ namespace net
     {
         out.entity = entity;
         Writer w(out.bytes, ENTITY_STATE_MAX);
-        w.WriteFloat(x); w.WriteFloat(y); w.WriteFloat(z); w.WriteFloat(yaw);
+        WriteCentimetres24(w, x);
+        WriteCentimetres24(w, y);
+        WriteCentimetres24(w, z);
+        w.WriteU16(EncodeAngle16(yaw));
         w.WriteU16(speedKmh);
         w.WriteU8(static_cast<uint8_t>(steer));
         w.WriteU8(flags);
@@ -42,11 +46,13 @@ namespace net
     {
         Reader r(in.bytes, in.len);
         uint8_t s = 0;
-        if (!(r.ReadFloat(x) && r.ReadFloat(y) && r.ReadFloat(z) && r.ReadFloat(yaw)
+        uint16_t a = 0;
+        if (!(ReadCentimetres24(r, x) && ReadCentimetres24(r, y) && ReadCentimetres24(r, z) && r.ReadU16(a)
               && r.ReadU16(speedKmh) && r.ReadU8(s) && r.ReadU8(flags) && r.ReadU8(damage) && r.ReadU8(state)))
             return false;
+        yaw = DecodeAngle16(a);
         steer = static_cast<int8_t>(s);
-        return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(yaw);
+        return true;
     }
 
     uint16_t NetEntityHit::Encode(uint8_t* out, uint16_t cap) const
@@ -267,6 +273,15 @@ void NetEntityManager::OnAuthoritative(const net::WorldStateEntry& e, net::World
         if (e.owner != 0) rem.claimSent = false;
         net::NetEntitySpawn s;
         if (s.Decode(e.value)) rem.spawn = s;
+        if (e.owner == 0)
+        {
+            // Released: the record carries its final pose, nothing streams it.
+            rem.samples.Clear();
+            rem.visual.x = rem.spawn.x;
+            rem.visual.y = rem.spawn.y;
+            rem.visual.z = rem.spawn.z;
+            rem.visual.yaw = rem.spawn.yaw;
+        }
         return;
     }
     SpawnRemote(e);
@@ -337,6 +352,16 @@ void NetEntityManager::OnEntityState(net::PeerId owner, const net::EntityStateRe
 
 // ------------------------------------------------------------ per frame
 
+bool NetEntityManager::PoseKnown(const Remote& r) const
+{
+    // Bound objects stand where the world put them, a released entity at its
+    // final pose; a moving one is only known while its samples are fresh.
+    if (r.spawn.kind == net::NEK_PARKED_CAR || r.owner == 0) return true;
+    if (!m_clock || m_relevanceRadius <= 0.0f) return true;
+    if (r.samples.Empty()) return false;
+    return net::TimeDiff(m_clock() - m_interpDelayMs, r.samples.Newest().time) <= static_cast<int32_t>(kStaleMs);
+}
+
 void NetEntityManager::UpdateRelevance()
 {
     float px = 0.0f, pz = 0.0f;
@@ -353,15 +378,16 @@ void NetEntityManager::UpdateRelevance()
             float dx = r.visual.x - px, dz = r.visual.z - pz;
             d2 = dx * dx + dz * dz;
         }
+        const bool known = PoseKnown(r);
         if (r.handle == nullptr)
         {
-            if ((!havePlayer || bound || d2 <= showR2) && m_sink.spawn)
+            if (known && (!havePlayer || bound || d2 <= showR2) && m_sink.spawn)
             {
                 r.handle = m_sink.spawn(kv.first, r.spawn);
                 if (r.handle && m_sink.move) m_sink.move(r.handle, r.visual);
             }
         }
-        else if (havePlayer && !bound && d2 > hideR2)
+        else if (!known || (havePlayer && !bound && d2 > hideR2))
         {
             if (m_sink.despawn) m_sink.despawn(r.handle, r.spawn.kind);
             r.handle = nullptr;
@@ -451,6 +477,7 @@ int NetEntityManager::CountRemoteNear(float x, float z, float radius, uint8_t ki
     for (const auto& kv : m_remote)
     {
         if (kind != net::NEK_NONE && kv.second.spawn.kind != kind) continue;
+        if (!PoseKnown(kv.second)) continue;
         float dx = kv.second.visual.x - x, dz = kv.second.visual.z - z;
         if (dx * dx + dz * dz <= r2) ++n;
     }

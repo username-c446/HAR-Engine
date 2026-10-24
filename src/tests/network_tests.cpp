@@ -136,95 +136,130 @@ namespace NetworkTests
     public:
         TEST_METHOD(SerializeDeserialize)
         {
+            // In a machine: the vehicle block travels, the on-foot block does
+            // not, the model name rides presence (not the stream).
             PlayerNetworkState state;
+            std::memset(&state, 0, sizeof(state));
             state.x = 1.0f;
-            state.y = 2.0f;
-            state.z = 3.0f;
+            state.y = -2.0f;
+            state.z = 1234.56f;
             state.rotY = 4.0f;
             strcpy(state.vehicleModel, "homer");
             state.netVehicleId = 5;
-            state.vehicleSpeed = 66.0f;
+            state.vehicleSpeed = 88.0f;
             state.inVehicle = 1;
             state.flags = PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR;
             state.motionAngle = 1234;
-            state.facingAngle = 4321;
-            state.speedFactor = 200;
-            state.characterState = 1; // CharacterAi::LOCO
+            state.characterState = 7;
             state.actionEvent = PlayerNetworkState::ACTION_JUMP;
             state.vehYaw = 2.5f;
             state.vehSteer = 64;
             state.vehSpeedKmh = 88;
             state.vehState = 1;
             state.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE | PlayerNetworkState::VEH_FLAG_REVERSE;
+            state.vehDamage = 200;
+            state.teleportSeq = 3;
 
-            char buffer[PlayerNetworkState::SERIALIZED_SIZE];
-            state.Serialize(buffer);
+            char buffer[PlayerNetworkState::MAX_SERIALIZED_SIZE];
+            int n = state.Serialize(buffer);
+            Assert::AreEqual(28, n, L"In a machine the state is 28 bytes.");
 
             PlayerNetworkState restored;
-            restored.Deserialize(buffer);
-
-            Assert::AreEqual(state.x, restored.x);
-            Assert::AreEqual(state.y, restored.y);
-            Assert::AreEqual(state.z, restored.z);
-            Assert::AreEqual(state.rotY, restored.rotY);
-            Assert::AreEqual(0, strcmp(state.vehicleModel, restored.vehicleModel));
+            Assert::IsTrue(restored.Deserialize(buffer, n));
+            Assert::AreEqual(state.x, restored.x, 0.005f);
+            Assert::AreEqual(state.y, restored.y, 0.005f);
+            Assert::AreEqual(state.z, restored.z, 0.005f);
+            Assert::AreEqual(4.0f - 6.28318531f, restored.rotY, 0.0002f, L"Angles decode into (-pi, pi].");
+            Assert::AreEqual('\0', restored.vehicleModel[0], L"The model is not streamed.");
             Assert::AreEqual(state.netVehicleId, restored.netVehicleId);
-            Assert::AreEqual(state.vehicleSpeed, restored.vehicleSpeed);
-            Assert::AreEqual(state.inVehicle, restored.inVehicle);
+            Assert::AreEqual(88.0f, restored.vehicleSpeed, L"vehicleSpeed comes from vehSpeedKmh.");
+            Assert::AreEqual((int)state.inVehicle, (int)restored.inVehicle);
             Assert::AreEqual(static_cast<int>(state.flags), static_cast<int>(restored.flags));
-            Assert::AreEqual(static_cast<int>(state.motionAngle), static_cast<int>(restored.motionAngle));
-            Assert::AreEqual(static_cast<int>(state.facingAngle), static_cast<int>(restored.facingAngle));
-            Assert::AreEqual(static_cast<int>(state.speedFactor), static_cast<int>(restored.speedFactor));
+            Assert::AreEqual(0, static_cast<int>(restored.motionAngle), L"No on-foot block in a machine.");
             Assert::AreEqual(static_cast<int>(state.characterState), static_cast<int>(restored.characterState));
             Assert::AreEqual(static_cast<int>(state.actionEvent), static_cast<int>(restored.actionEvent));
-            Assert::AreEqual(state.vehYaw, restored.vehYaw);
+            Assert::AreEqual(state.vehYaw, restored.vehYaw, 0.0002f);
             Assert::AreEqual(static_cast<int>(state.vehSteer), static_cast<int>(restored.vehSteer));
             Assert::AreEqual(static_cast<int>(state.vehSpeedKmh), static_cast<int>(restored.vehSpeedKmh));
             Assert::AreEqual(static_cast<int>(state.vehState), static_cast<int>(restored.vehState));
             Assert::AreEqual(static_cast<int>(state.vehFlags), static_cast<int>(restored.vehFlags));
+            Assert::AreEqual(200, static_cast<int>(restored.vehDamage));
+            Assert::AreEqual(3, static_cast<int>(restored.teleportSeq));
         }
 
-        TEST_METHOD(SerializedSizeIsStable)
+        TEST_METHOD(SerializedSizesFollowWhatThePlayerDoes)
         {
-            // Serialization must not depend on struct padding/alignment.
-            // 4 floats + vehicleModel[16] + int32 + float + 2*uint8         (base 42)
-            // + 2*uint16 + 2*uint8 + uint8                                  (loco +7 = 49)
-            // + uint8                                                       (action +1 = 50)
-            // + float + uint8 + uint16 + uint8 + uint8                      (vehicle mirror +8 = 58)
-            // + uint8 vehDamage + uint8 teleportSeq                         (+2 = 60)
-            Assert::AreEqual<int>(4 * 4 + 16 + 4 + 4 + 2 + 4 + 2 + 1 + 4 + 1 + 2 + 1 + 1 + 1 + 1,
-                                  PlayerNetworkState::SERIALIZED_SIZE);
+            Assert::AreEqual(16, PlayerNetworkState::BASE_SIZE);
+            Assert::AreEqual(21, PlayerNetworkState::BASE_SIZE + PlayerNetworkState::LOCO_SIZE);
+            Assert::AreEqual(28, PlayerNetworkState::MAX_SERIALIZED_SIZE);
+            PlayerNetworkState st;
+            std::memset(&st, 0, sizeof(st));
+            char buf[PlayerNetworkState::MAX_SERIALIZED_SIZE];
+            Assert::AreEqual(21, st.Serialize(buf), L"On foot.");
+            st.inVehicle = 1;
+            Assert::AreEqual(28, st.Serialize(buf), L"In a machine.");
+        }
+
+        TEST_METHOD(MalformedStatesAreRefused)
+        {
+            PlayerNetworkState st;
+            std::memset(&st, 0, sizeof(st));
+            char buf[PlayerNetworkState::MAX_SERIALIZED_SIZE + 1];
+            int n = st.Serialize(buf);
+            PlayerNetworkState out;
+            Assert::IsTrue(out.Deserialize(buf, n));
+            Assert::IsFalse(out.Deserialize(buf, n - 1), L"Truncated.");
+            buf[n] = 0;
+            Assert::IsFalse(out.Deserialize(buf, n + 1), L"Trailing bytes.");
+            buf[0] = static_cast<char>(0x80);
+            Assert::IsFalse(out.Deserialize(buf, n), L"Unknown section bit.");
+            Assert::IsFalse(out.Deserialize(nullptr, 0));
+        }
+
+        TEST_METHOD(PositionsQuantizeToCentimetresAndClamp)
+        {
+            PlayerNetworkState st;
+            std::memset(&st, 0, sizeof(st));
+            st.x = -321.234f;
+            st.y = 0.004f;
+            st.z = 1.0e9f; // beyond +-83 km
+            st.rotY = -0.25f;
+            char buf[PlayerNetworkState::MAX_SERIALIZED_SIZE];
+            int n = st.Serialize(buf);
+            PlayerNetworkState out;
+            Assert::IsTrue(out.Deserialize(buf, n));
+            Assert::AreEqual(-321.23f, out.x, 0.001f);
+            Assert::AreEqual(0.0f, out.y, 0.001f);
+            Assert::AreEqual(83886.07f, out.z, 0.01f, L"Clamped to the i24 range.");
+            Assert::AreEqual(-0.25f, out.rotY, 0.0002f);
+            st.x = std::numeric_limits<float>::quiet_NaN();
+            n = st.Serialize(buf);
+            Assert::IsTrue(out.Deserialize(buf, n));
+            Assert::AreEqual(0.0f, out.x, L"NaN never reaches a receiver.");
         }
 
         TEST_METHOD(LocoFieldsRoundTripSerialize)
         {
-            // Continuous-locomotion + vehicle-mirror fields survive a wire
-            // round-trip, and the new stable SERIALIZED_SIZE is enforced.
+            // On foot: the locomotion block travels, the vehicle block does not.
             PlayerNetworkState state;
+            std::memset(&state, 0, sizeof(state));
             state.x = 1.0f; state.y = 2.0f; state.z = 3.0f; state.rotY = 0.5f;
-            strcpy(state.vehicleModel, "homer");
-            state.netVehicleId = 9;
-            state.vehicleSpeed = 50.0f;
-            state.inVehicle = 1;
+            state.inVehicle = 0;
+            state.netVehicleId = 9; // ignored on foot
             state.flags = PlayerNetworkState::FLAG_LOCO_TURBO;
             state.motionAngle = 3141;   // ~PI radians
             state.facingAngle = 1000;   // 1 radian
             state.speedFactor = 128;    // half speed
             state.characterState = 1;   // LOCO
-            state.actionEvent = PlayerNetworkState::ACTION_JUMP;
-            state.vehYaw = 1.75f;
-            state.vehSteer = static_cast<uint8_t>(static_cast<int8_t>(30 * (255.0f / 90.0f))); // ~+30 deg
-            state.vehSpeedKmh = 95;
-            state.vehState = 0;         // VS_NORMAL
-            state.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE;
-            state.vehDamage = 77;
+            state.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_SLAM, 5);
+            state.vehSpeedKmh = 95;     // ignored on foot
             state.teleportSeq = 5;
 
-            Assert::AreEqual<int>(60, PlayerNetworkState::SERIALIZED_SIZE, L"SERIALIZED_SIZE drifted.");
-            char buffer[PlayerNetworkState::SERIALIZED_SIZE];
-            state.Serialize(buffer);
+            char buffer[PlayerNetworkState::MAX_SERIALIZED_SIZE];
+            int n = state.Serialize(buffer);
+            Assert::AreEqual(21, n);
             PlayerNetworkState restored;
-            restored.Deserialize(buffer);
+            Assert::IsTrue(restored.Deserialize(buffer, n));
 
             Assert::AreEqual(static_cast<int>(state.motionAngle), static_cast<int>(restored.motionAngle));
             Assert::AreEqual(static_cast<int>(state.facingAngle), static_cast<int>(restored.facingAngle));
@@ -232,19 +267,13 @@ namespace NetworkTests
             Assert::AreEqual(static_cast<int>(state.characterState), static_cast<int>(restored.characterState));
             Assert::AreEqual(static_cast<int>(state.flags), static_cast<int>(restored.flags));
             Assert::AreEqual(static_cast<int>(state.actionEvent), static_cast<int>(restored.actionEvent));
-            Assert::AreEqual(state.vehYaw, restored.vehYaw);
-            Assert::AreEqual(static_cast<int>(state.vehSteer), static_cast<int>(restored.vehSteer));
-            Assert::AreEqual(static_cast<int>(state.vehSpeedKmh), static_cast<int>(restored.vehSpeedKmh));
-            Assert::AreEqual(static_cast<int>(state.vehState), static_cast<int>(restored.vehState));
-            Assert::AreEqual(static_cast<int>(state.vehFlags), static_cast<int>(restored.vehFlags));
-            Assert::AreEqual(77, static_cast<int>(restored.vehDamage));
+            Assert::AreEqual(0.5f, restored.rotY, 0.0002f);
+            Assert::AreEqual(0, (int)restored.inVehicle);
+            Assert::AreEqual(0, restored.netVehicleId, L"No vehicle block on foot.");
+            Assert::AreEqual(0, (int)restored.vehSpeedKmh);
             Assert::AreEqual(5, static_cast<int>(restored.teleportSeq));
         }
-    };
 
-    TEST_CLASS(ClientServerLoopbackTests)
-    {
-    public:
         TEST_METHOD(ServerAcceptsHelloAndWelcome)
         {
             net::Session host;
@@ -1895,24 +1924,20 @@ namespace NetworkTests
             Assert::IsFalse(mgr.HasRemotePlayer(100), L"Removed remote player should be gone.");
         }
 
-        TEST_METHOD(MissionStateRelaysBetweenClientsThroughServer)
+        TEST_METHOD(PlayerStateRelaysBetweenClientsThroughServer)
         {
-            // Mission progress rides the same generic relay as player state in
-            // the engine layer (net::Session relays arbitrary blobs). Here we
-            // serialize MissionSyncState into the blob and verify it survives the
-            // server relay: A publishes, B's world sink receives the exact blob.
-            MissionSyncState msA;
-            msA.missionIndex = 2;
-            msA.stageIndex = 1;
-            msA.objectiveIndex = 0;
-            msA.inMission = 1;
-
+            // A's typed state goes through the bridge, the compact wire format
+            // and the server relay; B's bridge rebuilds it. (Mission progress has
+            // its own channel: MissionStateRelaysThroughDedicatedChannel.)
             ScriptedPlayer aState;
             aState.ready = true;
-            // Pack the mission state into the first bytes of the player-state
-            // blob so it passes through the relay verbatim.
-            memcpy(reinterpret_cast<char*>(&aState.state), &msA, sizeof(msA));
-            aState.state.flags = 0;
+            std::memset(&aState.state, 0, sizeof(aState.state));
+            aState.state.x = 12.34f;
+            aState.state.y = -5.5f;
+            aState.state.z = 678.9f;
+            aState.state.facingAngle = 1571;
+            aState.state.characterState = 1;
+            aState.state.flags = PlayerNetworkState::FLAG_JUMPING;
 
             net::GamePlayerBridge aBridge;
             aBridge.SetTypedLocalProvider(
@@ -1947,11 +1972,12 @@ namespace NetworkTests
             }
             Assert::IsNotNull(seen, L"B should see A's state via the relay.");
             if (seen) {
-                // The first bytes carried the serialized MissionSyncState.
-                MissionSyncState received;
-                memcpy(&received, seen, sizeof(MissionSyncState));
-                Assert::AreEqual(2, received.missionIndex, L"Mission index should survive the relay.");
-                Assert::AreEqual(1, received.stageIndex, L"Stage index should survive the relay.");
+                Assert::AreEqual(12.34f, seen->x, 0.005f, L"Position survives the relay (1 cm).");
+                Assert::AreEqual(-5.5f, seen->y, 0.005f);
+                Assert::AreEqual(678.9f, seen->z, 0.005f);
+                Assert::AreEqual(1571, (int)seen->facingAngle);
+                Assert::AreEqual(1, (int)seen->characterState);
+                Assert::AreEqual((int)PlayerNetworkState::FLAG_JUMPING, (int)seen->flags);
             }
 
             g_scriptedHostHolder = nullptr;
@@ -2994,7 +3020,8 @@ namespace NetworkTests
             float nanv = std::numeric_limits<float>::quiet_NaN();
             net::NetEntityMotion bad; bad.x = nanv;
             bad.Encode(rec, 1);
-            Assert::IsFalse(mo.Decode(rec), L"Non-finite positions rejected.");
+            Assert::IsTrue(mo.Decode(rec));
+            Assert::AreEqual(0.0f, mo.x, L"A non-finite position cannot be put on the wire.");
         }
     };
 

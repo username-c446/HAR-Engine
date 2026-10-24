@@ -57,6 +57,39 @@ namespace net
         anim[sizeof(anim) - 1] = '\0';
         return model[0] != '\0';
     }
+
+    bool PlayerVehicle::operator==(const PlayerVehicle& o) const
+    {
+        return netVehicleId == o.netVehicleId && std::strncmp(model, o.model, sizeof(model)) == 0;
+    }
+
+    void PlayerVehicle::Set(int32_t id, const char* modelName)
+    {
+        netVehicleId = id;
+        std::memset(model, 0, sizeof(model));
+        if (modelName != nullptr) std::strncpy(model, modelName, sizeof(model) - 1);
+    }
+
+    bool PlayerVehicle::Encode(WorldStateValue& out) const
+    {
+        Writer w(out.bytes, WS_MAX_VALUE);
+        w.WriteU32(static_cast<uint32_t>(netVehicleId));
+        w.WriteBytes(model, static_cast<uint16_t>(sizeof(model)));
+        if (!w.Ok()) return false;
+        out.len = static_cast<uint8_t>(w.Position());
+        return true;
+    }
+
+    bool PlayerVehicle::Decode(const WorldStateValue& in)
+    {
+        if (in.len != 4 + sizeof(model)) return false;
+        Reader r(in.bytes, in.len);
+        uint32_t id = 0;
+        if (!r.ReadU32(id) || !r.ReadBytes(model, static_cast<uint16_t>(sizeof(model)))) return false;
+        netVehicleId = static_cast<int32_t>(id);
+        model[sizeof(model) - 1] = '\0'; // never trust a peer's terminator
+        return true;
+    }
 }
 
 void PlayerPresence::OnWelcomed(net::PeerId self)
@@ -65,6 +98,7 @@ void PlayerPresence::OnWelcomed(net::PeerId self)
     m_welcomed = true;
     if (m_localContext.level != 0xFF) Publish(net::WOC_PLAYER_CONTEXT);
     if (m_hasLocalAppearance) Publish(net::WOC_APPEARANCE);
+    if (m_hasLocalVehicle) Publish(net::WOC_VEHICLE);
 }
 
 void PlayerPresence::OnMatchEnd()
@@ -89,6 +123,14 @@ void PlayerPresence::SetLocalAppearance(const net::PlayerAppearance& app)
     Publish(net::WOC_APPEARANCE);
 }
 
+void PlayerPresence::SetLocalVehicle(const net::PlayerVehicle& vehicle)
+{
+    if (m_hasLocalVehicle && vehicle == m_localVehicle) return;
+    m_localVehicle = vehicle;
+    m_hasLocalVehicle = true;
+    Publish(net::WOC_VEHICLE);
+}
+
 void PlayerPresence::Publish(uint8_t channel)
 {
     if (!m_welcomed || !m_send) return;
@@ -98,15 +140,22 @@ void PlayerPresence::Publish(uint8_t channel)
     op.kind = net::WSO_SET;
     op.policy = net::WSP_OWNER;
     op.flags = net::WSF_ERASE_ON_OWNER_LEAVE;
-    bool ok = channel == net::WOC_PLAYER_CONTEXT ? m_localContext.Encode(op.value)
-                                                 : m_localAppearance.Encode(op.value);
+    bool ok = false;
+    switch (channel)
+    {
+    case net::WOC_PLAYER_CONTEXT: ok = m_localContext.Encode(op.value); break;
+    case net::WOC_APPEARANCE:     ok = m_localAppearance.Encode(op.value); break;
+    case net::WOC_VEHICLE:        ok = m_localVehicle.Encode(op.value); break;
+    default: break;
+    }
     if (ok) m_send(op);
 }
 
 void PlayerPresence::OnAuthoritative(const net::WorldStateEntry& e, net::WorldStateReason reason)
 {
     if (!net::IsPlayerObjectId(e.key.object)) return;
-    if (e.key.channel != net::WOC_PLAYER_CONTEXT && e.key.channel != net::WOC_APPEARANCE) return;
+    if (e.key.channel != net::WOC_PLAYER_CONTEXT && e.key.channel != net::WOC_APPEARANCE
+        && e.key.channel != net::WOC_VEHICLE) return;
     net::PeerId peer = net::PlayerOfObjectId(e.key.object);
     if (m_welcomed && peer == m_self) return; // our own records
 
@@ -115,13 +164,19 @@ void PlayerPresence::OnAuthoritative(const net::WorldStateEntry& e, net::WorldSt
         auto it = m_remote.find(peer);
         if (it == m_remote.end()) return;
         if (e.key.channel == net::WOC_PLAYER_CONTEXT) it->second.hasContext = false;
-        else it->second.hasAppearance = false;
-        if (!it->second.hasContext && !it->second.hasAppearance) m_remote.erase(it);
+        else if (e.key.channel == net::WOC_APPEARANCE) it->second.hasAppearance = false;
+        else it->second.hasVehicle = false;
+        if (!it->second.hasContext && !it->second.hasAppearance && !it->second.hasVehicle) m_remote.erase(it);
         return;
     }
 
     Remote& r = m_remote[peer];
-    if (e.key.channel == net::WOC_PLAYER_CONTEXT)
+    if (e.key.channel == net::WOC_VEHICLE)
+    {
+        net::PlayerVehicle v;
+        if (v.Decode(e.value)) { r.vehicle = v; r.hasVehicle = true; }
+    }
+    else if (e.key.channel == net::WOC_PLAYER_CONTEXT)
     {
         net::PlayerContext c;
         if (c.Decode(e.value)) { r.context = c; r.hasContext = true; }
@@ -148,6 +203,12 @@ const net::PlayerAppearance* PlayerPresence::Appearance(net::PeerId peer) const
 {
     auto it = m_remote.find(peer);
     return (it != m_remote.end() && it->second.hasAppearance) ? &it->second.appearance : nullptr;
+}
+
+const net::PlayerVehicle* PlayerPresence::Vehicle(net::PeerId peer) const
+{
+    auto it = m_remote.find(peer);
+    return (it != m_remote.end() && it->second.hasVehicle) ? &it->second.vehicle : nullptr;
 }
 
 uint32_t PlayerPresence::AppearanceVersion(net::PeerId peer) const

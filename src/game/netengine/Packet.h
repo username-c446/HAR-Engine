@@ -13,7 +13,7 @@ namespace net
     // packet layout. A client presents it in PID_HELLO; a server refuses any
     // other version (PID_REFUSE, REFUSE_PROTOCOL) instead of silently
     // misreading its packets.
-    static constexpr const uint16_t PROTOCOL_VERSION = 2;
+    static constexpr const uint16_t PROTOCOL_VERSION = 3;
 
     // First field of PID_HELLO ('HARN'): tells an engine client from random
     // UDP traffic that happens to reach the port.

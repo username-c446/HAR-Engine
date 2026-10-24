@@ -14,17 +14,16 @@ net::StateVerdict PlayerMovementValidator::Refuse(Track& t, uint32_t now, std::v
         return net::SV_DROP;
     t.corrected = true;
     t.lastCorrection = now;
-    correction.resize(PlayerNetworkState::SERIALIZED_SIZE);
-    t.last.Serialize(reinterpret_cast<char*>(correction.data()));
+    correction.resize(PlayerNetworkState::MAX_SERIALIZED_SIZE);
+    correction.resize(static_cast<size_t>(t.last.Serialize(reinterpret_cast<char*>(correction.data()))));
     return net::SV_CORRECT;
 }
 
 net::StateVerdict PlayerMovementValidator::ValidatePeerState(net::PeerId from, const uint8_t* data, uint16_t size,
                                                              uint32_t serverNowMs, std::vector<uint8_t>& correction)
 {
-    if (size < PlayerNetworkState::SERIALIZED_SIZE) { ++m_refused; return net::SV_DROP; }
     PlayerNetworkState st;
-    st.Deserialize(reinterpret_cast<const char*>(data));
+    if (!st.Deserialize(reinterpret_cast<const char*>(data), size)) { ++m_refused; return net::SV_DROP; }
 
     const float ext = m_limits.worldExtent;
     bool sane = Finite(st.x) && Finite(st.y) && Finite(st.z) && Finite(st.rotY)

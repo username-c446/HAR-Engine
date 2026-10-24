@@ -17,6 +17,13 @@
 //
 // Untimed input (time 0: no clock, e.g. unit tests) degrades to "show the
 // newest state".
+//
+// The server may forward a distant player's samples at a lower rate (interest
+// management). With Timing::adaptive the delay follows the measured sample
+// spacing (two intervals, never below interpolationDelayMs) and slews there
+// gradually, so playback speed changes slightly instead of the pose jumping.
+// A sample more than kGapResetMs after the newest one starts a new history
+// (the player was not relevant for a while): no slide across the gap.
 // World velocity of the rendered pose (m/s), from the bracketing samples.
 // Receivers drive animation with it (walk/run cycle matches the real motion).
 struct RemoteMotion
@@ -35,9 +42,21 @@ public:
         ClockFn  clock;
         uint32_t interpolationDelayMs = 100; // two send periods at 20 Hz
         uint32_t maxExtrapolationMs   = 250;
+        bool     adaptive = false;            // delay follows the sample spacing
     };
 
-    void Clear() { m_buffer.Clear(); m_lastTime = 0; m_hasLast = false; }
+    static constexpr const uint32_t kGapResetMs = 1000;
+    static constexpr const float    kDelaySlew  = 0.25f; // delay change per elapsed ms
+
+    void Clear()
+    {
+        m_buffer.Clear();
+        m_lastTime = 0;
+        m_hasLast = false;
+        m_intervalMs = 0.0f;
+        m_delayMs = 0.0f;
+        m_lastRenderClock = 0;
+    }
     bool Empty() const { return m_buffer.Empty(); }
 
     // Returns true if `state` is a new sample (not the same packet seen again).
@@ -53,6 +72,19 @@ public:
         }
         if (m_hasLast && serverTimeMs == m_lastTime) return false;
         if (m_hasLast && m_lastTime == 0) m_buffer.Clear(); // switching to timed samples
+        if (!m_buffer.Empty())
+        {
+            int32_t gap = net::TimeDiff(serverTimeMs, m_buffer.Newest().time);
+            if (gap > static_cast<int32_t>(kGapResetMs))
+            {
+                m_buffer.Clear(); // a new history: do not blend across the gap
+            }
+            else if (gap > 0)
+            {
+                float g = static_cast<float>(gap);
+                m_intervalMs = m_intervalMs <= 0.0f ? g : m_intervalMs + (g - m_intervalMs) * 0.25f;
+            }
+        }
         m_buffer.Push(serverTimeMs, state);
         m_lastTime = serverTimeMs;
         m_hasLast = true;
@@ -71,7 +103,8 @@ public:
             out = m_buffer.Newest().value;
             return true;
         }
-        uint32_t renderTime = timing.clock() - timing.interpolationDelayMs;
+        uint32_t now = timing.clock();
+        uint32_t renderTime = now - (timing.adaptive ? AdaptDelay(timing, now) : timing.interpolationDelayMs);
         typedef net::SnapshotBuffer<PlayerNetworkState>::Item Item;
         const Item* a = nullptr;
         const Item* b = nullptr;
@@ -115,8 +148,36 @@ public:
         return s;
     }
 
+    // The delay currently applied (adaptive timing; 0 before the first render).
+    float CurrentDelayMs() const { return m_delayMs; }
+
 private:
+    uint32_t AdaptDelay(const Timing& timing, uint32_t now)
+    {
+        float target = 2.0f * m_intervalMs;
+        float base = static_cast<float>(timing.interpolationDelayMs);
+        if (target < base) target = base;
+        if (m_delayMs <= 0.0f)
+        {
+            m_delayMs = target;
+        }
+        else
+        {
+            int32_t elapsed = net::TimeDiff(now, m_lastRenderClock);
+            if (elapsed < 0) elapsed = 0;
+            if (elapsed > 100) elapsed = 100;
+            float step = kDelaySlew * static_cast<float>(elapsed);
+            if (m_delayMs < target) m_delayMs = m_delayMs + step < target ? m_delayMs + step : target;
+            else if (m_delayMs > target) m_delayMs = m_delayMs - step > target ? m_delayMs - step : target;
+        }
+        m_lastRenderClock = now;
+        return static_cast<uint32_t>(m_delayMs + 0.5f);
+    }
+
     net::SnapshotBuffer<PlayerNetworkState> m_buffer;
     uint32_t m_lastTime = 0;
     bool     m_hasLast = false;
+    float    m_intervalMs = 0.0f;   // smoothed spacing of received samples
+    float    m_delayMs = 0.0f;      // applied delay (adaptive timing)
+    uint32_t m_lastRenderClock = 0;
 };

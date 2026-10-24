@@ -60,7 +60,8 @@ namespace net
         bool Decode(const WorldStateValue& in);
     };
 
-    // Streamed motion: f32 x,y,z,yaw | u16 speedKmh | i8 steer | u8 flags | u8 damage | u8 state (22 bytes)
+    // Streamed motion: i24 x,y,z (cm) | u16 yaw (2pi/65536) | u16 speedKmh | i8 steer
+    //                  | u8 flags | u8 damage | u8 state (17 bytes; yaw decodes into (-pi, pi])
     struct NetEntityMotion
     {
         float    x = 0.0f, y = 0.0f, z = 0.0f, yaw = 0.0f;
@@ -75,7 +76,7 @@ namespace net
         static constexpr const uint8_t MF_DESTROYED = 0x04;
         static constexpr const uint8_t MF_KNOCKED   = 0x08; // pedestrian knocked down / ragdoll
 
-        static constexpr const uint8_t SIZE = 4 * 4 + 2 + 1 + 1 + 1 + 1;
+        static constexpr const uint8_t SIZE = 3 * 3 + 2 + 2 + 1 + 1 + 1 + 1;
         static_assert(SIZE <= ENTITY_STATE_MAX, "motion record must fit an entity state record");
         void Encode(EntityStateRecord& out, uint64_t entity) const;
         bool Decode(const EntityStateRecord& in);
@@ -155,7 +156,11 @@ public:
     // Interest management: a ghost of a dynamic entity is shown only within
     // `radius` of our player (removed beyond 1.25x, the record is kept); 0 =
     // everywhere. A ghost the sink could not create is retried every frame.
+    // With a clock, a moving entity is shown only while its owner's samples
+    // keep arriving (the server forwards them only near us): a record whose
+    // newest sample is older than kStaleMs is not trusted as a position.
     void SetRelevanceRadius(float radius) { m_relevanceRadius = radius; }
+    static constexpr const uint32_t kStaleMs = 1000;
 
     // Match lifecycle. OnWelcomed announces entities created before our peer
     // id was known; OnMatchEnd removes every ghost and forgets announcements.
@@ -217,6 +222,7 @@ private:
     void Adopt(uint64_t id);
     void RenderGhosts();
     void UpdateRelevance();
+    bool PoseKnown(const Remote& r) const;
     void TryClaims();
     void StreamOwned();
     bool SendOp(uint64_t id, uint8_t kind, uint8_t flags, const net::WorldStateValue* value);

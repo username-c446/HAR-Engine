@@ -84,6 +84,7 @@ namespace net
             {
                 case ENET_EVENT_TYPE_CONNECT:
                     m_peerReady = true;
+                    ConfigureLink(ev.peer);
                     break;
                 case ENET_EVENT_TYPE_RECEIVE:
                 {

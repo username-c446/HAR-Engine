@@ -77,6 +77,29 @@ namespace net
         virtual void OnPeerLeft(PeerId peer) { (void)peer; }
     };
 
+    struct EntityStateRecord;
+
+    // Interest management: which admitted peers receive a relayed stream
+    // sample. The engine core cannot interpret game payloads, so the game
+    // decides (positions, contexts); the core enforces the decision.
+    // Without a policy every sample goes to every peer.
+    class IInterestPolicy
+    {
+    public:
+        static constexpr const uint32_t kNotRelevant = 0xFFFFFFFFu;
+
+        virtual ~IInterestPolicy() = default;
+        // A player state the server accepted (stream payload, after the
+        // validator): the latest known state of `peer`.
+        virtual void OnPlayerState(PeerId peer, const uint8_t* data, uint16_t size, uint32_t serverNowMs) = 0;
+        // Minimum spacing (server ms) of `sender`'s player samples forwarded
+        // to `receiver`: 0 = every sample, kNotRelevant = none.
+        virtual uint32_t PlayerStateIntervalMs(PeerId receiver, PeerId sender) = 0;
+        // Whether an entity record streamed by its owner is relevant to `receiver`.
+        virtual bool EntityRelevant(PeerId receiver, PeerId owner, const EntityStateRecord& rec) = 0;
+        virtual void OnPeerLeft(PeerId peer) = 0;
+    };
+
     // -------------------------------------------------------------------
     // Dedicated mission-progress channel (PID_MISSION_STATE).
     //

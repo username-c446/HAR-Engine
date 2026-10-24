@@ -74,32 +74,32 @@ struct PlayerNetworkState
     static constexpr const uint8_t VEH_FLAG_REVERSE = 0x02;
     static constexpr const uint8_t VEH_FLAG_DESTROYED = 0x04; // machine blown up (ghost shows the explosion)
 
-    // Number of bytes Serialize writes / Deserialize reads.
-    // 4 floats + vehicleModel[16] + int32 + float + 2*uint8  (base, 42)
-    // + 2*uint16 + 2*uint8 + uint8                          (loco, +7)
-    // + uint8                                               (actionEvent, +1)
-    // + float + uint8 + uint16 + uint8 + uint8              (vehicle mirror, +9)
-    // + uint8 vehDamage + uint8 teleportSeq                 (+2)  => 60 total.
-    static constexpr const int SERIALIZED_SIZE = sizeof(float) * 4
-        + sizeof(vehicleModel)
-        + sizeof(int32_t)
-        + sizeof(float)
-        + sizeof(uint8_t) * 2
-        // loco
-        + sizeof(uint16_t) * 2
-        + sizeof(uint8_t) * 2
-        // actionEvent
-        + sizeof(uint8_t)
-        // vehicle mirror
-        + sizeof(float)
-        + sizeof(uint8_t)
-        + sizeof(uint16_t)
-        + sizeof(uint8_t)
-        + sizeof(uint8_t)
-        // damage + teleport sequence
-        + sizeof(uint8_t)
-        + sizeof(uint8_t);
+    // Wire format (protocol 3, little-endian, bounds-checked). Only what the
+    // player is doing is sent: the on-foot block on foot, the vehicle block in
+    // a machine. The vehicle model name is not streamed — it rides the
+    // player's presence record (PlayerPresence WOC_VEHICLE) and the receiver
+    // fills vehicleModel from it.
+    //
+    //   u8  sections          SEC_* below; any other bit = malformed
+    //   i24 x, y, z           centimetres (+-83 km)
+    //   u16 rotY              angle, 2pi/65536 units
+    //   u8  flags | u8 characterState | u8 actionEvent | u8 teleportSeq
+    //   [SEC_LOCO]    u16 motionAngle | u16 facingAngle | u8 speedFactor        (+5)
+    //   [SEC_VEHICLE] i32 netVehicleId | u16 vehYaw (angle) | u8 vehSteer
+    //                 | u16 vehSpeedKmh | u8 vehState | u8 vehFlags | u8 vehDamage (+12)
+    //
+    // On foot 21 bytes, in a machine 28 (the old fixed layout was 60).
+    // Decoded angles lie in (-pi, pi]; vehicleSpeed is restored from
+    // vehSpeedKmh; fields of an absent block decode as 0.
+    static constexpr const uint8_t SEC_LOCO    = 0x01;
+    static constexpr const uint8_t SEC_VEHICLE = 0x02;
+    static constexpr const int BASE_SIZE    = 1 + 3 * 3 + 2 + 4;
+    static constexpr const int LOCO_SIZE    = 2 + 2 + 1;
+    static constexpr const int VEHICLE_SIZE = 4 + 2 + 1 + 2 + 1 + 1 + 1;
+    static constexpr const int MAX_SERIALIZED_SIZE = BASE_SIZE + VEHICLE_SIZE;
 
-    void Serialize(char* buffer) const;
-    void Deserialize(const char* buffer);
+    // Writes the state (out holds MAX_SERIALIZED_SIZE); returns bytes written.
+    int  Serialize(char* out) const;
+    // False on a malformed / truncated record (the state is then undefined).
+    bool Deserialize(const char* data, int size);
 };

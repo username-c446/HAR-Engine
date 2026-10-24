@@ -1100,6 +1100,7 @@
     <ClCompile Include="..\game\netengine\ServerCore.cpp" />
     <ClCompile Include="..\game\network\PlayerMovementValidator.cpp" />
     <ClCompile Include="..\game\network\GameServer.cpp" />
+    <ClCompile Include="..\game\network\PlayerInterestPolicy.cpp" />
     <ClCompile Include="..\game\netengine\WorldState.cpp" />
     <ClCompile Include="..\game\netengine\Ledger.cpp" />
     <ClCompile Include="..\game\network\NetWorldRegistry.cpp" />

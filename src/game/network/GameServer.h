@@ -2,6 +2,7 @@
 
 #include "../netengine/ServerCore.h"
 #include "PlayerMovementValidator.h"
+#include "PlayerInterestPolicy.h"
 #include "ServerModManager.h"
 
 #include <memory>
@@ -19,7 +20,9 @@
 //     Lua mods' on_validate;
 //   - the mods' on_join as the admission filter, on_leave and the
 //     "player.joined" / "player.left" events;
-//   - the session options (PvP).
+//   - the session options (PvP);
+//   - interest management of the player / entity streams
+//     (PlayerInterestPolicy).
 class GameServer
 {
 public:
@@ -29,6 +32,7 @@ public:
         bool pvp = false;
         std::vector<std::string> modScripts;          // server Lua mods to load
         PlayerMovementValidator::Limits movement;
+        PlayerInterestPolicy::Config interest;
     };
 
     GameServer();
@@ -44,6 +48,7 @@ public:
     void SetPvp(bool enabled);
 
     PlayerMovementValidator& Movement() { return m_movement; }
+    PlayerInterestPolicy&    Interest() { return m_interest; }
     // Loaded mods (one manager per script).
     size_t ModCount() const { return m_mods.size(); }
     ServerModManager* Mod(size_t i) { return i < m_mods.size() ? m_mods[i].get() : nullptr; }
@@ -53,5 +58,6 @@ private:
 
     net::ServerCore* m_core = nullptr;
     PlayerMovementValidator m_movement;
+    PlayerInterestPolicy    m_interest;
     std::vector<std::unique_ptr<ServerModManager>> m_mods;
 };
