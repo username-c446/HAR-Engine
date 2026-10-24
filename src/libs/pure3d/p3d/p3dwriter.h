@@ -87,6 +87,18 @@ public:
     // Closes the MULTISPRITE chunk opened by WriteSprite.
     void EndSprite();
 
+    // Polygon (FrontendPolygon 0x18009), the only front-end drawable the loader
+    // supports that the writer lacked. Points are [x,y,z] floats (z ignored by
+    // the loader); colours are u32 per point in surface order (ARGB).
+    void WritePolygon(const char* name,
+                      uint32_t version,
+                      uint32_t translucency,
+                      const float* points,   // 3 floats per point
+                      const uint32_t* colours, // one u32 per point
+                      unsigned numPoints);
+    // Closes the POLYGON chunk opened by WritePolygon.
+    void EndPolygon();
+
     void EndProject();
 
     // The serialized .p3d bytes.

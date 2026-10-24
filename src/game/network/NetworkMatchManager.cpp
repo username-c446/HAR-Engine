@@ -14,6 +14,7 @@
 #include "RemotePlayerManager.h"
 #include "RemotePlayerWorldView.h"
 #include "RemoteVehicleWorldView.h"
+#include <radtime.hpp>
 
 NetworkMatchManager* NetworkMatchManager::spInstance = nullptr;
 
@@ -65,7 +66,13 @@ bool NetworkMatchManager::StartHost(unsigned short port)
     m_bridge->SetTypedLocalProvider(m_localStateProvider);
     m_bridge->SetRemotePlayers(&m_remotePlayers);
 
-    bool ok = m_session->StartHost(port, 0x5EED0000u | static_cast<uint32_t>(port));
+    // Session-scoped world seed: randomized per match so every host differs, and
+    // broadcast to clients in WELCOME so all peers seed their world RNG
+    // identically. radTimeGetMilliseconds is a good entropy source (differs
+    // between matches; the upper bits make same-second matches distinct).
+    uint32_t worldSeed = (radTimeGetMilliseconds() ^ 0x5EED0000u) & 0x7FFFFFFFu;
+    if (worldSeed == 0) worldSeed = 0x5EED0000u;
+    bool ok = m_session->StartHost(port, worldSeed);
     if (!ok)
     {
         m_hostPort = 0;

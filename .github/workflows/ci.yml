@@ -1,0 +1,90 @@
+name: CI (build + tests + CodeQL)
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  # CodeQL advanced setup needs to write the analysis results.
+  security-events: write
+
+env:
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+  VCPKG_COMMIT_ID: '5f8c424e267b7360d451df406eeefb3767985b17' # keep in sync with build.yml
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
+      - uses: GuillaumeFalourd/setup-windows10-sdk-action@v2.4
+        with:
+          sdk-version: 22621
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1
+        with:
+          vs-version: 'latest'
+      # Third-party and header-only code (deps/, engines' radmath/radsound) is
+      # excluded because the findings it produces are false positives in the
+      # legacy game sources (dismissed 2026-10-24). Scan the game engine layer.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          config-file: .github/codeql.yml
+      - name: Build (DebugWindows)
+        run: msbuild.exe src/srr2/SRR2.vcxproj /p:Configuration=DebugWindows /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /m /p:SolutionDir=${{ github.workspace }}
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  build-and-test:
+    name: Build + tests
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
+      - uses: GuillaumeFalourd/setup-windows10-sdk-action@v2.4
+        with:
+          sdk-version: 22621
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1
+        with:
+          vs-version: 'latest'
+      - name: Setup VCPKG
+        uses: lukka/run-vcpkg@v10.0
+        with:
+          vcpkgDirectory: 'vcpkg'
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      - name: Install Dependencies (VCPKG)
+        run: .\vcpkg\vcpkg.exe install --triplet x64-windows
+      - name: Integrate (VCPKG)
+        run: .\vcpkg\vcpkg.exe integrate install
+
+      - name: Build SRR2 (DebugWindows)
+        run: msbuild.exe src/srr2/SRR2.vcxproj /p:Configuration=DebugWindows /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /m /p:SolutionDir=${{ github.workspace }}
+      - name: Build tests (Debug|x64)
+        run: msbuild.exe src/tests/Tests.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 /p:VcpkgEnableManifest=true /m /p:SolutionDir=${{ github.workspace }}
+      - name: Run tests
+        run: vstest.console.exe src\tests\x64\Debug\Tests.dll

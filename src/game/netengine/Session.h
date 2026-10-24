@@ -116,6 +116,19 @@ namespace net
         // Broadcast cadence for local state. Default every 6th Update (~10 Hz).
         void SetStateSendEvery(unsigned n) { m_stateSendEvery = (n > 0) ? n : 1; }
 
+        // ---- open user-data channel (0x8000+) -------------------------------
+
+        // Callback for inbound custom events. `from` is the originating peer;
+        // on a host session the event is relayed from a remote client, on a
+        // joiner it comes straight from the server. Self-echo is filtered.
+        using CustomEventFn = std::function<void(PeerId from, const uint8_t* data, uint16_t size)>;
+        void SetCustomEventSink(CustomEventFn fn) { m_customEvent = std::move(fn); }
+
+        // Ships an opaque payload to all other peers in the match (relayed
+        // server-side). The engine never interprets the bytes. Returns false if
+        // not in a match or the payload exceeds MAX_PACKET_PAYLOAD.
+        bool SendCustomEvent(const uint8_t* data, uint16_t size);
+
     private:
         // Sends the local player's state (from m_localState) to all peers.
         void SendLocalStateIfDue();
@@ -145,6 +158,7 @@ namespace net
         // World attachment (may be null when world not wired, e.g. dedicated relay).
         ILocalStateProvider* m_localState = nullptr;
         IRemoteStateSink*    m_remoteSink = nullptr;
+        CustomEventFn        m_customEvent;   // open user-data channel sink
         unsigned             m_stateSendEvery = 6;
         unsigned             m_stateTick     = 0;
         uint8_t              m_stateScratch[MAX_PACKET_PAYLOAD];

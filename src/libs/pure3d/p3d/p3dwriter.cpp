@@ -16,6 +16,7 @@ namespace
         GROUP       = 0x00018004,
         MULTISPRITE = 0x00018006,
         MULTITEXT   = 0x00018007,
+        POLYGON     = 0x00018009,
         STRINGTEXTBIBLE  = 0x0001800B,
         STRINGHARDCODED  = 0x0001800C,
     };
@@ -282,6 +283,35 @@ void P3DWriter::WriteSprite(const char* name,
 }
 
 void P3DWriter::EndSprite()
+{
+    EndChunk();
+}
+
+void P3DWriter::WritePolygon(const char* name,
+                             uint32_t version,
+                             uint32_t translucency,
+                             const float* points,
+                             const uint32_t* colours,
+                             unsigned numPoints)
+{
+    BeginChunk(POLYGON);
+    WriteString(name);
+    WriteU32(version);
+    WriteUInt(translucency);
+    WriteUInt(numPoints);
+    for (unsigned i = 0; i < numPoints; ++i)
+    {
+        WriteFloat(points[i * 3 + 0]);
+        WriteFloat(points[i * 3 + 1]);
+        WriteFloat(points[i * 3 + 2]);
+    }
+    for (unsigned i = 0; i < numPoints; ++i)
+    {
+        WriteUInt(colours[i]);
+    }
+}
+
+void P3DWriter::EndPolygon()
 {
     EndChunk();
 }

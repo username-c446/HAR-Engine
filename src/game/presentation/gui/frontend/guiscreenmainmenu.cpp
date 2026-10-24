@@ -576,8 +576,7 @@ void CGuiScreenMainMenu::HandleMessage
                 // In the multiplayer overlay, switch between Host and Join.
                 if( m_mpOverlayActive )
                 {
-                    m_mpOverlaySelection = (m_mpOverlaySelection == 0) ? 1 : 0;
-                    this->UpdateMpOverlayDisplay();
+                    this->ToggleMpOverlaySelection();
                 }
                 else
                 {
@@ -1420,7 +1419,7 @@ void CGuiScreenMainMenu::OnMpOverlayConfirm()
     if( m_mpOverlaySelection == 0 )
     {
         // Host a server on the typed port (default 3737).
-        int port = atoi( m_mpIpBuffer[0] != '\0' ? m_mpIpBuffer : "3737" );
+        int port = atoi( m_mpHostPortBuffer[0] != '\0' ? m_mpHostPortBuffer : "3737" );
         this->StartMultiplayerHost( static_cast<unsigned short>( port ) );
     }
     else
@@ -1556,6 +1555,7 @@ CGuiScreenMainMenu::StartMultiplayerOverlay()
 
     m_mpOverlayActive = true;
     m_mpOverlaySelection = 0; // start at Host
+    m_mpHostPortBuffer[0] = '\0';
     m_mpIpBuffer[0] = '\0';
     m_mpOverlayText = overlayText;
 
@@ -1577,16 +1577,34 @@ CGuiScreenMainMenu::EndMultiplayerOverlay()
     m_mpOverlayActive = false;
 }
 
+void CGuiScreenMainMenu::ToggleMpOverlaySelection()
+{
+    m_mpOverlaySelection = (m_mpOverlaySelection == 0) ? 1 : 0;
+    this->UpdateMpOverlayDisplay();
+}
+
+char* CGuiScreenMainMenu::ActiveMpField()
+{
+    return (m_mpOverlaySelection == 0) ? m_mpHostPortBuffer : m_mpIpBuffer;
+}
+
+size_t CGuiScreenMainMenu::ActiveMpFieldCapacity() const
+{
+    return (m_mpOverlaySelection == 0) ? sizeof(m_mpHostPortBuffer) : sizeof(m_mpIpBuffer);
+}
+
 void CGuiScreenMainMenu::UpdateMpOverlayDisplay()
 {
-    // Show current selection and the typed value. In HOST mode the field is the
-    // server port (default 3737); in JOIN mode it is the server "ip:port".
-    char buf[128];
-    const char* mode = (m_mpOverlaySelection == 0) ? "HOST" : "JOIN";
-    const char* field = (m_mpOverlaySelection == 0) ? "Port (default 3737)" : "Address (ip:port)";
-    const char* value = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
-    const char* action = (m_mpOverlaySelection == 0) ? "start" : "connect";
-    sprintf( buf, "MULTIPLAYER %s\n%s: %s\n[Enter=%s | Esc=back]\n[Up/Down: switch to %s]", mode, field, value, action, (m_mpOverlaySelection == 0) ? "JOIN" : "HOST" );
+    // Two visible fields: Host port (default 3737) and Join address (ip:port).
+    // The selected field is highlighted; typed input goes into whichever is
+    // currently selected.
+    char buf[192];
+    const char* hostVal = (m_mpHostPortBuffer[0] != '\0') ? m_mpHostPortBuffer : "3737 (default)";
+    const char* joinVal = (m_mpIpBuffer[0] != '\0') ? m_mpIpBuffer : "_";
+    const char* hostMark = (m_mpOverlaySelection == 0) ? ">>" : "  ";
+    const char* joinMark = (m_mpOverlaySelection == 1) ? ">>" : "  ";
+    sprintf( buf, "MULTIPLAYER\n%s Host port : %s\n%s Join address : %s\n[Enter=confirm | Esc=back | Up/Down: switch]",
+             hostMark, hostVal, joinMark, joinVal );
     if( m_mpOverlayText != NULL )
     {
         m_mpOverlayText->SetString( 0, buf );
@@ -1596,21 +1614,23 @@ void CGuiScreenMainMenu::UpdateMpOverlayDisplay()
 void CGuiScreenMainMenu::OnMpOverlayChar( const char* utf8Char )
 {
     if( spMpOverlayOwner == NULL ) return;
-    // Append up to the buffer limit.
     size_t len = strlen( utf8Char );
     if( len == 0 ) return;
-    if( strlen( spMpOverlayOwner->m_mpIpBuffer ) + len >= sizeof( spMpOverlayOwner->m_mpIpBuffer ) ) return;
-    strcat( spMpOverlayOwner->m_mpIpBuffer, utf8Char );
+    char* field = spMpOverlayOwner->ActiveMpField();
+    size_t cap = spMpOverlayOwner->ActiveMpFieldCapacity();
+    if( strlen( field ) + len >= cap ) return;
+    strcat( field, utf8Char );
     spMpOverlayOwner->UpdateMpOverlayDisplay();
 }
 
 void CGuiScreenMainMenu::OnMpOverlayBackspace()
 {
     if( spMpOverlayOwner == NULL ) return;
-    size_t len = strlen( spMpOverlayOwner->m_mpIpBuffer );
+    char* field = spMpOverlayOwner->ActiveMpField();
+    size_t len = strlen( field );
     if( len > 0 )
     {
-        spMpOverlayOwner->m_mpIpBuffer[ len - 1 ] = '\0';
+        field[ len - 1 ] = '\0';
     }
     spMpOverlayOwner->UpdateMpOverlayDisplay();
 }

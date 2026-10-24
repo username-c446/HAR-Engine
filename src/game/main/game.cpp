@@ -41,6 +41,7 @@
 #include <main/commandlineoptions.h>
 #include <main/game.h>
 #include <main/platform.h>
+#include <network/NetworkMatchManager.h>
 
 #include <memory/srrmemory.h>
 #include <memory/memoryutilities.h>
@@ -636,6 +637,18 @@ void Game::Stop()
 
 unsigned Game::GetRandomSeed ()
 {
+    // Multiplayer: the server chose a session-wide seed and broadcast it in
+    // WELCOME; every peer must seed its world RNG from it so the static world
+    // composition (traffic models/colors, peds, parking, interior props)
+    // matches. Outside a match fall back to the wall-clock seed as before.
+    NetworkMatchManager* match = NetworkMatchManager::GetInstance();
+    if ( match != NULL && match->IsInMatch() )
+    {
+        unsigned int worldSeed = match->GetWorldSeed();
+        if ( worldSeed != 0 )
+            return worldSeed;
+    }
+
     radDate date;
     ::radTimeGetDate (&date);
     return ( ( date.m_Year << 16 ) | (  date.m_Month << 8 ) | ( date.m_Day ) ) ^ ( ( date.m_Second << 24 ) | ( date.m_Minute << 8 ) | ( date.m_Hour ) );

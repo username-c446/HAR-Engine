@@ -36,6 +36,7 @@ namespace net
         constexpr const PacketId kIdAuth       = PID_AUTH;
         constexpr const PacketId kIdPing       = PID_PING;
         constexpr const PacketId kIdPong       = PID_PONG;
+        constexpr const PacketId kIdUser       = PID_USER;
 
         inline void WriteU16Le(uint8_t* d, uint16_t v)
         {
@@ -140,6 +141,18 @@ namespace net
                 }
                 return;
             }
+            if (rp.id == kIdUser)
+            {
+                // Open user-data relay: forward the opaque payload to every
+                // OTHER peer (server-authoritative, mirrors the state relay).
+                // The server does not interpret the bytes.
+                uint8_t framed[2 + MAX_PACKET_PAYLOAD];
+                if (rp.size + 2 > sizeof(framed)) return;
+                WriteU16Le(framed, rp.from);
+                std::memcpy(framed + 2, rp.data, rp.size);
+                m_server->Broadcast(kIdUser, framed, static_cast<uint16_t>(rp.size + 2), rp.from);
+                return;
+            }
             if (rp.id == kIdState)
             {
                 // Server-authoritative gate: a validator may reject the state
@@ -233,6 +246,15 @@ namespace net
                     }
                 }
             }
+            if (rp.id == kIdUser && rp.size >= 2)
+            {
+                // Relayed user event: [sender u16][payload]. Forward to the
+                // game's custom-event sink (self-echo already omitted by the
+                // server's omit=sender broadcast).
+                PeerId from = ReadU16Le(rp.data);
+                if (from != m_selfId && m_customEvent)
+                    m_customEvent(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
+            }
             else if (rp.id == kIdState && rp.size >= 2 + 1)
             {
                 PeerId from = ReadU16Le(rp.data);
@@ -285,6 +307,12 @@ namespace net
                         if (id != m_selfId) m_peerRoster.insert(id);
                     }
                 }
+            }
+            else if (rp.id == kIdUser && rp.size >= 2)
+            {
+                PeerId from = ReadU16Le(rp.data);
+                if (from != m_selfId && m_customEvent)
+                    m_customEvent(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
             }
             else if (rp.id == kIdState && rp.size >= 2 + 1)
             {
@@ -351,6 +379,17 @@ namespace net
         if (m_client && m_client->SendTo(kIdState, m_stateScratch, size))
             return; // client-session: sent to the server (which relays)
         if (m_server) m_server->Broadcast(kIdState, m_stateScratch, size, 0);
+    }
+
+    bool Session::SendCustomEvent(const uint8_t* data, uint16_t size)
+    {
+        if (size > MAX_PACKET_PAYLOAD) return false;
+        // Ship to the server (which relays to everyone else), or directly to
+        // all peers if we are the host.
+        if (m_client && m_client->SendTo(kIdUser, data, size))
+            return true;
+        if (m_server) { m_server->Broadcast(kIdUser, data, size, 0); return true; }
+        return false;
     }
 
     void Session::HandleRemoteState(PeerId from, const uint8_t* data, uint16_t size)

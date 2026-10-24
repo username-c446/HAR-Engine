@@ -64,6 +64,12 @@ public:
     unsigned short GetLocalClientId() const { return m_session ? m_session->GetLocalPeerId() : 0; }
     unsigned short GetHostPort() const { return m_hostPort; }
 
+    // The match's server-authoritative world seed (0 outside a match). The game
+    // uses it to seed its world RNG identically on every peer so the static
+    // world composition (traffic/peds/parking/props) matches. See
+    // Game::GetRandomSeed().
+    unsigned int GetWorldSeed() const { return m_session ? m_session->GetWorldSeed() : 0; }
+
     // Drains the client's pending join/leave notifications. Empty unless we are
     // a joined client. Lets the UI print "Player connected/disconnected".
     void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);

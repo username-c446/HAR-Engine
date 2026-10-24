@@ -37,6 +37,13 @@ namespace net
         PID_PLAYER_STATE = 0x0100, // relayed per-player transform
         PID_VEHICLE_STATE= 0x0101, // relayed remote driver's machine
         PID_MISSION_STATE= 0x0102, // relayed mission progress
+
+        // Open user-data channel in the reserved 0x8000+ range. The engine does
+        // not interpret the payload: the session relays it to all other peers
+        // (server-authoritative, like player state) and delivers a copy to the
+        // game's custom-event sink. Games/mods use it to ship their own packets
+        // without touching the core protocol.
+        PID_USER         = 0x8000,
     };
 
     // Opaque identifier of a connected peer (assigned by the transport).

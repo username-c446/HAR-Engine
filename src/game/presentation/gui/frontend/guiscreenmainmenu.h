@@ -66,11 +66,14 @@ protected:
     void StartMultiplayerOverlay();
     void EndMultiplayerOverlay();
     void OnMpOverlayConfirm();
+    void ToggleMpOverlaySelection();
     void StartMultiplayerHost( unsigned short port );
     void StartMultiplayerJoin( const char* ip, unsigned short port );
     void UpdateMpOverlayDisplay();
     static void OnMpOverlayChar( const char* utf8Char );
     static void OnMpOverlayBackspace();
+    char* ActiveMpField();
+    size_t ActiveMpFieldCapacity() const;
 
 private:
     enum eMainMenuSelection
@@ -133,7 +136,8 @@ private:
     // Multiplayer overlay state.
     bool m_mpOverlayActive;
     int  m_mpOverlaySelection;   // 0 = Host, 1 = Join
-    char m_mpIpBuffer[64];       // typed IP/port string
+    char m_mpHostPortBuffer[16]; // Host server port (default 3737)
+    char m_mpIpBuffer[64];       // Join server address (ip:port)
     Scrooby::Text* m_mpOverlayText;
 
     static CGuiScreenMainMenu* spMpOverlayOwner;

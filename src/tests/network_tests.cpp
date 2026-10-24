@@ -5,6 +5,7 @@
 #include "RemotePlayerWorldView.h"
 #include "RemoteVehicleWorldView.h"
 #include "ServerModManager.h"
+#include "ClientModManager.h"
 #include "MissionSyncState.h"
 #include "MissionSyncManager.h"
 #include "../game/netengine/Packet.h"
@@ -17,6 +18,9 @@
 
 #include <winsock2.h>
 #include <functional>
+#include <stdlib.h>
+#include <string>
+#include <windows.h>
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 
@@ -40,6 +44,39 @@ namespace NetworkTests
         closesocket(s);
         WSACleanup();
         return port;
+    }
+
+    // Anchors TestDataPath to THIS test DLL: we must resolve Tests.dll's own path,
+// not the host runner (vstest.console.exe lives outside the repo). Taking the
+// address of a function compiled into Tests.dll lets GetModuleHandleEx find the
+// right module deterministically, which works both under vstest and on CI where
+// the DLL sits in the repo at <repo>/src/tests/x64/Debug/.
+    static const char* TestDataAnchor() { return "anchor"; }
+
+    std::string TestDataPath(const char* fileName)
+    {
+        HMODULE mod = NULL;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&TestDataAnchor), &mod) == 0)
+            return std::string(fileName);
+
+        char module[MAX_PATH] = { 0 };
+        DWORD n = GetModuleFileNameA(mod, module, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) return std::string(fileName);
+
+        std::string dir(module);
+        size_t slash = dir.find_last_of("\\/");
+        if (slash != std::string::npos) dir = dir.substr(0, slash);
+        // dir is now .../src/tests/x64/Debug -> drop x64 and Debug (2 levels) to
+        // reach src/tests.
+        for (int i = 0; i < 2; ++i)
+        {
+            size_t p = dir.find_last_of("\\/");
+            if (p == std::string::npos) break;
+            dir = dir.substr(0, p);
+        }
+        return dir + "\\" + fileName;
     }
 
     // ---- helpers for the engine-level transport tests ---------------
@@ -416,6 +453,168 @@ namespace NetworkTests
             Assert::IsFalse(welcomed, L"A client that sends no password must not be admitted.");
 
             client.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(SessionReconnectsAfterLeave)
+        {
+            // A single net::Session must be re-usable after Leave() (the
+            // reconnection / "played a round, join the next one" scenario).
+            // Leave() fully tears down transport and resets match state, so a
+            // second Join() on the same instance must work cleanly.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"First join did not get WELCOME.");
+            Assert::IsTrue(joiner.GetLocalPeerId() != 0);
+            joiner.Leave();
+            Assert::IsFalse(joiner.IsInMatch(), L"Joiner must be out of any match after Leave.");
+
+            // Same joiner object joins the still-running host again.
+            Assert::IsTrue(joiner.Join("127.0.0.1", port), L"Re-join on same session failed.");
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Re-join after Leave did not get WELCOME.");
+            Assert::IsTrue(joiner.GetLocalPeerId() != 0, L"Re-joined session has no peer id.");
+
+            // And a fresh peering works too, proving the host accepted both.
+            net::Session third;
+            Assert::IsTrue(third.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, third), L"Third joiner did not get WELCOME.");
+
+            third.Leave();
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(HostRestartsOnSamePortAfterLeave)
+        {
+            // After Leave(), the same Session can StartHost again on the same
+            // UDP port: teardown must release the socket so the rebind succeeds.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+            host.Leave();
+            Assert::IsFalse(host.IsInMatch(), L"Host must leave the match after Leave().");
+
+            Assert::IsTrue(host.StartHost(port, 0xBEEF), L"Rebind on the same port failed.");
+            Assert::IsTrue(host.IsHost(), L"Host must be hosting after restart.");
+
+            // A joiner connects to the restarted host to prove it's listening.
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not reach the restarted host.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(CustomEventRelaysFromJoinerToHost)
+        {
+            // The open user-data channel ships an opaque payload through the
+            // server to the host's custom-event sink (server relays, sender
+            // excluded). The host sees the event tagged with the joiner's id.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            // Host receives the joiner's custom event.
+            int hostGot = 0;
+            uint8_t hostPayload[8] = { 0 };
+            net::PeerId hostFrom = 0;
+            host.SetCustomEventSink([&](net::PeerId from, const uint8_t* d, uint16_t size) {
+                hostGot++;
+                hostFrom = from;
+                uint16_t n = size < sizeof(hostPayload) ? size : sizeof(hostPayload);
+                memcpy(hostPayload, d, n);
+            });
+
+            const uint8_t msg[5] = { 9, 8, 7, 6, 5 };
+            Assert::IsTrue(joiner.SendCustomEvent(msg, sizeof(msg)), L"joiner.SendCustomEvent failed.");
+
+            for (int i = 0; i < 200 && hostGot == 0; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(1, hostGot, L"Host did not receive the joiner's custom event.");
+            Assert::IsTrue(hostFrom == joiner.GetLocalPeerId(), L"Host saw wrong sender id.");
+            for (int i = 0; i < 5; ++i)
+                Assert::AreEqual(static_cast<int>(msg[i]), static_cast<int>(hostPayload[i]),
+                    L"Host got mangled custom payload.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(CustomEventRelaysFromHostToJoiner)
+        {
+            // Same channel, reverse direction: the host ships an event that the
+            // joiner's sink receives (via the host's own loopback client).
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            int joinerGot = 0;
+            uint8_t payload[4] = { 0 };
+            joiner.SetCustomEventSink([&](net::PeerId from, const uint8_t* d, uint16_t size) {
+                joinerGot++;
+                uint16_t n = size < sizeof(payload) ? size : sizeof(payload);
+                memcpy(payload, d, n);
+            });
+
+            const uint8_t msg[4] = { 1, 3, 3, 7 };
+            Assert::IsTrue(host.SendCustomEvent(msg, sizeof(msg)), L"host.SendCustomEvent failed.");
+
+            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the host's custom event.");
+            for (int i = 0; i < 4; ++i)
+                Assert::AreEqual(static_cast<int>(msg[i]), static_cast<int>(payload[i]),
+                    L"Joiner got mangled custom payload.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(CustomEventDoesNotEchoToSender)
+        {
+            // A sender must not receive its own event back (the server's
+            // omit=sender broadcast removes the echo).
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            int joinerGot = 0;
+            joiner.SetCustomEventSink([&](net::PeerId, const uint8_t*, uint16_t) { joinerGot++; });
+
+            const uint8_t msg[2] = { 0xAB, 0xCD };
+            Assert::IsTrue(joiner.SendCustomEvent(msg, sizeof(msg)));
+
+            // Pump enough that any echo would have arrived, then assert none did.
+            for (int i = 0; i < 60; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(0, joinerGot, L"Sender received its own custom event back.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(CustomEventRejectsOversize)
+        {
+            // Payloads over MAX_PACKET_PAYLOAD must be refused before send.
+            net::Session host;
+            Assert::IsTrue(host.StartHost(PickFreePort(), 0xAA55));
+            uint8_t big[net::MAX_PACKET_PAYLOAD + 8];
+            Assert::IsFalse(host.SendCustomEvent(big, net::MAX_PACKET_PAYLOAD + 1),
+                L"Oversize custom event must be rejected.");
             host.Leave();
         }
     };
@@ -1065,8 +1264,7 @@ namespace NetworkTests
         TEST_METHOD(LuaHooksControlJoinAndValidate)
         {
             ServerModManager mods;
-            // Absolute path so the test is independent of vstest's working dir.
-            Assert::IsTrue(mods.LoadScript("C:\\Users\\User\\Downloads\\The-Simpsons-Hit-Run\\src\\tests\\test_server_mod.lua"),
+            Assert::IsTrue(mods.LoadScript(TestDataPath("test_server_mod.lua").c_str()),
                 L"Should load the Lua test script.");
             Assert::IsTrue(mods.HasScript());
 
@@ -1084,6 +1282,56 @@ namespace NetworkTests
             Assert::IsFalse(mods.OnPlayerValidate(1, bad), L"on_validate with z=500 should fail.");
 
             mods.OnPlayerLeave(1); // must not crash
+        }
+
+        TEST_METHOD(LuaEventBusDispatchesToRegisteredHandlers)
+        {
+            // The event bus: a script registers handlers with net.on(); the
+            // engine dispatches to them via Emit with typed args. Handlers
+            // increment Lua globals we read back with GetGlobalInt().
+            ServerModManager mods;
+            Assert::IsTrue(mods.LoadScript(TestDataPath("test_server_mod_events.lua").c_str()),
+                L"Should load the event-bus test script.");
+
+            // No one listens on an unknown event -> Emit reports nothing ran.
+            int noEvt[] = { 42 };
+            Assert::IsFalse(mods.Emit("player.nobody", noEvt, 1),
+                L"Emit on an unregistered event must report no handler ran.");
+
+            // Dispatch "player.spawn" twice and "player.kick" once.
+            int a[] = { 7 };
+            int b[] = { 9, 2 };
+            Assert::IsTrue(mods.Emit("player.spawn", a, 1), L"spawn handler did not run.");
+            Assert::IsTrue(mods.Emit("player.spawn", a, 1), L"spawn handler did not run a 2nd time.");
+            Assert::IsTrue(mods.Emit("player.kick", b, 2), L"kick handler did not run.");
+
+            // Handlers incremented their Lua globals; read them back.
+            Assert::AreEqual(2, mods.GetGlobalInt("spawns"), L"spawn handler ran the wrong number of times.");
+            Assert::AreEqual(1, mods.GetGlobalInt("kicks"), L"kick handler ran the wrong number of times.");
+        }
+
+        TEST_METHOD(ClientLuaEventBusDispatchesToRegisteredHandlers)
+        {
+            // The client-side mirror (ClientModManager) uses the same net.on()
+            // API and Emit() dispatch as the server side, so a client mod can
+            // react to client-scoped events (match start, world seed, inbound
+            // custom events) identically.
+            ClientModManager mods;
+            Assert::IsTrue(mods.LoadScript(TestDataPath("test_server_mod_events.lua").c_str()),
+                L"Should load the event-bus test script on the client side.");
+
+            int noEvt[] = { 42 };
+            Assert::IsFalse(mods.Emit("player.nobody", noEvt, 1),
+                L"Client Emit on an unregistered event must report no handler ran.");
+
+            int a[] = { 7 };
+            int b[] = { 9, 2 };
+            Assert::IsTrue(mods.Emit("player.spawn", a, 1), L"Client spawn handler did not run.");
+            Assert::IsTrue(mods.Emit("player.spawn", a, 1), L"Client spawn handler did not run a 2nd time.");
+            Assert::IsTrue(mods.Emit("player.kick", b, 2), L"Client kick handler did not run.");
+
+            Assert::AreEqual(2, mods.GetGlobalInt("spawns"), L"Client spawn handler ran the wrong number of times.");
+            Assert::AreEqual(1, mods.GetGlobalInt("kicks"), L"Client kick handler ran the wrong number of times.");
         }
     };
 
@@ -1622,6 +1870,75 @@ namespace NetworkTests
             w.EndProject();
             // version 16 => no drop-shadow block: no extra 1+4+4+4+4 bytes.
             Assert::IsTrue(w.GetData().size() > 0);
+        }
+
+        TEST_METHOD(WritePolygonEmitsValidChunk)
+        {
+            // The FrontendPolygon (0x18009) chunk the loader reads: name,
+            // version, translucency, numPoints, [x,y,z] per point, [colour] per
+            // point. Verify the writer lays those fields out in the loader order.
+            P3DWriter w;
+            w.BeginProject("p", 640, 480, "pc", "", "", "");
+            w.BeginScreen("s", 1, 0);
+            w.EndScreen();
+            w.BeginPage("page", 1, 640, 480);
+            w.BeginLayer("l", 1, true, true, 255);
+            const float pts[6] = { 0, 0, 0, 100, 0, 50 };
+            const uint32_t cols[2] = { 0xFFFF0000u, 0xFF00FF00u };
+            w.WritePolygon("tri", 1, 128, pts, cols, 2);
+            w.EndPolygon();
+            w.EndLayer();
+            w.EndPage();
+            w.EndProject();
+
+            // Find the POLYGON chunk (0x18009) anywhere in the generated file (it lives
+            // several levels deep: DATA_FILE > PROJECT > SCREEN > PAGE > LAYER).
+            // Recurse through declared chunk lengths like the mini-reader in
+            // WritesValidChunkHierarchy.
+            const std::vector<char>& data = w.GetData();
+            auto readU32 = [&](size_t p) -> uint32_t {
+                if (p + 4 > data.size()) return 0;
+                return (static_cast<unsigned char>(data[p]))
+                    | (static_cast<unsigned char>(data[p + 1]) << 8)
+                    | (static_cast<unsigned char>(data[p + 2]) << 16)
+                    | (static_cast<unsigned char>(data[p + 3]) << 24);
+            };
+            bool found = false;
+            std::function<void(size_t)> walk = [&](size_t start) {
+                if (start + 12 > data.size()) return;
+                uint32_t id = readU32(start);
+                uint32_t dataL = readU32(start + 4);
+                uint32_t chunkL = readU32(start + 8);
+                if (chunkL == 0 || start + chunkL > data.size()) return;
+
+                if (id == 0x18009)
+                {
+                    found = true;
+                    // name (Pascal), version u32, translucency u32, numPoints u32.
+                    size_t p = start + 12;
+                    unsigned nameLen = static_cast<unsigned char>(data[p]);
+                    p += 1 + nameLen;
+                    Assert::AreEqual(1u, readU32(p), L"Polygon version mismatch.");
+                    Assert::AreEqual(128u, readU32(p + 4), L"Polygon translucency mismatch.");
+                    Assert::AreEqual(2u, readU32(p + 8), L"Polygon numPoints mismatch.");
+                    // 2 points * 3 floats = 24 bytes, then 2 colours.
+                    Assert::IsTrue(chunkL >= 12 + 1 + nameLen + 4 + 4 + 4 + 24 + 8, L"Polygon chunk too short.");
+                    return;
+                }
+
+                // Recurse into sub-chunks within this chunk's span.
+                size_t substart = start + dataL;
+                size_t p2 = substart;
+                while (p2 + 12 <= start + chunkL) {
+                    uint32_t childL = readU32(p2 + 8);
+                    if (childL == 0 || p2 + childL > start + chunkL) break;
+                    walk(p2);
+                    if (found) return;
+                    p2 += childL;
+                }
+            };
+            walk(0);
+            Assert::IsTrue(found, L"POLYGON chunk (0x18009) not found in writer output.");
         }
     };
 }

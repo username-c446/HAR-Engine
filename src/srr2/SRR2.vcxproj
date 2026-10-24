@@ -1089,6 +1089,7 @@
     <ClCompile Include="..\game\network\MissionSyncState.cpp" />
 <ClCompile Include="..\game\network\NetworkMatchManager.cpp" />
     <ClCompile Include="..\game\network\NetworkConsoleCommands.cpp" />
+    <ClCompile Include="..\game\network\ClientModManager.cpp" />
     <ClCompile Include="..\game\network\ServerModManager.cpp" />
 <ClCompile Include="..\game\netengine\Packet.cpp" />
  <ClCompile Include="..\game\netengine\PacketRegistry.cpp" />

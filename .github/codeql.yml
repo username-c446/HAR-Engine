@@ -1,0 +1,27 @@
+name: "HAR-Engine CodeQL config"
+
+# Scope the scan to the engine/game sources the project owns. The inherited
+# game libraries under src/libs and src/game/sound produced only false-positive
+# use-after-free / overflow findings that were triaged and dismissed on
+# 2026-10-24; excluding them keeps the alert list meaningful.
+
+queries:
+  - uses: security-and-quality
+
+paths:
+  - src/game/main
+  - src/game/netengine
+  - src/game/network
+  - src/game/presentation
+  - src/game/contexts
+  - src/libs/pure3d
+
+paths-ignore:
+  - src/libs/radcore
+  - src/libs/radmath
+  - src/libs/radsound
+  - src/libs/scrooby
+  - src/libs/sim
+  - src/game/sound
+  - deps
+  - tools/vcpkg
