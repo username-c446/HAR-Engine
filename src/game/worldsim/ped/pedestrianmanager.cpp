@@ -1271,10 +1271,10 @@ void PedestrianManager::HandleEvent( EventEnum id, void* pEventData )
         {
             static const float TRIGGER_PANIC_RADIUS_SQR = 144.0f;
 
-            // Get player data
-            Avatar* player = GetAvatarManager()->GetAvatarForPlayer(0);
-            rmt::Vector playerPos;
-            player->GetPosition( playerPos );
+            // For any ped nearby an active player, make him run away. Loop over
+            // every avatar (not just player 0) so a reaction fires around any
+            // connected player in the match.
+            int nAvatars = GetAvatarManager()->GetNumAvatars();
 
             // for any ped nearby, make him run away... 
             int i = mActivePeds.GetHead();
@@ -1287,11 +1287,18 @@ void PedestrianManager::HandleEvent( EventEnum id, void* pEventData )
                 {
                     rmt::Vector pedPos;
                     pedStr->ped->GetCharacter()->GetPosition( pedPos );
-                    float distSqr = (playerPos - pedPos).MagnitudeSqr();
-
-                    if( distSqr < TRIGGER_PANIC_RADIUS_SQR )
+                    for( int a = 0; a < nAvatars; a++ )
                     {
-                        pedStr->ped->IncitePanic();
+                        Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( a );
+                        if( avatar == NULL ) continue;
+                        rmt::Vector playerPos;
+                        avatar->GetPosition( playerPos );
+                        float distSqr = (playerPos - pedPos).MagnitudeSqr();
+                        if( distSqr < TRIGGER_PANIC_RADIUS_SQR )
+                        {
+                            pedStr->ped->IncitePanic();
+                            break;
+                        }
                     }
                 }
                 i = mActivePeds.GetNextOf( i );

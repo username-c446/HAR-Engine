@@ -402,8 +402,7 @@ Solving_Answer RedBrickCollisionSolverAgent::PreCollisionEvent(Collision& inColl
                 }
                 else
                 {
-                    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                    if(playerAvatar->GetVehicle() == vehicle)
+                    if(GetAvatarManager()->GetAvatarForVehicle( vehicle ) != NULL)
                     {
                         GetEventManager()->TriggerEvent( EVENT_HIT_MOVEABLE, (void*)simStateB );
                     }
@@ -428,8 +427,7 @@ Solving_Answer RedBrickCollisionSolverAgent::PreCollisionEvent(Collision& inColl
                 }
                 else
                 {
-                    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                    if(playerAvatar->GetVehicle() == vehicle)
+                    if(GetAvatarManager()->GetAvatarForVehicle( vehicle ) != NULL)
                     {
                         GetEventManager()->TriggerEvent( EVENT_HIT_MOVEABLE, (void*)simStateA );
                     }

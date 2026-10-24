@@ -14,6 +14,8 @@
 //========================================
 // Foundation Tech
 #include <raddebug.hpp>
+#include <float.h>
+#include <ai/state.h>
 
 //========================================
 // Project Includes
@@ -491,19 +493,43 @@ Avatar* AvatarManager::GetAvatarForVehicle(Vehicle* vehicle)
 //=============================================================================
 bool AvatarManager::IsAvatarGettingInOrOutOfCar(int playerId)
 {
-   if (     
-       GetAvatarForPlayer(0)->GetCharacter()->GetStateManager()->GetState() == CharacterAi::GET_IN
-            ||
-                GetAvatarForPlayer(0)->GetCharacter()->GetStateManager()->GetState() == CharacterAi::GET_OUT
-       )
-
-   {
-       return true;
-   }
-   else
+   if ( playerId < 0 || playerId >= mNumAvatars || GetAvatarForPlayer( playerId ) == NULL )
    {
        return false;
    }
+   CharacterAi::CharacterState s = GetAvatarForPlayer( playerId )->GetCharacter()->GetStateManager()->GetState();
+   return ( s == CharacterAi::GET_IN || s == CharacterAi::GET_OUT );
+}
+
+//=============================================================================
+// AvatarManager::FindNearestAvatar
+//=============================================================================
+// Description: Returns the active avatar closest to `position`, optionally
+//              excluding one player id (so an AI can target "another" player).
+//              NULL if there are no matching avatars.
+//
+// Parameters:  position       - world position to measure distance from
+//              ignorePlayerId - if >= 0, this player's avatar is skipped
+//
+// Return:      Avatar*        - nearest, or NULL
+//=============================================================================
+Avatar* AvatarManager::FindNearestAvatar( const rmt::Vector& position, int ignorePlayerId )
+{
+    Avatar* best = NULL;
+    float bestDist = FLT_MAX;
+    for ( int i = 0; i < mNumAvatars; i++ )
+    {
+        if ( i == ignorePlayerId ) continue;
+        Avatar* a = mAvatarArray[ i ];
+        Character* ch = a->GetCharacter();
+        if ( ch == NULL ) continue;
+        rmt::Vector p;
+        ch->GetPosition( p );
+        float dx = position.x - p.x, dy = position.y - p.y, dz = position.z - p.z;
+        float d = dx*dx + dy*dy + dz*dz;
+        if ( d < bestDist ) { bestDist = d; best = a; }
+    }
+    return best;
 }
 
             

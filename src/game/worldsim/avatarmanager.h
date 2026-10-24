@@ -55,6 +55,18 @@ public:
     Avatar* GetAvatarForVehicle(Vehicle* vehicle);
 
     Avatar* FindAvatarForCharacter( Character* pCharacter );
+
+    // Number of currently active player avatars in this process. This is the
+    // multiplayer-aware iteration bound: NPC/traffic systems should loop
+    // `0..GetNumAvatars()-1` instead of hard-coding `GetAvatarForPlayer(0)` so
+    // the world reacts around every connected player, not just player 0.
+    int GetNumAvatars() const { return mNumAvatars; }
+
+    // Nearest active avatar to a world position (or NULL if none). Used by AI
+    // that must pick "the player to target/react to" when there are several
+    // players in the match. Optionally ignores a specific id (e.g. the caller's
+    // own avatar) so a reaction targets another player.
+    Avatar* FindNearestAvatar( const rmt::Vector& position, int ignorePlayerId = -1 );
     
     void PutCharacterInCar( Character* pCharacter, Vehicle* pVehicle );
     void PutCharacterOnGround( Character* pCharacter, Vehicle* pVehicle );

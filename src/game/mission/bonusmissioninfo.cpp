@@ -394,9 +394,10 @@ void BonusMissionInfo::Update( unsigned int milliseconds )
         }
 
         //
-        // Test if the avatar is near the position
-        //
-        Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+// Test if any avatar is near the position
+        Avatar* avatar = GetAvatarManager()->FindNearestAvatar( charPos );
+        if ( avatar != NULL )
+        {
         rmt::Vector avatarPosition;
         avatar->GetPosition( avatarPosition );
         float distSquared = ( charPos - avatarPosition ).MagnitudeSqr();
@@ -406,6 +407,7 @@ void BonusMissionInfo::Update( unsigned int milliseconds )
                 EVENT_BONUS_MISSION_CHARACTER_APPROACHED, 
                 GetMissionManager()->GetMission(GetMissionNum()) 
             );
+        }
         }
 
         if ( mIcon )

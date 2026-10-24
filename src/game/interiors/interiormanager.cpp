@@ -525,8 +525,7 @@ protected:
         //
         // Not getting good position info here.  Play from avatar position
         //
-        Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer(0);
-        rAssert(avatar != NULL);  //NIGEL - I put this assert in for you! love Ian.
+        Avatar* avatar = GetAvatarManager()->FindNearestAvatar( rmt::Vector(0.0f,0.0f,0.0f) );
 
         if (avatar != NULL)
         {

@@ -248,7 +248,7 @@ void SoundDebugDisplay::Render()
         //
         // Get the avatar position
         //
-        theAvatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+        theAvatar = GetAvatarManager()->FindNearestAvatar( rmt::Vector(0,0,0) );
         if( theAvatar != NULL )
         {
             //

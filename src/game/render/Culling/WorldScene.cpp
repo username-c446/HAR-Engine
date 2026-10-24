@@ -1516,7 +1516,8 @@ END_PROFILE("list construction")
 
     int activeArea = -1;
 
-    Avatar* av = GetAvatarManager()->GetAvatarForPlayer(0);
+    Avatar* av = GetAvatarManager()->FindNearestAvatar( rmt::Vector(0,0,0) );
+    if ( av == NULL ) return;
     Vehicle* v = av->GetVehicle();
     Character* c = av->GetCharacter();
     if(v)

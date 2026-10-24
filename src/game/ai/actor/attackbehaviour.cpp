@@ -86,13 +86,14 @@ AttackBehaviour::Apply( Actor* actor, unsigned int timeInMS )
 
 
     rmt::Vector targetPos;
-    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer(0);
-    Character* character = avatar->GetCharacter();
-    avatar->GetPosition( targetPos );
-    targetPos.y += AVG_CHARACTER_HEIGHT; // Lets not lock onto their feet
-
     rmt::Vector actorPos;
     actor->GetPosition( &actorPos );
+    Avatar* avatar = GetAvatarManager()->FindNearestAvatar( actorPos );
+    if ( avatar == NULL ) return;
+    Character* character = avatar->GetCharacter();
+    if ( character == NULL ) return;
+    avatar->GetPosition( targetPos );
+    targetPos.y += AVG_CHARACTER_HEIGHT; // Lets not lock onto their feet
     int currentAnimationState = actor->GetState();              
     actor->LookAt( targetPos, timeInMS );
     // Are we firing? Then just keep trained on the target and

@@ -132,7 +132,7 @@ void GetOutOfCarCondition::HandleEvent( EventEnum id, void* pEventData )
 
         //check to see if the Charactar bailing out of the car is a PC or NPC
         //if its a NPC then this condition should not apply to them
-        if ( whichCharacter != GetAvatarManager()->GetAvatarForPlayer(0)->GetCharacter())
+        if ( GetAvatarManager()->FindAvatarForCharacter( whichCharacter ) == NULL )
         {
             return;
         }

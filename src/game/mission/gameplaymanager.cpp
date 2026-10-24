@@ -680,10 +680,12 @@ void GameplayManager::PlaceVehicleAtLocator( Vehicle* vehicle,
     
     // 1 day later...
     // you fucking retard, only do this if you are not the users car...
-    if(GetAvatarManager()->GetAvatarForPlayer(0))
+    for ( int p = 0; p < GetAvatarManager()->GetNumAvatars(); ++p )
     {
-        Vehicle* playersCar = GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle();
-        
+        Avatar* av = GetAvatarManager()->GetAvatarForPlayer( p );
+        if ( av == NULL ) continue;
+        Vehicle* playersCar = av->GetVehicle();
+
         if(playersCar == NULL)
         {
             playersCar = this->GetCurrentVehicle();
@@ -694,6 +696,7 @@ void GameplayManager::PlaceVehicleAtLocator( Vehicle* vehicle,
             if(TestProximityToUsersCarAndNudgeUpIfNecessaryDamnUglyHack(pos, playersCar))
             {
                 pos.y += 2.0f;
+                break;   // nudged once; don't stack
             }
         }                
         
@@ -1831,8 +1834,7 @@ void GameplayManager::ClearVehicleSlotIfInSphere( eCarSlots slot, const rmt::Sph
 {
     Vehicle* vehicle = GetVehicleInSlot( slot );
     rmt::Vector position;
-    if( vehicle != NULL &&
-        GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() != vehicle )
+    if( vehicle != NULL && GetAvatarManager()->GetAvatarForVehicle( vehicle ) == NULL )
     {
         vehicle->GetPosition( &position );
         bool isVehicleInSphere = s.Contains( position );
@@ -3114,25 +3116,32 @@ int  GameplayManager::UpdateVDU()
     }
     else
     {
-        rmt::Vector CharacterPositionStart;
-        GetAvatarManager()->GetAvatarForPlayer(0)->GetCharacter()->GetPosition(CharacterPositionStart);
-
         for(int i=0;i<MAX_VDU_CARS;i++)
         {
             if (mVDU.mpVehicle[i] != NULL)
             {
                 rmt::Vector position;
-                rmt::Vector CarPositionDifference;
-
                 mVDU.mpVehicle[i]->GetPosition(&position);
-                mVDU.mpVehicle[i]->GetPosition(&CarPositionDifference);
-                
-                CarPositionDifference.Sub(CharacterPositionStart);
 
-                //dont care about the y vaule since we are going to just do a top down radial check
-                CarPositionDifference.y =0;                
-                //chuck: remove the car if it is out of the players view and greater than 5.0 meters from player
-                if ((spInstance->TestPosInFrustrumOfPlayer(position,0) == false) && (rmt::Sqrt(CarPositionDifference.MagnitudeSqr()) > 5.0f))
+                // remove a VDU car only if it is out of EVERY player's view and >5m from every avatar
+                bool removeVduCar = true;
+                for ( int p = 0; p < GetAvatarManager()->GetNumAvatars() && removeVduCar; ++p )
+                {
+                    Avatar* pAvatar = GetAvatarManager()->GetAvatarForPlayer( p );
+                    rmt::Vector CharacterPositionStart( 0.0f, 0.0f, 0.0f );
+                    if ( pAvatar != NULL ) pAvatar->GetCharacter()->GetPosition( CharacterPositionStart );
+
+                    rmt::Vector CarPositionDifference;
+                    CarPositionDifference.Sub( position, CharacterPositionStart );
+                    CarPositionDifference.y = 0; // top-down radial check only
+
+                    bool inFrustrum = spInstance->TestPosInFrustrumOfPlayer( position, p );
+                    if ( inFrustrum || ( rmt::Sqrt( CarPositionDifference.MagnitudeSqr() ) <= 5.0f ) )
+                    {
+                        removeVduCar = false;
+                    }
+                }
+                if ( removeVduCar )
                 {
                     GetVehicleCentral()->RemoveVehicleFromActiveList(mVDU.mpVehicle[i]);
 

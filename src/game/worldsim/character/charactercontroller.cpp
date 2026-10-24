@@ -673,10 +673,11 @@ void NPCController::Update( float seconds )
             //
             rmt::Vector playerPos, myPos, myFacing;
 
-            Avatar* avatar = ::GetAvatarManager()->GetAvatarForPlayer(0);
-            avatar->GetPosition( playerPos );
-
             mpCharacter->GetPosition( &myPos );
+
+            Avatar* avatar = ::GetAvatarManager()->FindNearestAvatar( myPos );
+            if ( avatar ) avatar->GetPosition( playerPos );
+            else playerPos = myPos;
 
             mpCharacter->GetFacing( myFacing );
             //rAssert( rmt::Epsilon( myFacing.MagnitudeSqr(), 1.0f, 0.001f ) );
@@ -889,9 +890,9 @@ void NPCController::Update( float seconds )
             mSecondsChangePanicDir += seconds;
             if( mSecondsChangePanicDir > SECONDS_BETW_PANIC_CHANGE_DIRECTION )
             {
-                Avatar* player = GetAvatarManager()->GetAvatarForPlayer( 0 );
-                rAssert( player );
-
+                Avatar* player = GetAvatarManager()->FindNearestAvatar( myPos );
+                if ( player )
+                {
                 rmt::Vector playerPos;
                 player->GetPosition( playerPos );
 
@@ -915,11 +916,12 @@ void NPCController::Update( float seconds )
 
                 awayFromPlayer.NormalizeSafe(); // *** SQUARE ROOT! ***
 
-                mNormalizedPanicDir = awayFromPlayer;
+mNormalizedPanicDir = awayFromPlayer;
                 mSecondsChangePanicDir = 0.0f;
-            }
-            SetDirection( mNormalizedPanicDir );
 
+                SetDirection( mNormalizedPanicDir );
+                }
+            }
         }
         break;
     case TALKING_WITH_PLAYER: // fall thru
@@ -1141,8 +1143,10 @@ void NPCController::DetectAndDodge( float seconds )
         // ok, we're stopped, but are they're still coming?
         else 
         {
-            Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-            rAssert( avatar != NULL );
+            rmt::Vector myPos;
+            mpCharacter->GetPosition( myPos );
+            Avatar* avatar = GetAvatarManager()->FindNearestAvatar( myPos );
+            if ( avatar == NULL ) return;
 
             if( hisVel > epsilon ) // we're already stopped, but he's still coming
             {
@@ -1222,7 +1226,9 @@ void NPCController::TraversePath( float seconds )
 
     // if player not close enough, don't bother to do this...
     rmt::Vector playerPos;
-    GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( playerPos );
+    Avatar* nearestP = GetAvatarManager()->FindNearestAvatar( myPos );
+    if ( nearestP != NULL ) nearestP->GetPosition( playerPos );
+    else playerPos = myPos;
     
     const float DIST_PLAYER_TOO_FAR_TO_BOTHER_SQR = 22500.0f;
     if( (playerPos-myPos).MagnitudeSqr() >= DIST_PLAYER_TOO_FAR_TO_BOTHER_SQR )
@@ -1307,8 +1313,9 @@ bool NPCController::Detect( float seconds, float& hisVel )
     //////////////////////////////////////
     // Information about player
     //////////////////////////////////////
-    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-    rAssert( avatar != NULL );
+    mpCharacter->GetPosition( myPos );
+    Avatar* avatar = GetAvatarManager()->FindNearestAvatar( myPos );
+    if ( avatar == NULL ) return false;
     avatar->GetPosition( playerPos );
     float playerCollisionRadius = 
         (avatar->IsInCar())? VEHICLE_SPAN_METERS : CHARACTER_SPAN_METERS;
@@ -1496,14 +1503,16 @@ void NPCController::PerformCringe( )
     rmt::Vector myPos, playerPos;
     mpCharacter->GetPosition( myPos );
     
-    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-    rAssert( avatar != NULL );
+    Avatar* avatar = GetAvatarManager()->FindNearestAvatar( myPos );
+    if ( avatar != NULL )
+    {
     avatar->GetPosition( playerPos );
 
     rmt::Vector toPlayer = playerPos - myPos;
     toPlayer.Normalize(); // *** SQUARE ROOT! ***
 
     SetDirection( toPlayer );
+    }
 }
 
 void NPCController::PerformDodge( )
@@ -1594,11 +1603,11 @@ void NPCController::TransitToState( State state )
             mpCharacter->SetSpeed( mSpeedMps );
             mSecondsChangePanicDir = 0.0f;
 
-            Avatar* player = GetAvatarManager()->GetAvatarForPlayer( 0 );
-            rAssert( player );
-
             rmt::Vector myPos, playerPos;
             mpCharacter->GetPosition( myPos );
+
+            Avatar* player = GetAvatarManager()->FindNearestAvatar( myPos );
+            if ( player == NULL ) return;
             player->GetPosition( playerPos );
 
             rmt::Vector awayFromPlayer = myPos - playerPos;

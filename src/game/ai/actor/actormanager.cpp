@@ -342,20 +342,20 @@ ActorManager::WithinAliveRange( int index )
 
     rmt::Vector position;
     actor->GetPosition( &position );
-    // Get the avatar position;
-    Avatar* currAvatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-    rmt::Vector currAvatarPos;     
-    currAvatar->GetPosition( currAvatarPos );
-    // calc distance
-    float distSqr = (currAvatarPos - position).MagnitudeSqr();
-    if ( distSqr < ActorRemovalRangeSqr )
+
+    // The actor stays alive if it is near ANY active player in the match.
+    AvatarManager* am = GetAvatarManager();
+    bool alive = false;
+    for ( int p = 0; p < am->GetNumAvatars() && !alive; ++p )
     {
-        withinRange = true;
+        Avatar* currAvatar = am->GetAvatarForPlayer( p );
+        if ( currAvatar == NULL ) continue;
+        rmt::Vector currAvatarPos;
+        currAvatar->GetPosition( currAvatarPos );
+        float distSqr = (currAvatarPos - position).MagnitudeSqr();
+        if ( distSqr < ActorRemovalRangeSqr ) alive = true;
     }
-    else
-    {
-        withinRange = false;
-    }
+    withinRange = alive;
     return withinRange;
 }
 

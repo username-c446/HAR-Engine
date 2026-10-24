@@ -94,13 +94,14 @@ AttractionBehaviour::Apply( Actor* actor, unsigned int timeInMS )
     FlyingActor* flyingactor = static_cast< FlyingActor* >( actor );
     flyingactor->SetDesiredHeightEnabled( false );
 
-    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer(0);
-    rAssert( avatar != NULL );
+    rmt::Vector actorPosition;
+    actor->GetPosition( &actorPosition );
+
+    Avatar* avatar = GetAvatarManager()->FindNearestAvatar( actorPosition );
+    if ( avatar == NULL ) return;
 
     rmt::Vector avatarPosition;
     avatar->GetPosition( avatarPosition );
-    rmt::Vector actorPosition;
-    actor->GetPosition( &actorPosition );
 
     if ( m_ForceFindNewWatchPosition )
     {
@@ -195,8 +196,16 @@ AttractionBehaviour::HandleEvent( EventEnum id, void* pEventData )
         {
             if ( m_ParentActor != NULL )
             {
-                Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                if ( WithinSensoryRange( *m_ParentActor, *avatar ) )
+                // React if the event came from any player within sensory range.
+                bool anyPlayerInRange = false;
+                AvatarManager* am = GetAvatarManager();
+                for ( int p = 0; p < am->GetNumAvatars() && !anyPlayerInRange; ++p )
+                {
+                    Avatar* avatar = am->GetAvatarForPlayer( p );
+                    if ( avatar != NULL && WithinSensoryRange( *m_ParentActor, *avatar ) )
+                        anyPlayerInRange = true;
+                }
+                if ( anyPlayerInRange )
                 {
                     switch (m_CurrentState)
                     {

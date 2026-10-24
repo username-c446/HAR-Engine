@@ -7,6 +7,7 @@
 #include "ServerModManager.h"
 #include "ClientModManager.h"
 #include "MissionSyncState.h"
+#include "WorldEvent.h"
 #include "MissionSyncManager.h"
 #include "../game/netengine/Packet.h"
 #include "../game/netengine/PacketRegistry.h"
@@ -1939,6 +1940,85 @@ namespace NetworkTests
             };
             walk(0);
             Assert::IsTrue(found, L"POLYGON chunk (0x18009) not found in writer output.");
+        }
+    };
+
+    TEST_CLASS(WorldEventTests)
+    {
+    public:
+        TEST_METHOD(WorldEventCodecRoundTripsPayload)
+        {
+            // The codec wraps a type + origin + opaque payload in the PID_USER
+            // channel envelope. Verify encode->decode round-trips the fields.
+            const uint8_t payload[5] = { 1, 2, 3, 4, 5 };
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_STATEPROP, 0x2A, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should write header+payload.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_STATEPROP, L"Type must round-trip.");
+            Assert::IsTrue(d.originPeer == 0x2A, L"Origin peer must round-trip.");
+            Assert::IsTrue(d.payloadSize == sizeof(payload), L"Payload size must round-trip.");
+            for (uint16_t i = 0; i < sizeof(payload); ++i)
+                Assert::IsTrue(d.payload[i] == payload[i], L"Payload bytes must round-trip.");
+        }
+
+        TEST_METHOD(WorldEventRejectsTruncatedOrOversize)
+        {
+            // Truncated (header only, missing payload) must decode as invalid.
+            const uint8_t payload[3] = { 9, 8, 7 };
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_BREAKABLE, 1, payload, sizeof(payload));
+            auto trunc = net::WorldEventCodec::Decode(buf, net::WORLD_EVENT_HEADER_SIZE + 1);
+            Assert::IsFalse(trunc.valid, L"Truncated event must decode invalid.");
+
+            // Oversize payload (over MAX_PACKET_PAYLOAD) must be refused at encode.
+            uint8_t big[net::MAX_PACKET_PAYLOAD];
+            uint16_t m = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_COIN_COLLECTED, 1,
+                                                      big, net::MAX_PACKET_PAYLOAD);
+            Assert::IsTrue(n > 0, L"First encode should have succeeded (3-byte payload).");
+            Assert::IsTrue(m == 0, L"Oversize encode must return 0.");
+        }
+
+        TEST_METHOD(WorldEventRelaysBetweenSessionsThroughOpenChannel)
+        {
+            // End-to-end: a world event encoded via NetworkMatchManager's
+            // SendWorldEvent must reach the other session's sink through the
+            // open PID_USER relay (host->joiner and joiner->host).
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA55));
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            // Host -> joiner: register sink on joiner, send from host.
+            int joinerGot = 0;
+            uint8_t joinerType = 0;
+            joiner.SetCustomEventSink([&](net::PeerId from, const uint8_t* data, uint16_t size) {
+                auto d = net::WorldEventCodec::Decode(data, size);
+                if (!d.valid) return;
+                joinerGot++;
+                joinerType = static_cast<uint8_t>(d.type);
+            });
+
+            uint8_t payload[2] = { 0xEE, 0x01 };
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_VEHICLE_DESTROYED,
+                                                      static_cast<uint16_t>(host.GetLocalPeerId()),
+                                                      payload, sizeof(payload));
+            Assert::IsTrue(n > 0);
+            Assert::IsTrue(host.SendCustomEvent(buf, n), L"Host SendCustomEvent failed.");
+
+            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the host's world event.");
+            Assert::IsTrue(joinerType == static_cast<uint8_t>(net::WE_VEHICLE_DESTROYED),
+                           L"Joiner should see WE_VEHICLE_DESTROYED type.");
+
+            joiner.Leave();
+            host.Leave();
         }
     };
 }

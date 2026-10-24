@@ -1743,45 +1743,47 @@ void MissionStage::Update(unsigned int elapsedTime)
         }
     }
 
-    Vehicle* p_vehicle = NULL;
-    //get players p1 position
-    p_vehicle = GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle();
-
-    //player must be the car for safezone check
-    if (p_vehicle != NULL)
+    // Safe-zone relief: any player inside a safe zone quiets the world's chase
+    // AI; chases resume only once every player has left all safe zones.
+    bool anyPlayerInCar = false;
+    bool anyInsideSafeZone = false;
+    AvatarManager* am_zone = GetAvatarManager();
+    for ( int pz = 0; pz < am_zone->GetNumAvatars(); ++pz )
     {
+        Avatar* av_zone = am_zone->GetAvatarForPlayer( pz );
+        if ( av_zone == NULL ) continue;
+        Vehicle* p_vehicle = av_zone->GetVehicle();
+        if ( p_vehicle == NULL ) continue;
+        anyPlayerInCar = true;
+        rmt::Vector player_position;
+        p_vehicle->GetPosition(&player_position);
 
-        //check if the player car is inside the safezones for this stage.
         for (int i = 0; i < MAX_SAFEZONES; i++)
         {
-            Vehicle* p_vehicle = NULL;
-            //get players p1 position
-            p_vehicle = GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle();
-            rmt::Vector player_position;
-            p_vehicle->GetPosition(&player_position);
-
-            if (m_SafeZone_Array[i] != NULL)
+            if (m_SafeZone_Array[i] != NULL && m_SafeZone_Array[i]->InsideZone(player_position))
             {
-                //if true and false
-                if (m_SafeZone_Array[i]->InsideZone(player_position) && (mb_InsideSafeZone == false))
-                {
-                    //player has entered safezone
-                    GetGameplayManager()->DisableAllChaseAI();
-                    mb_InsideSafeZone = true;
-                }
+                anyInsideSafeZone = true;
+                break;
+            }
+        }
+        if ( anyInsideSafeZone ) break;
+    }
 
-
-                //if false and true
-                if ((m_SafeZone_Array[i]->InsideZone(player_position) == false) && (mb_InsideSafeZone))
-                {
-                    //just left the safezone
-                    GetGameplayManager()->EnableAllChaseAI();
-                    mb_InsideSafeZone = false;
-                }
-
-            } //end if check if safezone isnt null
-        }//end for loop to check safezones
-    }//end if player is inside their car
+    if ( anyPlayerInCar )
+    {
+        if ( anyInsideSafeZone && (mb_InsideSafeZone == false))
+        {
+            //a player has entered a safe zone
+            GetGameplayManager()->DisableAllChaseAI();
+            mb_InsideSafeZone = true;
+        }
+        if ( !anyInsideSafeZone && (mb_InsideSafeZone))
+        {
+            //all players have left the safe zones
+            GetGameplayManager()->EnableAllChaseAI();
+            mb_InsideSafeZone = false;
+        }
+    }
 
     //Chuck: Disable player control of car while count down is in progress.
     if (mbDisablePlayerControlForCountDown == true)

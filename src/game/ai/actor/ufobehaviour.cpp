@@ -186,7 +186,8 @@ UFOBehaviour::SuckIntoUFO( const rmt::Vector& actorPosition, DynaPhysDSG* pDSG, 
 				}
 				if(vehicle->IsUserDrivingCar())
 				{
-					Character* c = GetAvatarManager()->GetAvatarForPlayer(0)->GetCharacter();
+					Avatar* driverAvatar = GetAvatarManager()->GetAvatarForVehicle( vehicle );
+					Character* c = driverAvatar ? driverAvatar->GetCharacter() : NULL;
 					if(c)
 					{
 				        c->GetActionController()->Clear();
@@ -284,9 +285,10 @@ UFOBehaviour::DestroyObject( DynaPhysDSG* object )
                 characterAbducted = true;
                 // Lets set a default spawn position since the designers aren't here
                 SetCharacterRespawnPosition( p3d::find< EventLocator >( "Z3D1" ) );
-                Character* character = GetAvatarManager()->GetAvatarForPlayer(0)->GetCharacter();
-                rAssert( character!= NULL );
-                GetAvatarManager()->PutCharacterOnGround(character, vehicle);
+                Avatar* driverAvatar = GetAvatarManager()->GetAvatarForVehicle( vehicle );
+                Character* character = driverAvatar ? driverAvatar->GetCharacter() : NULL;
+                rAssert( character != NULL );
+                if ( character ) GetAvatarManager()->PutCharacterOnGround(character, vehicle);
                 m_RespawnLocator->Trigger( 0, true );
             }   
             else

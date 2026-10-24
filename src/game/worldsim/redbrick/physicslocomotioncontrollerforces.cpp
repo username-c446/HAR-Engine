@@ -638,7 +638,7 @@ void PhysicsLocomotion::GasForce2(rmt::Vector& forceResult, int wheelNum, float 
             mVehicle->mDoSpeedBurst = false;
         }
 
-        if(GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() == mVehicle)
+        if(GetAvatarManager()->GetAvatarForVehicle( mVehicle ) != NULL)
         {
             if(GetCheatInputSystem()->IsCheatEnabled(CHEAT_ID_HIGH_ACCELERATION))
             {

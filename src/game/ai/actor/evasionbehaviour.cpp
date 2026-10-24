@@ -66,7 +66,11 @@ void
 EvasionBehaviour::Apply( Actor* actor, unsigned int timeInMS )
 {
 
-    Avatar* currAvatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+    rmt::Vector actorPos;
+    actor->GetPosition( &actorPos );
+
+    Avatar* currAvatar = GetAvatarManager()->FindNearestAvatar( actorPos );
+    if ( currAvatar == NULL ) return;
     rmt::Vector currAvatarPos;     
     currAvatar->GetPosition( currAvatarPos );
 
@@ -79,9 +83,7 @@ EvasionBehaviour::Apply( Actor* actor, unsigned int timeInMS )
     }
     else
     {
-        // Get distance to player
-        Avatar* currAvatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-        rmt::Vector currAvatarPos;     
+        // Reuse the nearest avatar resolved above
         currAvatar->GetPosition( currAvatarPos );
 
         rmt::Vector actorPosition;

@@ -13,5 +13,6 @@
 #include "../game/netengine/Packet.h"
 #include "PlayerNetworkState.h"
 #include "NetworkPacket.h"
+#include "../game/network/RemotePlayerManager.h"
 
 #include <cstdlib>

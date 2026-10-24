@@ -1454,8 +1454,9 @@ void GetOut::HandleEvent( EventEnum id, void* pUserData )
     {
         GetEventManager()->RemoveListener( this, EVENT_GUI_IRIS_WIPE_CLOSED );
 
-        Character* character = GetAvatarManager()->GetAvatarForPlayer( 0 )->GetCharacter();
-        Vehicle* car = GetAvatarManager()->GetAvatarForPlayer( 0 )->GetVehicle();
+        Character* character = mpCharacter;
+        Vehicle* car = character->GetTargetVehicle();
+        rAssert(car);
 
         GetEventManager()->TriggerEvent( EVENT_GETOUTOFVEHICLE_END, character );
 

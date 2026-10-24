@@ -206,19 +206,32 @@ void GetInObjective::OnUpdate( unsigned int elapsedTime )
 
     if(mStrict)
     {
-        if ( GetAvatarManager()->GetAvatarForPlayer( 0 )->GetVehicle() == vehicle  &&
-            GetCharacterManager()->GetCharacter( 0 )->GetStateManager()->GetState() == CharacterAi::INCAR )
+        // Objective completes when ANY player enters the required car.
+        bool entered = false;
+        AvatarManager* am = GetAvatarManager();
+        for ( int p = 0; p < am->GetNumAvatars() && !entered; ++p )
         {
-            SetFinished( true );
+            Avatar* a = am->GetAvatarForPlayer( p );
+            if ( a == NULL ) continue;
+            bool inCar = a->GetCharacter() &&
+                a->GetCharacter()->GetStateManager()->GetState() == CharacterAi::INCAR;
+            if ( a->GetVehicle() == vehicle && inCar ) entered = true;
         }
+        if ( entered ) SetFinished( true );
     }
     else
     {
-        if ( GetAvatarManager()->GetAvatarForPlayer( 0 )->GetVehicle() &&
-            GetCharacterManager()->GetCharacter( 0 )->GetStateManager()->GetState() == CharacterAi::INCAR )
+        bool enteredAny = false;
+        AvatarManager* am2 = GetAvatarManager();
+        for ( int p = 0; p < am2->GetNumAvatars() && !enteredAny; ++p )
         {
-            SetFinished( true );
+            Avatar* a = am2->GetAvatarForPlayer( p );
+            if ( a == NULL ) continue;
+            bool inCar = a->GetCharacter() &&
+                a->GetCharacter()->GetStateManager()->GetState() == CharacterAi::INCAR;
+            if ( a->GetVehicle() != NULL && inCar ) enteredAny = true;
         }
+        if ( enteredAny ) SetFinished( true );
     }
 }
 

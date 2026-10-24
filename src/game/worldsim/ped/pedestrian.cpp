@@ -98,7 +98,9 @@ void Pedestrian::Update( float seconds )
         GetCharacter()->GetPosition( &myPos );
 
         rmt::Vector playerPos;
-        GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( playerPos );
+        Avatar* nearestP = GetAvatarManager()->FindNearestAvatar( myPos );
+        if ( nearestP != NULL ) nearestP->GetPosition( playerPos );
+        else playerPos = myPos;
 
         const float MIN_DIST_SQR_FROM_PLAYER = 1225.0f;
         if( (myPos - playerPos).MagnitudeSqr() <= MIN_DIST_SQR_FROM_PLAYER ||
@@ -291,8 +293,8 @@ void Pedestrian::ActivateSelf()
 
     rmt::Vector playerPos, playerVel;
 
-    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-    rAssert( avatar != NULL );
+    Avatar* avatar = GetAvatarManager()->FindNearestAvatar( myPos );
+    if ( avatar == NULL ) return;
     avatar->GetPosition( playerPos );
 
     /*

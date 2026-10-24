@@ -3,6 +3,7 @@
 #include "PlayerNetworkState.h"
 #include "MissionSyncState.h"
 #include "RemotePlayerManager.h"   // placeholder; will be bridged from net::Session
+#include "WorldEvent.h"
 #include "../netengine/Session.h"
 #include "../netengine/GamePlayerBridge.h"
 
@@ -70,6 +71,34 @@ public:
     // Game::GetRandomSeed().
     unsigned int GetWorldSeed() const { return m_session ? m_session->GetWorldSeed() : 0; }
 
+    // ---- world event relay (over the open PID_USER channel) ----------------
+
+    // Broadcasts a shared-world event to all other peers (relayed server-side).
+    // The engine treats the payload as opaque bytes; WorldEventCodec adds the
+    // type tag + origin. Returns false if not in a match or the payload is too
+    // large. This is the mechanism for replicating destructible world state
+    // (broken props, destroyed vehicles, state transitions, coins).
+    bool SendWorldEvent(net::WorldEventType type, const uint8_t* payload, uint16_t payloadSize)
+    {
+        if (!m_session) return false;
+        uint8_t buf[net::MAX_PACKET_PAYLOAD];
+        uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), type,
+                                                  static_cast<uint16_t>(GetLocalClientId()),
+                                                  payload, payloadSize);
+        if (n == 0) return false;
+        return m_session->SendCustomEvent(buf, n);
+    }
+
+    // Registers the callback for inbound world events. Receives the decoded
+    // event (type + origin + payload). Self-echo is already filtered by the
+    // session's transport. If the session does not exist yet (e.g. called before
+    // StartHost/JoinHost), the sink is bound once the session is created.
+    void SetWorldEventSink(net::WorldEventCodec::InboundFn fn)
+    {
+        m_worldEventSink = std::move(fn);
+        if (m_session) ReattachWorldEventSink();
+    }
+
     // Drains the client's pending join/leave notifications. Empty unless we are
     // a joined client. Lets the UI print "Player connected/disconnected".
     void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);
@@ -86,6 +115,12 @@ private:
     NetworkMatchManager(const NetworkMatchManager&);
     NetworkMatchManager& operator=(const NetworkMatchManager&);
 
+    // Re-binds the (decoded) world-event sink to the session's custom-event
+    // channel. Called after the session is created in StartHost/JoinHost so the
+    // sink works even if SetWorldEventSink() was called before the session
+    // existed.
+    void ReattachWorldEventSink();
+
     static NetworkMatchManager* spInstance;
 
     // Bridge to the reusable engine network layer.
@@ -101,4 +136,7 @@ private:
     // Game-side authoritative remote set, fed by the bridge.
     RemotePlayerManager m_remotePlayers;
     mutable std::vector<JoinLeaveEvent> m_pendingEvents;
+
+    // Decoded world-event sink (see SetWorldEventSink).
+    net::WorldEventCodec::InboundFn m_worldEventSink;
 };

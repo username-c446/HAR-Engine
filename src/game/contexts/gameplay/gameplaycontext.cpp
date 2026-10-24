@@ -125,13 +125,29 @@ namespace
     // Scratch buffer for the auto-join command-line target (\-join <ip:port>).
     static char s_autoJoinIp[128];
 
-    // Local-state provider for the multiplayer layer: reads the primary player's
-    // live Avatar position/heading/vehicle from the game world.
+    // Local-state provider for the multiplayer layer: reads the local live Avatar
+    // position/heading/vehicle and publishes it to peers over the network.
+    //
+    // IMPORTANT (world-avatar index vs network peer-id — do not conflate them):
+    //  * The game world here is single-avatar per process: AvatarManager is sized
+    //    by GameplayManager::GetNumPlayers(), which the mission system fixes at 1
+    //    (missionmanager.cpp, `SetNumPlayers(1)`). So GetAvatarForPlayer(0) is the
+    //    ONE and only avatar of this process — it is the LOCAL player, whichever
+    //    machine this is. It is NOT "the host" by any network meaning.
+    //  * The network peer id of this process (net::Session::GetLocalPeerId(),
+    //    resolved from the server's WELCOME) is a DIFFERENT axis: it is 0 for the
+    //    host (host's loopback client connects first, ServerEndpoint assigns
+    //    m_nextPeerId++ in connect order) and 1,2,3... for joiners. It is used by
+    //    the bridge (GamePlayerBridge::m_selfId) ONLY to filter our own echo, and
+    //    must be pushed via NetworkMatchManager::Update -> SetLocalPeerId so a
+    //    client does not wrongly drop the host's state (peer id 0 == world index 0
+    //    is a coincidence of connect order, not a semantic link).
+    // See docs/MULTIPLAYER_SYNC_MANIFEST.ru.md, "Индекс аватара vs сетевой peer-id".
     bool GameplayLocalStateProvider( PlayerNetworkState& outState )
     {
         AvatarManager* am = GetAvatarManager();
         if ( am == NULL ) return false;
-        Avatar* avatar = am->GetAvatarForPlayer( 0 );
+        Avatar* avatar = am->GetAvatarForPlayer( 0 ); // the local (only) avatar of this process
         if ( avatar == NULL ) return false;
 
         rmt::Vector pos;

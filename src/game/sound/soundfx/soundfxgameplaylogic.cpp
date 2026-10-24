@@ -281,13 +281,22 @@ void SoundFXGameplayLogic::HandleEvent( EventEnum id, void* pEventData )
             break;
 
         case EVENT_CARD_COLLECTED:
+            {
             //
             // Only play card sound effect in car, the music system
             // handles it when on foot
             //
-            if( GetAvatarManager()->GetAvatarForPlayer( 0 )->IsInCar() )
+            bool anyInCar = false;
+            AvatarManager* am288 = GetAvatarManager();
+            for ( int p = 0; p < am288->GetNumAvatars() && !anyInCar; ++p )
+            {
+                Avatar* a = am288->GetAvatarForPlayer( p );
+                if ( a != NULL && a->IsInCar() ) anyInCar = true;
+            }
+            if( anyInCar )
             {
                 playSFXSound( "card_collect", false );
+            }
             }
             break;
 
@@ -496,11 +505,17 @@ void SoundFXGameplayLogic::handleCollisionEvent( SoundCollisionData* collisionDa
     // something
     //
 
-    //TODO (Cary):  I think that this should search the avatar manager for each vehicle in the
-    //collision pair (or always take A so that vehicles don't get doubled events) and test to
-    //see if the vehicle is user controlled.  The code as it is only sends events for player 0
-    //and won't work for multiplayer.
-    Vehicle* pVehicle = GetAvatarManager()->GetAvatarForPlayer( 0 )->GetVehicle();
+    //TEST: match collision objects to any player's vehicle (not just player 0).
+    Vehicle* pVehicle = NULL;
+    AvatarManager* am503 = GetAvatarManager();
+    for ( int p = 0; p < am503->GetNumAvatars() && pVehicle == NULL; ++p )
+    {
+        Avatar* a = am503->GetAvatarForPlayer( p );
+        if ( a == NULL ) continue;
+        Vehicle* avVeh = a->GetVehicle();
+        if ( avVeh && ( avVeh == collisionData->collObjA || avVeh == collisionData->collObjB ) )
+            pVehicle = avVeh;
+    }
 
     if( !pVehicle )
     {

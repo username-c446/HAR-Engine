@@ -339,7 +339,8 @@ void WorldRenderLayer::Render()
             {
                 rmt::Vector posn, pTriPts[3], intPosn, intNorm;
                 IntersectDSG* pIntersectChunk;
-                AvatarManager::GetInstance()->GetAvatarForPlayer(0)->GetPosition(posn);
+                Avatar* dbgAv = AvatarManager::GetInstance()->FindNearestAvatar( rmt::Vector(0,0,0) );
+                if (dbgAv) dbgAv->GetPosition(posn);
                 pIntersectChunk = GetIntersectManager()->FindIntersectionTri(posn,pTriPts,intPosn,intNorm);
                 if(pIntersectChunk!=NULL)
                 {

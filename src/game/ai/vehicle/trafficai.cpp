@@ -340,15 +340,16 @@ void TrafficAI::Update( float seconds )
                         int coinflip = 0; //rand() % 4; 
                         if( coinflip == 0 ) // one in n chance to swerve
                         {
-                            Vehicle* playerVehicle = GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle();
-                            rAssert( playerVehicle );
-
                             Vehicle* myVehicle = GetVehicle();
                             rAssert( myVehicle );
 
+                            Vehicle* playerVehicle = NULL;
+                            Avatar* nearest = GetAvatarManager()->FindNearestAvatar( myVehicle->GetPosition() );
+                            if ( nearest ) playerVehicle = nearest->GetVehicle();
+
                             const float MY_MIN_SPEED_THRESHOLD = 8.333f;
                             const float PLAYER_MIN_SPEED_THRESHOLD = 11.111f;
-                            if( playerVehicle->mSpeed > PLAYER_MIN_SPEED_THRESHOLD && 
+                            if( playerVehicle && playerVehicle->mSpeed > PLAYER_MIN_SPEED_THRESHOLD && 
                                 GetVehicle()->mTrafficLocomotion->mActualSpeed > MY_MIN_SPEED_THRESHOLD )
                             {
                                 /*
@@ -609,7 +610,7 @@ void TrafficAI::StartSwerving( bool swerveRight )
     myRight = v->mVehicleTransverse;
     rAssert( rmt::Epsilon( myRight.MagnitudeSqr(), 1.0f, 0.001f ) );
 
-    Avatar* player = GetAvatarManager()->GetAvatarForPlayer( 0 );
+    Avatar* player = GetAvatarManager()->GetAvatarForVehicle( GetVehicle() );
     rAssert( player );
     rmt::Vector playerPos;
     player->GetPosition( playerPos );
@@ -1301,13 +1302,14 @@ void TrafficAI::CheckForObstacles( ObstacleType& objID, float& distFromObjSqr, v
     }
 
     // Get information about this Traffic Vehicle
-    rmt::Vector playerPos;
-    Avatar* avatar = ::GetAvatarManager()->GetAvatarForPlayer( 0 );
-    avatar->GetPosition( playerPos );
-    Vehicle* playerVehicle = avatar->GetVehicle();
-
     rmt::Vector pPos, pDir, pRightSide;
     GetVehicle()->GetPosition( &pPos );
+
+    rmt::Vector playerPos;
+    Avatar* avatar = ::GetAvatarManager()->FindNearestAvatar( pPos );
+    if ( avatar == NULL ) return;
+    avatar->GetPosition( playerPos );
+    Vehicle* playerVehicle = avatar->GetVehicle();
 
     // *** WARNING ***
     // GetHeading actually returns a normalized FACING value, meaning

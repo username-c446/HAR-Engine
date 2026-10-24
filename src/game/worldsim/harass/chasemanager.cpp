@@ -453,7 +453,20 @@ void ChaseManager::AddObjects(float seconds)
     superCam->GetPosition( &playerPos );
     superCam->GetVelocity( &playerVel );
     */
-    Avatar* avatar = ::GetAvatarManager()->GetAvatarForPlayer(0);
+    rmt::Vector fleetAnchor( 0.0f, 0.0f, 0.0f );
+    int nFleet = 0;
+    for ( int fi = 0; fi < MAX_CHASE_VEHICLES; ++fi )
+    {
+        if ( mVehicles[fi].isActive && mVehicles[fi].v != NULL )
+        {
+            rmt::Vector fp;
+            mVehicles[fi].v->GetPosition( &fp );
+            fleetAnchor.Add( fp );
+            ++nFleet;
+        }
+    }
+    if ( nFleet > 0 ) fleetAnchor.Scale( 1.0f / (float)nFleet );
+    Avatar* avatar = ::GetAvatarManager()->FindNearestAvatar( fleetAnchor );
     rAssert(avatar != NULL);
     avatar->GetPosition(playerPos);
     avatar->GetVelocity(playerVel);
@@ -598,7 +611,20 @@ void ChaseManager::RemoveObjects(float seconds)
     rAssert( superCam != NULL );
     superCam->GetPosition( &playerPos );
     */
-    Avatar* avatar = ::GetAvatarManager()->GetAvatarForPlayer(0);
+    rmt::Vector fleetAnchor( 0.0f, 0.0f, 0.0f );
+    int nFleet = 0;
+    for ( int fi = 0; fi < MAX_CHASE_VEHICLES; ++fi )
+    {
+        if ( mVehicles[fi].isActive && mVehicles[fi].v != NULL )
+        {
+            rmt::Vector fp;
+            mVehicles[fi].v->GetPosition( &fp );
+            fleetAnchor.Add( fp );
+            ++nFleet;
+        }
+    }
+    if ( nFleet > 0 ) fleetAnchor.Scale( 1.0f / (float)nFleet );
+    Avatar* avatar = ::GetAvatarManager()->FindNearestAvatar( fleetAnchor );
     rAssert(avatar != NULL);
     avatar->GetPosition(playerPos);
 

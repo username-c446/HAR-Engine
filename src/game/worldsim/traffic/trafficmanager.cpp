@@ -278,7 +278,13 @@ void TrafficManager::HandleEvent( EventEnum id, void* pEventData )
 
             if( usingHusk )
             {
-                Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+                Avatar* avatar = GetAvatarManager()->GetAvatarForVehicle( currVehicle );
+                if ( avatar == NULL )
+                {
+                    rmt::Vector vehPos;
+                    currVehicle->GetPosition( &vehPos );
+                    avatar = GetAvatarManager()->FindNearestAvatar( vehPos );
+                }
                 rAssert( avatar );
 
                 // if the avatar is inside a vehicle the vehicle

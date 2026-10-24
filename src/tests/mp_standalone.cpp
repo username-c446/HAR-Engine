@@ -156,6 +156,11 @@ int main(int argc, char** argv)
         g_fake.ready = true;
         net::GamePlayerBridge bridge;
         bridge.SetTypedLocalProvider(&FakeLocalState);
+        // Attach a remote repo so we can PRINT what we receive from other
+        // clients. Without this the join loop only sends; it never proves the
+        // engine delivers a peer's state to the other peers on the wire.
+        RemotePlayerManager remote;
+        bridge.SetRemotePlayers(&remote);
         bridge.AttachToSession(&client);
 
         if (!client.Join(ip, port)) {
@@ -186,6 +191,17 @@ int main(int argc, char** argv)
                     fflush(stdout);
                     if (!sent) break;
                 }
+                // Log remote players the engine delivered to us (i.e. OTHER
+                // clients/servers visible through the relay). Proves two peers
+                // actually see each other's replicated state over the wire.
+                remote.ForEachPlayer(
+                    [](int pid, const PlayerNetworkState& st, void*) -> bool {
+                        printf("[join] remote state from peer %d: x=%.2f z=%.2f\n",
+                               pid, st.x, st.z);
+                        return true;
+                    },
+                    NULL);
+                if (remote.GetPlayerCount() > 0) break;
             }
         }
     }

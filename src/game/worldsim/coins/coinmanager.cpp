@@ -391,8 +391,14 @@ void CoinManager::SpawnCoins( int Count, const rmt::Vector& Position, float Grou
 
     // Check for a valid avatar pointer
     rTuneAssert( GetAvatarManager() != NULL );
-    rTuneAssert( GetAvatarManager()->GetAvatarForPlayer(0) != NULL );
-    bool instaCollect = !Force && GetAvatarManager()->GetAvatarForPlayer( 0 )->IsInCar();
+    bool anyPlayerInCar = false;
+    AvatarManager* am = GetAvatarManager();
+    for ( int p = 0; p < am->GetNumAvatars() && !anyPlayerInCar; ++p )
+    {
+        Avatar* a = am->GetAvatarForPlayer( p );
+        if ( a != NULL && a->IsInCar() ) anyPlayerInCar = true;
+    }
+    bool instaCollect = !Force && anyPlayerInCar;
 
     for( int i = 0; i < Count; ++i )
     {
@@ -513,14 +519,27 @@ void CoinManager::Update( int ElapsedMS )
     {
         return;
     }
-    rmt::Vector avatarPos;
-    GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( avatarPos );
-    bool isInCar = GetAvatarManager()->GetAvatarForPlayer( 0 )->IsInCar();
     for( int i = 0; i < NUM_COINS; ++i )
     {
         ActiveCoin& c = mActiveCoins[ i ];
         if( c.State != CS_Inactive )
         {
+            // For each coin, resolve the nearest player (so any player can collect).
+            rmt::Vector avatarPos;
+            bool isInCar = false;
+            AvatarManager* am = GetAvatarManager();
+            float bestDistSq = FLT_MAX;
+            for ( int p = 0; p < am->GetNumAvatars(); ++p )
+            {
+                Avatar* a = am->GetAvatarForPlayer( p );
+                if ( a == NULL ) continue;
+                rmt::Vector avPos;
+                a->GetPosition( avPos );
+                float d = (avPos - c.Position).MagnitudeSqr();
+                if ( d < bestDistSq ) { bestDistSq = d; avatarPos = avPos; isInCar = a->IsInCar(); }
+            }
+            if ( bestDistSq == FLT_MAX ) avatarPos = c.Position;
+
             float decaySpin = 0.0f;
             if( c.State != CS_InitialSpawning && c.State != CS_SpawnToCollect && c.State != CS_Collecting && c.State != CS_Collected )
             {

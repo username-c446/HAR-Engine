@@ -1524,7 +1524,7 @@ void VehicleCentral::PreSubstepUpdate( float dt )
                 vehicle->SetEBrake(test, dt);
                 
                 if( GetCheatInputSystem()->IsCheatEnabled(CHEAT_ID_CAR_JUMP_ON_HORN) && 
-                    vehicle == GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() )    //   vehicle->mVehicleType == VT_USER )
+                    GetAvatarManager()->GetAvatarForVehicle( vehicle ) != NULL )    //   vehicle->mVehicleType == VT_USER )
                 {
                     test = vController->GetHorn( );
                     if(test > 0.1f)                    
@@ -1537,7 +1537,7 @@ void VehicleCentral::PreSubstepUpdate( float dt )
                 {
                     // Only the player vehicle's controller uses Set/GetHorn. 
                     // AI cars never at any time set the Horn value. 
-                    if( vehicle == GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() ||
+                    if( GetAvatarManager()->GetAvatarForVehicle( vehicle ) != NULL ||
                         ::GetGameplayManager()->GetGameType() == GameplayManager::GT_SUPERSPRINT )
                     {
                         // if in a certain game type, use the horn button for speedboost
@@ -1795,14 +1795,9 @@ void VehicleCentral::SubmitStatics()
                 int collisionAreaIndex = mActiveVehicleList[i]->mCollisionAreaIndex;
                 rAssert(collisionAreaIndex != -1);
         
-                Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                Vehicle* playerVehicle = 0;
-                if(playerAvatar)
-                {    
-                    playerVehicle = playerAvatar->GetVehicle();
-                }
+                bool belongsToAnyPlayer = GetAvatarManager()->GetAvatarForVehicle( mActiveVehicleList[i] ) != NULL;
 
-                if(playerVehicle && mActiveVehicleList[i] == playerVehicle)
+                if(belongsToAnyPlayer)
                 {
                     GetWorldPhysicsManager()->SubmitStaticsPseudoCallback(position, radius, collisionAreaIndex, mActiveVehicleList[i]->GetSimState(), true);
                     GetWorldPhysicsManager()->SubmitFencePiecesPseudoCallback(position, radius, collisionAreaIndex, mActiveVehicleList[i]->GetSimState(), true);
@@ -1876,14 +1871,9 @@ void VehicleCentral::SubmitDynamics()
                 rAssert(collisionAreaIndex != -1);
         
         
-                Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                Vehicle* playerVehicle = 0;
-                if(playerAvatar)
-                {    
-                    playerVehicle = playerAvatar->GetVehicle();
-                }
+                bool belongsToAnyPlayer = GetAvatarManager()->GetAvatarForVehicle( mActiveVehicleList[i] ) != NULL;
 
-                if(playerVehicle && mActiveVehicleList[i] == playerVehicle)
+                if(belongsToAnyPlayer)
                 {
                     GetWorldPhysicsManager()->SubmitDynamicsPseudoCallback(position, radius, collisionAreaIndex, mActiveVehicleList[i]->GetSimState(), true);
                 }
@@ -1913,14 +1903,9 @@ void VehicleCentral::SubmitDynamics()
         
         
         
-                Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-                Vehicle* playerVehicle = 0;
-                if(playerAvatar)
-                {    
-                    playerVehicle = playerAvatar->GetVehicle();
-                }
+                bool belongsToAnyPlayer = GetAvatarManager()->GetAvatarForVehicle( mActiveVehicleList[i] ) != NULL;
 
-                if(playerVehicle && mActiveVehicleList[i] == playerVehicle)
+                if(belongsToAnyPlayer)
                 {
                     GetWorldPhysicsManager()->SubmitDynamicsPseudoCallback(position, radius, collisionAreaIndex, mActiveVehicleList[i]->GetSimState(), true);
                 }

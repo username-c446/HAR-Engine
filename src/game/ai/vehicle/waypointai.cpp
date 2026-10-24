@@ -260,7 +260,13 @@ void WaypointAI::UpdateNeedToWaitForPlayer( float timeins )
 
                     float playerDistToCheckPt;
                     int playerCheckPt, playerLap;
-                    Avatar* player = GetAvatarManager()->GetAvatarForPlayer( 0 );
+                    rmt::Vector myPos2;
+                    GetPosition( &myPos2 );
+                    Avatar* player = GetAvatarManager()->FindNearestAvatar( myPos2 );
+                    if ( player == NULL )
+                    {
+                        return;
+                    }
                     player->GetRaceInfo( playerDistToCheckPt, playerCheckPt, playerLap );
 
                     bool aheadOfPlayer = false;
@@ -305,11 +311,16 @@ void WaypointAI::UpdateNeedToWaitForPlayer( float timeins )
                 {
                     rmt::Vector myPos, playerPos;
                     GetPosition( &myPos );
-                    GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( playerPos );
+                    Avatar* nearestPlayer = GetAvatarManager()->FindNearestAvatar( myPos );
+                    if ( nearestPlayer == NULL ) { needToDisable = true; }
+                    else
+                    {
+                    nearestPlayer->GetPosition( playerPos );
 
                     if( (myPos - playerPos).MagnitudeSqr() >= DIST_SQR_TOO_FAR_FROM_PLAYER )
                     {
                         needToDisable = true;
+                    }
                     }
                 }
             }
@@ -441,8 +452,10 @@ void WaypointAI::DoCatchUp( float timeins )
 
     ///////////////////////////////////////////////////////
     // info about myself & player
-    Avatar* player = GetAvatarManager()->GetAvatarForPlayer(0);
-    rAssert( player );
+    rmt::Vector myPos3;
+    GetPosition( &myPos3 );
+    Avatar* player = GetAvatarManager()->FindNearestAvatar( myPos3 );
+    if ( player == NULL ) { ResetCatchUpParams(); return; }
 
     Vehicle* myVehicle = GetVehicle();
     rAssert( myVehicle );

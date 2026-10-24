@@ -729,7 +729,9 @@ void DialogCoordinator::queueVillainDialog( EventEnum id, void* eventData )
                 //
                 AICar = gameplayMgr->GetCurrentMission()->GetCurrentStage()->GetMainAIVehicleForThisStage();
                 AICar->GetPosition( &villainPosn );
-                GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( avatarPosn );
+                Avatar* nearDlg = GetAvatarManager()->FindNearestAvatar( villainPosn );
+                if ( nearDlg != NULL ) nearDlg->GetPosition( avatarPosn );
+                else avatarPosn.Set( 0.0f, 0.0f, 0.0f );
                 diff.Sub( villainPosn, avatarPosn );
                 if( diff.MagnitudeSqr() > 75.0f )
                 {

@@ -1234,7 +1234,9 @@ void Vehicle::ResetOnSpot( bool resetDamage /*=true*/ , bool moveCarOntoRoad)
             //RoadManager::PathfindingOptions options = RoadManager::PO_SEARCH_INTERSECTIONS | RoadManager::PO_SEARCH_ROADS;
             //RoadManager::GetInstance()->FindClosestPathElement( currentVehiclePosition, radius, options, elem, roadSeg, segT, roadT );
 
-            GetAvatarManager()->GetAvatarForPlayer(0)->GetLastPathInfo(elem, roadSeg, segT, roadT);
+            Avatar* owner = GetAvatarManager()->GetAvatarForVehicle( this );
+            if ( owner == NULL ) owner = GetAvatarManager()->FindNearestAvatar( this->rPosition() );
+            if ( owner ) owner->GetLastPathInfo(elem, roadSeg, segT, roadT);
             if( elem.type == RoadManager::ET_INTERSECTION )
             {
                 useIntersection = true;
@@ -2570,7 +2572,7 @@ void Vehicle::PostSubstepUpdate(float dt)
     // only want to do the following two tests if we are the avatar's car
     //
     // unless, we are supersprint, then we want to do it for all cars, with no fade to black...
-    if(GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() == this ||
+    if(GetAvatarManager()->GetAvatarForVehicle( this ) != NULL ||
        GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
     {    
         
@@ -2775,8 +2777,9 @@ void Vehicle::BounceCharacters(float dt)
 
     if(mVehicleType == VT_USER)
     {                
-        Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-        if(sDoBounce && (playerAvatar->GetCharacter()->GetStateManager()->GetState() == CharacterAi::INCAR) && playerAvatar->GetVehicle() == this)
+        Avatar* playerAvatar = GetAvatarManager()->GetAvatarForVehicle( this );
+        if(sDoBounce && playerAvatar &&
+           (playerAvatar->GetCharacter()->GetStateManager()->GetState() == CharacterAi::INCAR))
         {                     
             mYAccelForSeatingOffset = (mVelocityCM.y - mVelocityCMLag.y) / dt;
             // seems to hover around -1.0f to 1.0f a lot - goes up to 8 or 10 occassionally
@@ -2824,8 +2827,8 @@ void Vehicle::MoveCharactersTowardsRestPosition(float dt)
     // let's say, for first try, move at half max diplacment speed
     float rate = 0.5f;
     
-    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-    if( mpDriver && mpDriver != playerAvatar->GetCharacter() )
+    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForVehicle( this );
+    if( mpDriver && ( !playerAvatar || mpDriver != playerAvatar->GetCharacter() ) )
     {
         // there is both a driver and us
         //
@@ -2961,8 +2964,8 @@ void Vehicle::MoveCharactersTowardsRestPosition(float dt)
 void Vehicle::ApplyDisplacementToCharacters(float displacement)
 {
     // now either we're driving alone or we're a passenger and there's a driver
-    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-    if( mpDriver && mpDriver != playerAvatar->GetCharacter() )
+    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForVehicle( this );
+    if( mpDriver && ( !playerAvatar || mpDriver != playerAvatar->GetCharacter() ) )
     {
         // sort of clunky to set every frame but whatever...
         mNPCRestSeatingPosition = mDriverLocation;
@@ -3185,7 +3188,7 @@ bool Vehicle::SelfRestTest(void)
     
     }
     */
-    Vehicle* playerVehicle = GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle();
+    bool isAnyPlayerVehicle = GetAvatarManager()->GetAvatarForVehicle( this ) != NULL;
     //Vehicle* playerVehicle = GetGameplayManager()->GetCurrentVehicle();
 
     if(mGas < 0.1f && mBrake < 0.2f && count > 2)
@@ -3214,7 +3217,7 @@ bool Vehicle::SelfRestTest(void)
                     //GetSimState()->ResetVelocities();
                                     
                     
-                    if(this->mVehicleType == VT_TRAFFIC && this != playerVehicle && !mCreatedByParkedCarManager)
+                    if(this->mVehicleType == VT_TRAFFIC && !isAnyPlayerVehicle && !mCreatedByParkedCarManager)
                     {
                         GetSimState()->SetControl(sim::simAICtrl);
                         GetSimState()->ResetVelocities();
@@ -3238,7 +3241,7 @@ bool Vehicle::SelfRestTest(void)
                 //this->ZeroOutXZVelocity();
             
             
-                if(this->mVehicleType == VT_TRAFFIC && this != playerVehicle && !mCreatedByParkedCarManager)
+                if(this->mVehicleType == VT_TRAFFIC && !isAnyPlayerVehicle && !mCreatedByParkedCarManager)
                 {
                     GetSimState()->SetControl(sim::simAICtrl);
                     GetSimState()->ResetVelocities();
@@ -3266,7 +3269,7 @@ bool Vehicle::SelfRestTest(void)
                 //this->ZeroOutXZVelocity();
             
             
-                if(this->mVehicleType == VT_TRAFFIC && this != playerVehicle && !mCreatedByParkedCarManager)
+                if(this->mVehicleType == VT_TRAFFIC && !isAnyPlayerVehicle && !mCreatedByParkedCarManager)
                 {
                     GetSimState()->SetControl(sim::simAICtrl);
                     GetSimState()->ResetVelocities();
@@ -4687,8 +4690,8 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
             GetSparkleManager()->AddPaintChips( position, velocity, vehicleColour, strength );
         }
 
-        Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-        if(playerAvatar->GetVehicle() == this)
+        Avatar* playerAvatar = GetAvatarManager()->GetAvatarForVehicle(this);
+        if(playerAvatar != NULL && playerAvatar->GetVehicle() == this)
         {
             CarOnCarCollisionEventData data;
 
@@ -4813,9 +4816,8 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
   // before further testing, see if this is a car that hit it's own ground plane
     // if so, abort
     
-    Avatar* playerAvatar = GetAvatarManager()->GetAvatarForPlayer(0);
-    
-    if(GetGameplayManager()->GetGameType() != GameplayManager::GT_SUPERSPRINT && playerAvatar->GetVehicle() == this)
+    if(GetGameplayManager()->GetGameType() != GameplayManager::GT_SUPERSPRINT &&
+       GetAvatarManager()->GetAvatarForVehicle( this ) != NULL)
     {
         const float percentageOfSpeedToMaintain = 0.85f; // plum, change this number
         
@@ -4970,7 +4972,7 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
     
     if(GetCheatInputSystem()->IsCheatEnabled(CHEAT_ID_INVINCIBLE_CAR))
     {
-        if(GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle() == this)
+        if(GetAvatarManager()->GetAvatarForVehicle( this ) != NULL)
         {
             return sim::Solving_Continue;   
         }

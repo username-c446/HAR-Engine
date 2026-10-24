@@ -171,10 +171,15 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
                         for ( j = 0; j < mNumCarTypes; ++j )
                         {
                             bool inUseByPlayer = false;
-                            Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
-                            inUseByPlayer = ( avatar && 
-                                              avatar->GetCharacter()->IsInCar() &&
-                                              avatar->GetVehicle() == mParkedCars[ j ].mCar );
+                            AvatarManager* am = GetAvatarManager();
+                            for ( int pi = 0; pi < am->GetNumAvatars() && !inUseByPlayer; ++pi )
+                            {
+                                Avatar* avatar = am->GetAvatarForPlayer( pi );
+                                if ( avatar && avatar->GetCharacter() &&
+                                     avatar->GetCharacter()->IsInCar() &&
+                                     avatar->GetVehicle() == mParkedCars[ j ].mCar )
+                                    inUseByPlayer = true;
+                            }
 
                             if ( mParkedCars[ j ].mLoadedZoneUID == static_cast< tUID >( 0 ) && !inUseByPlayer )
                             {
@@ -267,7 +272,9 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
             {
                 //Can we dump this car?
                 bool dump = true;
-                Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+                rmt::Vector carPosForDist;
+                mFreeCar.mCar->GetPosition( &carPosForDist );
+                Avatar* avatar = GetAvatarManager()->FindNearestAvatar( carPosForDist );
                 rAssert( avatar );
                 
                 if ( ( GetGameplayManager()->GetCurrentVehicle() == mFreeCar.mCar ) ||
@@ -471,7 +478,7 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
                 // is probably a husk, update this vehicle to be the original 
                 // vehicle and place the character in this new vehicle
                 // 
-                Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+                Avatar* avatar = GetAvatarManager()->GetAvatarForVehicle( v );
                 rAssert( avatar );
                 if( avatar->IsInCar() )
                 {
@@ -752,7 +759,7 @@ void ParkedCarManager::RemoveFreeCarIfClose( const rmt::Vector& position )
     rmt::Vector freeCarPosition;
     if ( mFreeCar.mCar != NULL )
     {
-        if(mFreeCar.mCar == GetAvatarManager()->GetAvatarForPlayer(0)->GetVehicle())
+        if(GetAvatarManager()->GetAvatarForVehicle( mFreeCar.mCar ) != NULL)
         {
             return;
         }

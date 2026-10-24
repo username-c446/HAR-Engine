@@ -337,7 +337,12 @@ void ChaseAI::UpdateTarget()
 {
     mTargetHasMovedToAnotherPathElement = false;
 
-    mpTarget = GetAvatarManager()->GetAvatarForPlayer( 0 );
+    // Target the nearest player in the match, not a hard-coded player 0.
+    rmt::Vector chasePos;
+    Vehicle* v = GetVehicle();
+    if ( v ) v->GetPosition( &chasePos );
+    else chasePos.Set( 0, 0, 0 );
+    mpTarget = GetAvatarManager()->FindNearestAvatar( chasePos );
     if( mpTarget )
     {
         // the Avatar keeps a notion of its nearest road/intersection entities

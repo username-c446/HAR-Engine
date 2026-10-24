@@ -1508,7 +1508,11 @@ void Character::PreSimUpdate( float timeins )
         GetPosition( myPos );
 
         rmt::Vector testPos;
-        GetAvatarManager()->GetAvatarForPlayer( 0 )->GetPosition( testPos );
+        Avatar* nearestAvatar = GetAvatarManager()->FindNearestAvatar( myPos );
+        if ( nearestAvatar == NULL ) { mTooFarToUpdate = false; }
+        else
+        {
+        nearestAvatar->GetPosition( testPos );
         /*
         // NOTE:
         // Can't use the camera pos because we could get quite far from the 
@@ -1525,6 +1529,7 @@ void Character::PreSimUpdate( float timeins )
         if( distSqr > DIST_TOO_FAR_TO_UPDATE_SQR && (fov > fovCutoff))
         {
             mTooFarToUpdate = true;
+        }
         }
     }
 
@@ -2716,7 +2721,7 @@ sim::Solving_Answer Character::PreReactToCollision( sim::SimState* pCollidedObj,
         {
             if( mpSimStateObj->mAIRefIndex == PhysicsAIRef::NPCharacter )
             {
-                if( v == GetAvatarManager()->GetAvatarForPlayer( 0 )->GetVehicle() )
+                if( GetAvatarManager()->GetAvatarForVehicle( v ) != NULL )
                 {
                     GetEventManager()->TriggerEvent( EVENT_PLAYER_MAKES_LIGHT_OF_CAR_HITTING_NPC );
                     GetEventManager()->TriggerEvent( EVENT_PLAYER_CAR_HIT_NPC, this );
@@ -3300,8 +3305,10 @@ BEGIN_PROFILE("Character::UpdateGroundHeight")
     collisionPosition.Clear( );
  
 
-    rmt::Vector playerPos;
-    GetAvatarManager()->GetAvatarForPlayer(0)->GetPosition( playerPos );
+rmt::Vector playerPos;
+    Avatar* nearestAv = GetAvatarManager()->FindNearestAvatar( position );
+    if ( nearestAv != NULL ) nearestAv->GetPosition( playerPos );
+    else playerPos = position;
 
     rmt::Vector distVecToPlayer = playerPos - position;
     distVecToPlayer.y = 0.0f;

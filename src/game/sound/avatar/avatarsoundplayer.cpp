@@ -149,7 +149,14 @@ bool AvatarSoundPlayer::OnBeginGameplay()
         m_avatars[i] = new(GMA_LEVEL_AUDIO) SoundAvatar( GetAvatarManager()->GetAvatarForPlayer( i ) );
     }
 
-    return( GetAvatarManager()->GetAvatarForPlayer( 0 )->IsInCar() );
+    AvatarManager* am = GetAvatarManager();
+    for ( int i = 0; i < am->GetNumAvatars(); i++ )
+    {
+        Avatar* a = am->GetAvatarForPlayer( i );
+        if ( a != NULL && a->IsInCar() )
+            return true;
+    }
+    return false;
 }
 
 //=============================================================================
