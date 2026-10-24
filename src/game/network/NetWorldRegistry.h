@@ -34,8 +34,9 @@ namespace net
         WOC_STATE     = 1, // u8 stateprop state           (WSP_LAST_WRITE)
         WOC_BROKEN    = 2, // u8 1 = broken / removed       (WSP_FIRST_WRITE)
         WOC_ANIM_DIR  = 3, // i8 animation direction -1/0/1 (WSP_LAST_WRITE)
-        WOC_TAKEN     = 4, // u8 1 = a player drove the parked car away (WSP_FIRST_WRITE)
+        WOC_TAKEN     = 4, // u16 claimant peer id: a player got into the parked car (WSP_FIRST_WRITE)
         WOC_POPULATION= 5, // zone parked-car placement plan (WSP_FIRST_WRITE)
+        WOC_POSE      = 6, // ObjectPose: where a pushed parked car came to rest (WSP_LAST_WRITE)
     };
 }
 

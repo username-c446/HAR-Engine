@@ -107,6 +107,7 @@
 
 #include <presentation/gui/guisystem.h>
 #include <network/NetWorldHooks.h>
+#include <worldsim/parkedcars/parkedcarmanager.h>
 
 using namespace sim;
 
@@ -4672,6 +4673,20 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
         return sim::Solving_Continue;
     }
 
+    // Networked match: a parked car our own simulation pushes (our car, our
+    // traffic) is moved by us for everyone; a ghost's push is its owner's.
+    if( normalizedMagnitude > 0.01f && networld::IsInMatch() &&
+        simStateA->mAIRefIndex == PhysicsAIRef::redBrickVehicle &&
+        simStateB->mAIRefIndex == PhysicsAIRef::redBrickVehicle )
+    {
+        Vehicle* other = ( simStateA->mAIRefPointer == this ) ? (Vehicle*)simStateB->mAIRefPointer
+                                                              : (Vehicle*)simStateA->mAIRefPointer;
+        if( other != NULL && other != this && !other->mNetworkGhost )
+        {
+            ParkedCarManager::GetInstance().OnPushedLocally( this );
+        }
+    }
+
 
 	if(mVehicleID == VehicleEnum::HUSKA)
     {
@@ -5093,6 +5108,21 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
     
     return sim::Solving_Continue;   
     
+}
+
+//=============================================================================
+// Vehicle::SetNetworkDriven
+//=============================================================================
+void Vehicle::SetNetworkDriven(bool driven)
+{
+    if( driven == mNetworkDriven || mSimStateArticulated == NULL )
+    {
+        return;
+    }
+    mNetworkDriven = driven;
+    mNetworkGhost = driven;
+    mSimStateArticulated->ResetVelocities();
+    mSimStateArticulated->SetControl( driven ? sim::simAICtrl : sim::simSimulationCtrl );
 }
 
 //=============================================================================

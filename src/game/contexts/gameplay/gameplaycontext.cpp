@@ -87,6 +87,7 @@
 #include <worldsim/character/charactermanager.h>
 #include <worldsim/character/character.h>
 #include <worldsim/traffic/trafficmanager.h>
+#include <worldsim/parkedcars/parkedcarmanager.h>
 #include <worldsim/ped/pedestrianmanager.h>
 
 #include <network/NetworkMatchManager.h>
@@ -662,7 +663,8 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
 
     void* NetEntitySpawnGhost( uint64_t id, const net::NetEntitySpawn& spawn )
     {
-        (void)id;
+        // A parked car another player pushes: our own copy follows their stream.
+        if ( spawn.kind == net::NEK_PARKED_CAR ) return ParkedCarManager::NetDriveBound( id );
         if ( spawn.kind != net::NEK_TRAFFIC_CAR ) return NULL;
         Vehicle* v = GetVehicleCentral()->AddNetworkGhostVehicle( spawn.model );
         if ( v != NULL )
@@ -686,9 +688,13 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
 
     void NetEntityDespawnGhost( void* handle, uint8_t kind )
     {
-        (void)kind;
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
+        if ( kind == net::NEK_PARKED_CAR )
+        {
+            ParkedCarManager::NetReleaseBound( v ); // our car, back to our physics
+            return;
+        }
         s_explodedGhosts.erase( v );
         // See RemoteVehicleDespawn: the teardown releases (and frees) the ghost.
         GetVehicleCentral()->RemoveNetworkGhostVehicle( v );
@@ -1384,6 +1390,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
 
     BEGIN_PROFILE("TrafficManager");
         TrafficManager::GetInstance()->Update( elapsedTime );
+        ParkedCarManager::GetInstance().UpdateNetworkPushes( elapsedTime );
     END_PROFILE("TrafficManager");
 
     BEGIN_PROFILE("ActorManager");

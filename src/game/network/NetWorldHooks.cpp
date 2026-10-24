@@ -20,6 +20,16 @@ namespace networld
         return NetworkMatchManager::WorldRegistry().Request(handle, channel, policy, value, len);
     }
 
+    uint64_t ObjectIdOf(void* handle)
+    {
+        return NetworkMatchManager::WorldRegistry().IdOf(handle);
+    }
+
+    void* ObjectHandleOf(uint64_t id)
+    {
+        return NetworkMatchManager::WorldRegistry().HandleOf(id);
+    }
+
     bool IsApplyingRemote()
     {
         return NetworkMatchManager::WorldRegistry().IsApplying();

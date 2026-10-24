@@ -227,6 +227,7 @@ Vehicle::Vehicle() :
     //mDamageType = 0;    // 0 is unset - normally 1, 2, or 3
     mDamageType = VDT_UNSET;
     mNetworkGhost = false;
+    mNetworkDriven = false;
 
     mVehicleDestroyed = false;
     mVehicleCanSustainDamage = true;

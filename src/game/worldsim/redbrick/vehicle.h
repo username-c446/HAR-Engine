@@ -808,6 +808,12 @@ public:
     void ApplyNetworkDamage(float health);
     // 1 = intact .. 0 = wrecked.
     float GetHealthFraction() const;
+    // A local world object (a parked car) another player pushes: kinematic
+    // (AI control, like traffic) and treated as a ghost while their stream
+    // moves it; false hands it back to our physics, at rest.
+    void SetNetworkDriven(bool driven);
+    bool IsNetworkDriven() const { return mNetworkDriven; }
+    bool mNetworkDriven;
     bool IsVehicleDestroyed()const { return mVehicleDestroyed; }
 
     bool mVehicleDestroyed;

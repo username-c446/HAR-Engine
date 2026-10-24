@@ -36,4 +36,29 @@ namespace net
         if (who == 0) return CLAIM_NONE;
         return (self != 0 && who == self) ? CLAIM_OURS : CLAIM_THEIRS;
     }
+
+    // Rest pose of a movable static object (a pushed parked car), WOC_POSE:
+    // f32 x, y, z, yaw (16 bytes). Late joiners and a reloaded zone place the
+    // object here instead of at its locator.
+    struct ObjectPose
+    {
+        float x = 0.0f, y = 0.0f, z = 0.0f, yaw = 0.0f;
+
+        static constexpr const uint8_t SIZE = 16;
+        bool Encode(WorldStateValue& out) const
+        {
+            Writer w(out.bytes, WS_MAX_VALUE);
+            w.WriteFloat(x); w.WriteFloat(y); w.WriteFloat(z); w.WriteFloat(yaw);
+            if (!w.Ok()) return false;
+            out.len = static_cast<uint8_t>(w.Position());
+            return true;
+        }
+        bool Decode(const WorldStateValue& in)
+        {
+            if (in.len != SIZE) return false;
+            Reader r(in.bytes, in.len);
+            if (!(r.ReadFloat(x) && r.ReadFloat(y) && r.ReadFloat(z) && r.ReadFloat(yaw))) return false;
+            return x == x && y == y && z == z && yaw == yaw; // never a NaN pose
+        }
+    };
 }

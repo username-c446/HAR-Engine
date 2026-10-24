@@ -961,8 +961,33 @@ simultaneous takers both "won"):
 - The manager listened to `EVENT_GETINTOVEHICLE_END` twice (the claim was sent
   twice); it now listens to START / END / GETOUT_END once each.
 
+### 18.13 Pushed parked cars (P3)
+A parked car is a static world object (registry id, `WOK_PARKED_CAR`); while
+someone pushes it, it is also an entity BOUND to that id (`NEK_PARKED_CAR`,
+`AddLocal(handle, spawn, boundId)` — the entity record lives under the car's own
+id with `WSP_OWNER`, so the first mover owns it and a second one gets
+`WSR_REJECT` and follows).
+- Who moves it: `Vehicle::PostReactToCollision` — a vehicle-vehicle contact
+  (normalized impulse > 0.01) with a vehicle simulated HERE (not a ghost: our car,
+  our traffic) calls `ParkedCarManager::OnPushedLocally`, which announces the
+  bound entity (`networld::ObjectIdOf`). A push by a ghost is its owner's.
+- Owner: the sampler streams it like traffic; `UpdateNetworkPushes` (every frame,
+  from `GameplayContext::OnUpdate`) stops when it has been still (< 1 km/h) for
+  1 s: the rest pose is written as `WOC_POSE` (6, `net::ObjectPose`, f32 x,y,z,yaw,
+  `WSP_LAST_WRITE`) and the entity is erased; getting into it also stops the
+  stream (the player stream and `WOC_TAKEN` take over).
+- Others: the entity sink's spawn for `NEK_PARKED_CAR` is
+  `ParkedCarManager::NetDriveBound(boundId)` — our own copy
+  (`networld::ObjectHandleOf`) switches to `Vehicle::SetNetworkDriven(true)`
+  (kinematic `simAICtrl` like traffic, and `mNetworkGhost`, so our hits on it go
+  to the owner) and follows the stream; despawn = `NetReleaseBound` → back to
+  our physics. If the car's zone is not loaded here, spawn is retried while the
+  entity lives.
+- `WOC_POSE` is applied by `NetApplyCar` (`Vehicle::SetTransform`) unless the
+  car is being moved or driven — also on registration, so a late joiner or a
+  reloaded zone places the car where it was left instead of at its locator.
+- `RemoveParkedCar` stops our stream and clears network driving first.
+
 ### 18.10 Still open
-- Pushed parked cars (entity bound to the static object — `NEK_PARKED_CAR` and
-  `AddLocal(handle, spawn, boundId)` are in place, the parked-car hooks are not).
 - Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
 - No player identity across reconnects (T7).

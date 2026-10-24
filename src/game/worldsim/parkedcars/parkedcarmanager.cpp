@@ -970,11 +970,135 @@ void ParkedCarManager::RemoveParkedCar( ParkedCarInfo& info )
     {
         return;
     }
+    for ( unsigned int i = 0; i < mNumPushed; ++i )
+    {
+        if ( mPushed[ i ].car == info.mCar )
+        {
+            StopStreamingPush( i, false );
+            break;
+        }
+    }
+    info.mCar->SetNetworkDriven( false );
     networld::UnregisterObject( info.mCar );
     GetVehicleCentral()->RemoveVehicleFromActiveList( info.mCar );
     info.mLoadedZoneUID = 0;
     info.mNetLoc = -1;
     mNumParkedCars--;
+}
+
+void ParkedCarManager::OnPushedLocally( Vehicle* car )
+{
+    if ( car == NULL || car->IsNetworkDriven() || networld::IsLocalEntity( car ) )
+    {
+        return;
+    }
+    ParkedCarInfo* info = NULL;
+    bool isFreeCar = false;
+    FindParkedCarInfo( car, info, isFreeCar );
+    if ( info == NULL || isFreeCar || info->mNetLoc < 0 || mNumPushed >= MAX_PUSHED )
+    {
+        return;
+    }
+    uint64_t boundId = networld::ObjectIdOf( car );
+    if ( boundId == 0 )
+    {
+        return;
+    }
+    net::NetEntitySpawn spawn;
+    spawn.kind = net::NEK_PARKED_CAR;
+    const char* name = car->GetName();
+    if ( name != NULL )
+    {
+        strncpy( spawn.model, name, sizeof( spawn.model ) - 1 );
+    }
+    rmt::Vector pos;
+    car->GetPosition( &pos );
+    spawn.x = pos.x; spawn.y = pos.y; spawn.z = pos.z;
+    spawn.yaw = car->GetFacingInRadians();
+    networld::AddLocalEntity( car, spawn, boundId );
+    mPushed[ mNumPushed ].car = car;
+    mPushed[ mNumPushed ].restMs = 0;
+    ++mNumPushed;
+}
+
+void ParkedCarManager::StopStreamingPush( unsigned int index, bool publishPose )
+{
+    Vehicle* car = mPushed[ index ].car;
+    if ( publishPose && networld::IsLocalEntity( car ) )
+    {
+        net::ObjectPose pose;
+        rmt::Vector pos;
+        car->GetPosition( &pos );
+        pose.x = pos.x; pose.y = pos.y; pose.z = pos.z;
+        pose.yaw = car->GetFacingInRadians();
+        net::WorldStateValue v;
+        if ( pose.Encode( v ) )
+        {
+            networld::RequestObjectState( car, net::WOC_POSE, net::WSP_LAST_WRITE, v.bytes, v.len );
+        }
+    }
+    networld::RemoveLocalEntity( car );
+    mPushed[ index ] = mPushed[ mNumPushed - 1 ];
+    --mNumPushed;
+}
+
+void ParkedCarManager::UpdateNetworkPushes( unsigned int elapsedMs )
+{
+    const float kStillKmh = 1.0f;
+    const unsigned int kRestMs = 1000;
+    for ( unsigned int i = 0; i < mNumPushed; )
+    {
+        Vehicle* car = mPushed[ i ].car;
+        if ( !networld::IsLocalEntity( car ) )
+        {
+            // Lost the race (another player moves it) or the match ended.
+            mPushed[ i ] = mPushed[ mNumPushed - 1 ];
+            --mNumPushed;
+            continue;
+        }
+        Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+        if ( avatar != NULL && avatar->GetVehicle() == car )
+        {
+            // We got in: it is our machine now (player stream + WOC_TAKEN).
+            StopStreamingPush( i, false );
+            continue;
+        }
+        float kmh = car->GetSpeedKmh();
+        mPushed[ i ].restMs = ( kmh < kStillKmh && kmh > -kStillKmh ) ? mPushed[ i ].restMs + elapsedMs : 0;
+        if ( mPushed[ i ].restMs >= kRestMs )
+        {
+            StopStreamingPush( i, true );
+            continue;
+        }
+        ++i;
+    }
+}
+
+void* ParkedCarManager::NetDriveBound( uint64_t boundId )
+{
+    Vehicle* car = static_cast< Vehicle* >( networld::ObjectHandleOf( boundId ) );
+    if ( car == NULL )
+    {
+        return NULL; // its zone is not loaded here: retried while the entity lives
+    }
+    ParkedCarInfo* info = NULL;
+    bool isFreeCar = false;
+    GetInstance().FindParkedCarInfo( car, info, isFreeCar );
+    if ( info == NULL || isFreeCar || info->mNetLoc < 0 )
+    {
+        return NULL;
+    }
+    car->SetNetworkDriven( true );
+    return car;
+}
+
+void ParkedCarManager::NetReleaseBound( void* handle )
+{
+    Vehicle* car = static_cast< Vehicle* >( handle );
+    if ( car != NULL )
+    {
+        car->SetNetworkDriven( false ); // the rest pose (WOC_POSE) settles it
+    }
 }
 
 void ParkedCarManager::ClaimBegin( Vehicle* car )
@@ -1158,6 +1282,22 @@ void ParkedCarManager::NetApplyCar( void* handle, unsigned char channel, const n
             break;
         }
     }
+    else if ( channel == net::WOC_POSE )
+    {
+        // Where a pushed car came to rest (also on a late join / zone reload,
+        // instead of its locator). Not while someone moves or drives it.
+        net::ObjectPose pose;
+        Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+        if ( pose.Decode( value ) && !v->IsNetworkDriven() && !networld::IsLocalEntity( v ) &&
+             ( avatar == NULL || avatar->GetVehicle() != v ) )
+        {
+            rmt::Matrix m;
+            m.Identity();
+            m.FillRotateXYZ( 0.0f, pose.yaw, 0.0f );
+            m.FillTranslate( rmt::Vector( pose.x, pose.y, pose.z ) );
+            v->SetTransform( m );
+        }
+    }
     else if ( channel == net::WOC_BROKEN && value.bytes[ 0 ] != 0 && !v->mVehicleDestroyed )
     {
         // Blown up elsewhere: run the same husk swap as a local destruction.
@@ -1179,6 +1319,7 @@ ParkedCarManager::ParkedCarManager() :
     mNumLocators( 0 ),
     mLoadingZoneUID( 0 ),
     mFreeCarLocator( NULL ),
+    mNumPushed( 0 ),
     mClaimCar( NULL ),
     mClaimPrevVehicle( NULL ),
     mClaimLost( false )

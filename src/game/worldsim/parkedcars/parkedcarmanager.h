@@ -54,6 +54,17 @@ public:
     //From EventListener
     virtual void HandleEvent( EventEnum id, void* pEventData );
 
+    // ---- networked match: pushed parked cars (P3) ----
+    // Our own simulation (our car / traffic) hit this parked car: we move it
+    // for everyone (an entity bound to the car; the first mover wins).
+    void OnPushedLocally( Vehicle* car );
+    // Per frame: a pushed car we move that came to rest publishes its pose
+    // (WOC_POSE) and stops streaming.
+    void UpdateNetworkPushes( unsigned int elapsedMs );
+    // Entity sink side: another player moves this car of ours (bound id).
+    static void* NetDriveBound( uint64_t boundId );
+    static void  NetReleaseBound( void* car );
+
     //From LoadingManager
     virtual void OnProcessRequestsComplete( void* pUserData );   
 
@@ -145,6 +156,16 @@ private:
     // first claim wins on the server). Until the verdict the entry is
     // predicted; if another player won, the player is put out of the car, the
     // previous current vehicle comes back and our copy of the car goes.
+    struct Pushed
+    {
+        Vehicle*     car;
+        unsigned int restMs;   // how long it has been still
+    };
+    static const unsigned int MAX_PUSHED = 8;
+    Pushed       mPushed[ MAX_PUSHED ];
+    unsigned int mNumPushed;
+    void StopStreamingPush( unsigned int index, bool publishPose );
+
     Vehicle* mClaimCar;          // car whose claim is pending (or lost)
     Vehicle* mClaimPrevVehicle;  // current vehicle before the entry (AddRef'd)
     bool     mClaimLost;         // waiting for the get-out to finish

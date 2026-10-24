@@ -1076,5 +1076,56 @@ namespace NetworkTests
             Assert::IsTrue(oa != net::CLAIM_NONE && ob != net::CLAIM_NONE);
             b.Leave(); a.Leave(); host.Leave();
         }
+
+        TEST_METHOD(RestPoseRoundTripsAndRefusesGarbage)
+        {
+            net::ObjectPose p;
+            p.x = 12.5f; p.y = -3.0f; p.z = 400.25f; p.yaw = 1.5f;
+            net::WorldStateValue v;
+            Assert::IsTrue(p.Encode(v));
+            Assert::AreEqual((int)net::ObjectPose::SIZE, (int)v.len);
+            net::ObjectPose back;
+            Assert::IsTrue(back.Decode(v));
+            Assert::AreEqual(400.25f, back.z);
+            Assert::AreEqual(1.5f, back.yaw);
+            v.len = 3;
+            Assert::IsFalse(back.Decode(v), L"Wrong size.");
+            p.x = std::numeric_limits<float>::quiet_NaN();
+            p.Encode(v);
+            Assert::IsFalse(back.Decode(v), L"Never a NaN pose.");
+        }
+
+        TEST_METHOD(SecondPusherFollowsTheFirst)
+        {
+            // Two players push the same parked car: both announce an entity bound
+            // to it; the server keeps the first owner and the other follows its
+            // stream with its own copy of the car (spawn sink gets the bound id).
+            for (MigGhost* g : g_migGhosts) delete g;
+            g_migGhosts.clear();
+            NetEntityManager m;
+            std::vector<net::WorldStateOp> ops;
+            m.SetSenders([&](const net::WorldStateOp& op) { ops.push_back(op); return true; },
+                         NetEntityManager::SendStatesFn());
+            NetEntityManager::Sink s = { &MigSpawn, &MigMove, &MigDespawn, &MigAdopt, &MigHit };
+            m.SetSink(s);
+            m.OnWelcomed(2);
+
+            const uint64_t carId = 0x0000777700000003ull; // the parked car's world object id
+            int car = 0;
+            net::NetEntitySpawn sp; sp.kind = net::NEK_PARKED_CAR; strcpy(sp.model, "compactA");
+            m.AddLocal(&car, sp, carId);
+            Assert::AreEqual((size_t)1, ops.size());
+            Assert::AreEqual(carId, ops[0].key.object, L"Announced under the car's own id.");
+            Assert::IsTrue(m.IsLocal(&car));
+
+            net::WorldStateEntry e;
+            e.key = ops[0].key; e.owner = 7; e.policy = net::WSP_OWNER;
+            sp.Encode(e.value);
+            m.OnAuthoritative(e, net::WSR_REJECT);
+            Assert::IsFalse(m.IsLocal(&car), L"Lost: not streamed by us.");
+            Assert::AreEqual((size_t)1, g_migGhosts.size(), L"Follows the winner.");
+            Assert::AreEqual(carId, g_migGhosts[0]->id);
+            m.OnMatchEnd();
+        }
     };
 }

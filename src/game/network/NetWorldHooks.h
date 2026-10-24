@@ -21,6 +21,9 @@ namespace networld
     // is being applied (so mirrors are never re-sent) or outside a match.
     bool     RequestObjectState(void* handle, uint8_t channel, uint8_t policy, const uint8_t* value, uint8_t len);
     bool     IsApplyingRemote();
+    // Network id of a registered object (0 = not registered) and back.
+    uint64_t ObjectIdOf(void* handle);
+    void*    ObjectHandleOf(uint64_t id);
     // Authoritative state already known for a unique object (ordinal 0).
     bool     FindObjectState(uint8_t kind, uint64_t sourceUid, uint64_t nameUid, uint8_t channel,
                              net::WorldStateValue& out);
