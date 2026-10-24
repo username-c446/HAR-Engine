@@ -103,11 +103,27 @@ struct PlayerNetworkState {
     int32 netVehicleId;       // stable network id of the vehicle
     float vehicleSpeed;       // vehicle speed (km/h) for validation
     uint8 inVehicle;          // 1 = in a vehicle
-    uint8 padding;            // size alignment
+    uint8 flags;              // FLAG_JUMPING | FLAG_IN_AIR | FLAG_LOCO_TURBO
+    // --- continuous locomotion (on foot) ---
+    uint16 motionAngle;       // desired motion direction, rad*1000
+    uint16 facingAngle;       // desired facing, rad*1000
+    uint8  speedFactor;       // 0..255 fraction of max speed
+    uint8  characterState;    // CharacterAi::CharacterState (LOCO etc.)
+    // --- one-shot action ---
+    uint8  actionEvent;       // ACTION_*; 0 = none (rising-edge latched)
+    // --- kinematic vehicle mirror (inVehicle) ---
+    float  vehYaw;            // machine heading, rad
+    uint8  vehSteer;          // signed steer -128..127 -> -45..+45 deg
+    uint16 vehSpeedKmh;       // speed, km/h
+    uint8  vehState;          // VS_NORMAL / VS_SLIP / VS_EBRAKE_SLIP
+    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE
 };
 ```
 
-- `SERIALIZED_SIZE = 4*4 + 16 + 4 + 4 + 1 + 1 = 42` bytes.
+- `SERIALIZED_SIZE = 42 (base) + 7 (locomotion) + 1 (actionEvent) + 9 (vehicle) = 58` bytes.
+- In a vehicle the locomotion/action fields are zeroed; on foot the vehicle fields are.
+- `actionEvent` is currently populated only with `ACTION_JUMP` (jump rising edge);
+  the other `ACTION_*` ids (SLAM, DODGE, CELEB…) are reserved and no-op on receive.
 - Little-endian-compatible serialization, free of padding bugs
   (`Serialize`/`Deserialize` in `PlayerNetworkState.cpp` via `net::Write*`).
 - **Validation link:** `inVehicle` picks the speed limit on the server
@@ -206,11 +222,20 @@ separate `PACKET_VEHICLE_STATE` is declared but not used. Do not duplicate it.
 - `Prune(players)` — despawn vehicles of drivers missing from the authoritative set.
 - `Update(dt)` — position interpolation (same mechanism as on-foot).
 
+- `Update(dt)` also smooths `vehYaw` over the shortest arc; steer/speed/state/
+  flags are passed to the move sink verbatim.
+
 ### Sink in gameplay context (`RemoteVehicleSpawn/Move/Despawn`)
-- Spawn via `VehicleCentral::InitVehicle(model, addToActiveList, ...,
-  VT_TRAFFIC, FORCE_NO_DRIVER, ...)` — sans driver, vehicle created as a normal
-  active one.
-- Move — `SetPosition`; Despawn — `RemoveVehicleFromActiveList` + `delete`.
+- Spawn via `VehicleCentral::AddNetworkGhostVehicle(model)` — a "network
+  ghost": in the scene and collision (renders and blocks) but **not** in the
+  active list and with no type any manager sweeps (traffic, parked cars,
+  mission reset, husk). Nothing but the network layer can free it.
+- Move — kinematic mirror: `SetTransform` (position + `vehYaw`), then speed is
+  re-applied (SetTransform zeroes it, otherwise wheels don't spin), steer,
+  brake/reverse lights.
+- Despawn — `RemoveNetworkGhostVehicle` (its final `Release()` self-deletes the
+  object). Do **not** `delete` — that double free crashed the host with two
+  remote drivers.
 
 ---
 
@@ -249,6 +274,10 @@ mp_standalone join   <hostIp> [port] [--password pw]
 - `HOSTPORT=<port>` — auto-start host.
 - `JOINIP=<ip[:port]>` — auto-start join.
 - `HOSTPASS=<pw>`, `HOSTSLOTS=<n>`, `JOINPASS=<pw>` — configuration.
+- Gameplay options (non-network, off by default): `FREEROAM` (load the level in
+  Sunday Drive without a mission), `ALLOWCARFLIP` (auto car flip),
+  `CINEMATICJUMPS` (cinematic jump camera), `EXITCARFADE` (legacy fade +
+  teleport car exit).
 - All these options apply in `GameplayContext::OnStart`, then
   `ClearNetworkOptions()` clears them so the match is not restarted again.
 
@@ -304,6 +333,13 @@ do not change.
 - Key contract: changing a position does NOT move the model in `Sync` — only sets
   the target; the actual movement happens in `Update`. This removes stutter and
   jitter at the packet frequency.
+- Facing (`rotY`) is smoothed over the shortest arc (350° → 10° through 0).
+- Locomotion fields (`motionAngle`/`facingAngle`/`speedFactor`/`characterState`,
+  turbo) reach the move sink unsmoothed: in game, when `characterState == LOCO`,
+  the puppet's `LocomotionDriver` drives them (`SetFacingDir` + speed from
+  `GetMaxSpeed()`).
+- The `action` sink fires once on the rising edge of a non-zero `actionEvent`
+  (`RemotePlayerAction`: `ACTION_JUMP` → `RemotePlayerJump`).
 
 ---
 
@@ -324,6 +360,34 @@ forcibly for everyone. Mechanic — mission-progress relay, like `PLAYER_STATE`:
 - **Client:** `GetRemoteMissionStates()` returns `map<clientId, MissionSyncState>`
   for UI "who's in which mission".
 - `MissionSyncManager` aggregates local + remote progress, testable.
+- **Engine channel:** a dedicated `PID_MISSION_STATE` in `net::Session`.
+  Provider — `IMissionStateProvider` (`WorldInterfaces.h`), sink —
+  `SetMissionStateSink`. Sent on its own slower cadence (`SetMissionSendEvery`,
+  default every 18 frames ≈ 3.3 Hz). The server relays `[sender][payload]` to
+  everyone except the sender, no validator.
+- `NetworkMatchManager::AttachMissionChannel()` wires `GameMissionAdapter` to the
+  session; remote progress via `GetRemoteMissionStates()` /
+  `GetRemoteMissionState(peerId, out)`. Test — `MissionStateRelaysThroughDedicatedChannel`.
+
+### 12.1 World events (`WorldEvent`, relayed over `PID_USER`)
+
+One-shot world changes go through `WorldEventCodec` (6-byte header + POD
+payload, no game types). Emitters live in `src/game/network/*WorldEventEmitter.*`
+and are a safe no-op outside a match:
+
+| Type | Emitter / call site | Payload |
+|---|---|---|
+| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG` (state change) | uid + state |
+| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (destroyed) | persistentId + xyz |
+| `WE_VEHICLE_DESTROYED` 0x03 | `EmitVehicleDestroyedWorldEvent` — `vehicle.cpp` (explosion) | netVehicleId + xyz |
+| `WE_COIN_COLLECTED` 0x04 | `EmitCoinCollectedWorldEvent` — `CoinManager::CheckCollection` | persistentId + xyz |
+| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `animcollisionentitydsg.h` | uid + direction |
+
+The receiver (`gameplaycontext.cpp`, `SetWorldEventSink`) currently applies only
+`WE_VEHICLE_DESTROYED`: it finds the local vehicle by net id and re-fires
+`EVENT_VEHICLE_DESTROYED` (husk logic). Remote drivers' ghosts are left alone —
+the drive-state stream despawns them. Other types are transmitted only
+(receiving is the next step, see `PRECISE_MULTIPLAYER_PLAN.ru.md`).
 
 ## 13. Game-loop integration points (`gameplaycontext.cpp`)
 

@@ -54,6 +54,7 @@ enum CmdLineOptionEnum
 
     CLO_DEBUGBV,        // Display Debug Bounding Volumes.
     CLO_SKIP_SUNDAY,    // Jump into the mission, skip sunday drive
+    CLO_FREEROAM,       // Load the level in Sunday Drive (free roam) without a mission scenario
     CLO_NO_TRAFFIC,     // Disable traffic ya!
     CLO_FPS,            // Display render stats always
     CLO_DESIGNER,       // Designer-optimised tune parameter
@@ -88,6 +89,19 @@ enum CmdLineOptionEnum
                             // multiplayer client launches that must not disturb
                             // the desktop while the user is working.
 
+    CLO_ALLOW_CAR_FLIP,     // Enable the vehicle flip mechanic (flip the car back
+                            // automatically when it lands upside down over a
+                            // ramp/air). Off by default for a clean car-driving
+                            // feel; "ALLOWCARFLIP" opts back into the flip.
+
+    CLO_CINEMATIC_JUMPS,    // Cinematic jump camera feature (see CinematicJumpsEnabled
+                            // below and CINEMATICJUMPS command line option).
+
+    CLO_EXIT_CAR_FADE,      // Legacy get-out-of-car mechanic: iris-wipe fade to
+                            // black + teleport. OFF by default (normal walking
+                            // get-out animation, GTA-style); "EXITCARFADE" opts
+                            // back into the fade + teleport exit.
+
     NUM_CLO             // Must not exceed 64
 };
 
@@ -115,8 +129,27 @@ class CommandLineOptions
         //
         static bool Get( CmdLineOptionEnum eOption );
 
+        // Whether the vehicle flip mechanic is enabled (command line "ALLOWCARFLIP").
+        // Off by default so SPACE/driving never flips the car unless opted in.
+        inline static bool GetAllowCarFlip() { return Get( CLO_ALLOW_CAR_FLIP ); }
+
         inline static short GetDefaultLevel() { return s_defaultLevel; }
         inline static short GetDefaultMission() { return s_defaultMission; }
+
+        // Whether the cinematic jump camera auto-triggers when the car goes
+        // airborne. Default FALSE (opt-in engine option; see CINEMATICJUMPS).
+        inline static bool CinematicJumpsEnabled()
+        {
+            return Get( CLO_CINEMATIC_JUMPS );
+        }
+
+        // Whether the get-out-of-car path uses the legacy iris-wipe fade-to-black
+        // + teleport exit. Default FALSE (opt-in engine option; see EXITCARFADE),
+        // which plays the normal walking get-out animation instead.
+        inline static bool ExitCarFadeEnabled()
+        {
+            return Get( CLO_EXIT_CAR_FADE );
+        }
 
         // Network auto-start options driven from the command line:
         //   -host <port>      start a multiplayer host

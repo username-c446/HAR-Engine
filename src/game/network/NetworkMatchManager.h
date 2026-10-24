@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <vector>
+#include <map>
 
 // Singleton orchestrating an online match. This is a THIN BRIDGE: it keeps the
 // same public API the rest of the game already calls (StartHost/JoinHost/Leave/
@@ -64,6 +65,21 @@ public:
     const RemotePlayerManager& GetRemotePlayers() const { return m_remotePlayers; }
     unsigned short GetLocalClientId() const { return m_session ? m_session->GetLocalPeerId() : 0; }
     unsigned short GetHostPort() const { return m_hostPort; }
+
+    // Remote players' mission progress, delivered via the dedicated
+    // PID_MISSION_STATE channel and keyed by peer id. Empty outside a match or
+    // before a peer has reported progress.
+    const std::map<int, MissionSyncState>& GetRemoteMissionStates() const
+    {
+        return m_remoteMissionStates;
+    }
+    bool GetRemoteMissionState(int peerId, MissionSyncState& out) const
+    {
+        std::map<int, MissionSyncState>::const_iterator it = m_remoteMissionStates.find(peerId);
+        if (it == m_remoteMissionStates.end()) return false;
+        out = it->second;
+        return true;
+    }
 
     // The match's server-authoritative world seed (0 outside a match). The game
     // uses it to seed its world RNG identically on every peer so the static
@@ -121,11 +137,23 @@ private:
     // existed.
     void ReattachWorldEventSink();
 
+    // Wire the dedicated mission-progress channel (PID_MISSION_STATE):
+    // attach the adapter as the session's IMissionStateProvider and register the
+    // sink that fills m_remoteMissionStates. Called after the session exists.
+    void AttachMissionChannel();
+
+    // Adapter class for bridging the typed MissionStateProvider to net::Session's
+    // opaque IMissionStateProvider. Defined in the .cpp; forward-declared here.
+    class GameMissionAdapter;
+    // Delivers a remote mission-progress blob (decoded) into m_remoteMissionStates.
+    void HandleRemoteMissionState(int peerId, const MissionSyncState& state);
+
     static NetworkMatchManager* spInstance;
 
     // Bridge to the reusable engine network layer.
     std::unique_ptr<net::Session> m_session;
     std::unique_ptr<net::GamePlayerBridge> m_bridge;
+    std::unique_ptr<GameMissionAdapter> m_missionAdapter;
 
     unsigned short m_hostPort;
     LocalStateProvider m_localStateProvider;
@@ -136,6 +164,9 @@ private:
     // Game-side authoritative remote set, fed by the bridge.
     RemotePlayerManager m_remotePlayers;
     mutable std::vector<JoinLeaveEvent> m_pendingEvents;
+
+    // Remote players' mission progress, keyed by peer id (PID_MISSION_STATE).
+    std::map<int, MissionSyncState> m_remoteMissionStates;
 
     // Decoded world-event sink (see SetWorldEventSink).
     net::WorldEventCodec::InboundFn m_worldEventSink;

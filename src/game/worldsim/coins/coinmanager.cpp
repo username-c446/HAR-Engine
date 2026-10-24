@@ -38,6 +38,7 @@
 #include <render/rendermanager/worldrenderlayer.h>
 #include <data/persistentworldmanager.h>
 #include <mission/gameplaymanager.h>
+#include <network/CoinWorldEventEmitter.h>
 #include <mission/charactersheet/charactersheetmanager.h>
 
 /* Watcher stuff */
@@ -628,6 +629,8 @@ void CoinManager::CheckCollection( ActiveCoin& Coin, const rmt::Vector& AvatarPo
         if( Coin.State == CS_RestingIndefinitely )
         {
             GetPersistentWorldManager()->OnObjectBreak( Coin.PersistentObjectID );
+            net::EmitCoinCollectedWorldEvent( Coin.PersistentObjectID,
+                                              Coin.Position.x, Coin.Position.y, Coin.Position.z );
         }
         Coin.State = CS_Collecting;
         Coin.Age = 0.0f;

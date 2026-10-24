@@ -1087,6 +1087,11 @@
     <ClCompile Include="..\game\network\RemoteVehicleWorldView.cpp" />
     <ClCompile Include="..\game\network\MissionSyncManager.cpp" />
     <ClCompile Include="..\game\network\MissionSyncState.cpp" />
+    <ClCompile Include="..\game\network\VehicleWorldEventEmitter.cpp" />
+    <ClCompile Include="..\game\network\CoinWorldEventEmitter.cpp" />
+    <ClCompile Include="..\game\network\BreakableWorldEventEmitter.cpp" />
+    <ClCompile Include="..\game\network\PlatformDirWorldEventEmitter.cpp" />
+    <ClCompile Include="..\game\network\StatePropWorldEventEmitter.cpp" />
 <ClCompile Include="..\game\network\NetworkMatchManager.cpp" />
     <ClCompile Include="..\game\network\NetworkConsoleCommands.cpp" />
     <ClCompile Include="..\game\network\ClientModManager.cpp" />

@@ -156,7 +156,20 @@ void BootupContext::StartMovies()
             // set level and mission to load for normal gameplay
             //
             GetGameplayManager()->SetLevelIndex( static_cast< RenderEnums::LevelEnum >( levelIndex ) );
-            GetGameplayManager()->SetMissionIndex( static_cast< RenderEnums::MissionEnum >( missionIndex ) );
+
+            // FREEROAM (clean client): load the level in Sunday Drive (free
+            // roam) WITHOUT forcing a mission script. The user explicitly asked
+            // to decouple missions from the default startup: missions must be
+            // optional quests, not a mandatory launch scenario. When -FREEROAM
+            // is set we simply do not assign a mission index, so
+            // GameplayManager::LevelLoaded() -> SetCurrentMission() steps into
+            // the Sunday Drive slot and nothing is scripted. Missions remain
+            // selectable as before (via the in-game flow / -M flag) but are not
+            // required to start a clean, scenario-free client.
+            if ( !CommandLineOptions::Get( CLO_FREEROAM ) )
+            {
+                GetGameplayManager()->SetMissionIndex( static_cast< RenderEnums::MissionEnum >( missionIndex ) );
+            }
 
             // skip FE and go to normal gameplay
             //

@@ -42,6 +42,8 @@
 
 #include <worldsim/redbrick/vehicle.h>
 
+#include <main/commandlineoptions.h>
+
 #include <worldsim/worldphysicsmanager.h>
 
 #include <worldsim/redbrick/geometryvehicle.h>
@@ -55,6 +57,7 @@
 #include <worldsim/avatar.h>
 #include <worldsim/character/character.h>
 #include <network/NetworkMatchManager.h>
+#include <network/VehicleWorldEventEmitter.h>
 
 
 #include <choreo/puppet.hpp>
@@ -2576,7 +2579,12 @@ void Vehicle::PostSubstepUpdate(float dt)
        GetGameplayManager()->GetGameType() ==  GameplayManager::GT_SUPERSPRINT)
     {    
         
-        if(count == 0 && GetWorldPhysicsManager()->mWorldUp.DotProduct(mVehicleUp) < 0.0f)
+        // The automatic "flip the car back" mechanic (avatar's car lands upside
+        // down over a ramp/air and the engine resets it on the spot) is gated
+        // behind the command line flag ALLOWCARFLIP. Off by default so a clean
+        // car-driving feel is standard; a mod/game opts back in with the flag.
+        if( CommandLineOptions::GetAllowCarFlip() &&
+            count == 0 && GetWorldPhysicsManager()->mWorldUp.DotProduct(mVehicleUp) < 0.0f)
         {
             float linear = mPastLinear.Smooth(GetSimState()->GetLinearVelocity().Magnitude());
             float angular = mPastAngular.Smooth(GetSimState()->GetAngularVelocity().Magnitude());
@@ -2691,6 +2699,7 @@ void Vehicle::PostSubstepUpdate(float dt)
                     {
                         // appropriate manager should catch this and swap in husk
                         GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED, (void*)this);
+                        net::EmitVehicleDestroyedWorldEvent(this);
                     }
                 }
                 
@@ -2713,6 +2722,7 @@ void Vehicle::PostSubstepUpdate(float dt)
                     {
                         // appropriate manager should catch this and swap in husk
                         GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED, (void*)this);
+                        net::EmitVehicleDestroyedWorldEvent(this);
                         if(mWasHitByVehicleType != VT_AI)
                         {
                             GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED_BY_USER, (void*)this);

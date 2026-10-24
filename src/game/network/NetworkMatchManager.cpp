@@ -16,6 +16,27 @@
 #include "RemoteVehicleWorldView.h"
 #include <chrono>
 
+// Bridges the game's typed MissionStateProvider ((MissionSyncState&) -> bool)
+// to the engine Session's opaque IMissionStateProvider (bytes). Serializes the
+// 13-byte MissionSyncState into the buffer the session ships on PID_MISSION_STATE.
+class NetworkMatchManager::GameMissionAdapter : public net::IMissionStateProvider
+{
+public:
+    MissionStateProvider typed = nullptr;
+
+    bool GetMissionState(uint8_t* out, uint16_t capacity, uint16_t& size) override
+    {
+        if (typed == nullptr) return false;
+        if (capacity < static_cast<uint16_t>(MissionSyncState::SERIALIZED_SIZE)) return false;
+        MissionSyncState st;
+        st.Clear();
+        if (!typed(st)) return false;
+        st.Serialize(reinterpret_cast<char*>(out));
+        size = static_cast<uint16_t>(MissionSyncState::SERIALIZED_SIZE);
+        return true;
+    }
+};
+
 NetworkMatchManager* NetworkMatchManager::spInstance = nullptr;
 
 NetworkMatchManager::NetworkMatchManager()
@@ -85,6 +106,7 @@ m_hostPort = port;
 
     // Bridge the world views to the session sinks.
     m_bridge->AttachToSession(m_session.get());
+    AttachMissionChannel();
     ReattachWorldEventSink();
     return true;
 }
@@ -108,6 +130,7 @@ bool NetworkMatchManager::JoinHost(const char* serverIp, unsigned short port)
     }
     m_hostPort = port;
     m_bridge->AttachToSession(m_session.get());
+    AttachMissionChannel();
     ReattachWorldEventSink();
     return true;
 }
@@ -118,7 +141,32 @@ void NetworkMatchManager::Leave()
         m_session->Leave();
     m_hostPort = 0;
     m_remotePlayers.Clear();
+    m_remoteMissionStates.clear();
     m_pendingEvents.clear();
+}
+
+void NetworkMatchManager::AttachMissionChannel()
+{
+    if (!m_session) return;
+    // Set up the adapter for the typed provider if it wasn't created yet.
+    if (!m_missionAdapter)
+        m_missionAdapter.reset(new GameMissionAdapter());
+    m_missionAdapter->typed = m_missionStateProvider;
+
+    m_session->SetMissionStateProvider(m_missionAdapter.get());
+    m_session->SetMissionStateSink(
+        [this](net::PeerId from, const uint8_t* data, uint16_t size)
+        {
+            if (size < static_cast<uint16_t>(MissionSyncState::SERIALIZED_SIZE)) return;
+            MissionSyncState st;
+            st.Deserialize(reinterpret_cast<const char*>(data));
+            HandleRemoteMissionState(static_cast<int>(from), st);
+        });
+}
+
+void NetworkMatchManager::HandleRemoteMissionState(int peerId, const MissionSyncState& state)
+{
+    m_remoteMissionStates[peerId] = state;
 }
 
 void NetworkMatchManager::ReattachWorldEventSink()
@@ -142,10 +190,12 @@ void NetworkMatchManager::SetLocalStateProvider(LocalStateProvider provider)
 
 void NetworkMatchManager::SetMissionStateProvider(MissionStateProvider provider)
 {
-    // Mission sync is still carried by the legacy MissionSyncManager path; this
-    // hook is preserved for API compatibility (mission relay is not tied to the
-    // engine Session yet).
-    (void)provider;
+    m_missionStateProvider = provider;
+    // Propagate to the session adapter immediately if it already exists (e.g.
+    // set before StartHost/JoinHost, or re-set mid-match). AttachMissionChannel
+    // also reads m_missionStateProvider when the session is created.
+    if (m_missionAdapter)
+        m_missionAdapter->typed = provider;
 }
 
 void NetworkMatchManager::SetHostConfig(const char* password, unsigned short maxPlayers)

@@ -1244,6 +1244,124 @@ bool VehicleCentral::RemoveVehicleFromActiveList(Vehicle* vehicle)
 
 
 //=============================================================================
+// VehicleCentral::AddNetworkGhostVehicle
+//=============================================================================
+// Description: Creates a vehicle that mirrors a remote driver in a networked
+//              match. The ghost is placed in the world scene + collision so it
+//              renders and blocks, but it is deliberately NOT added to the
+//              sweepable active-vehicle list and carries no type that any game
+//              manager treats as its own (we use VT_AI + no traffic/parked/trigger
+//              registration). Normal traffic/mission/parked-car/husk cleanup can
+//              therefore never find, steal or free it. Ownership is exclusive to
+//              the caller, which must call RemoveNetworkGhostVehicle + delete.
+//
+// Parameters:  (const char* name)
+//
+// Return:      Vehicle*  (NULL on failure)
+//
+//=============================================================================
+Vehicle* VehicleCentral::AddNetworkGhostVehicle( const char* name )
+{
+    if( name == NULL || name[0] == '\0' )
+    {
+        return NULL;
+    }
+
+    // Do NOT add to the active vehicle list: if the network ghost were registered
+    // there (especially as VT_TRAFFIC), the regular vehicle managers could sweep,
+    // recycle or free it under the network layer -> use-after-free/double-free.
+    Vehicle* ghost = InitVehicle( name, /*addToActiveVehicleList=*/false, NULL,
+                                  VT_AI, FORCE_NO_DRIVER, /*playercar=*/false,
+                                  /*startoutofcar=*/false );
+    if( ghost == NULL )
+    {
+        return NULL;
+    }
+
+    // Unregister the get-in action released for the default slot id: the ghost is
+    // not in the active list, so its event locator's action button must not point
+    // anywhere (it stays uninitialised / no prompt appears).
+    ghost->ActivateTriggers( false );
+
+    // Own it: an explicit ownership reference so no external Release while the
+    // sink still uses the raw pointer can destroy it early. Balanced by a Release
+    // in RemoveNetworkGhostVehicle.
+    ghost->AddRef();
+
+    //--------------------------------------------------------------------------
+    // Register for rendering + collision ONLY (mirror the parts of
+    // AddVehicleToActiveList the ghost needs), skipping:
+    //   * the mActiveVehicleList[slot] entry             (the sweepable handle)
+    //   * the AI/trigger/action-button/event plumbing
+    //--------------------------------------------------------------------------
+    GetRenderManager()->pWorldScene()->Add( (DynaPhysDSG*)ghost );
+
+    ghost->GetCollisionAreaIndexAndAddSelf();
+
+    int curWorldRenderLayer = GetRenderManager()->rCurWorldRenderLayer();
+    ghost->SetRenderLayerEnum( (RenderEnums::LayerEnum)curWorldRenderLayer );
+
+    // Not a real active-list slot.
+    ghost->mVehicleCentralIndex = -1;
+
+    return ghost;
+}
+
+
+//=============================================================================
+// VehicleCentral::RemoveNetworkGhostVehicle
+//=============================================================================
+// Description: Undoes AddNetworkGhostVehicle: removes the ghost from the world
+//              scene, frees its collision area/index and Releases the ownership
+//              ref taken at creation. It does NOT delete the object (the caller
+//              does, after this returns) and it does NOT touch the active-vehicle
+//              list (the ghost is never in it).
+//
+// Parameters:  (Vehicle* vehicle)
+//
+// Return:      bool  (true if it was registered as a network ghost, false otherwise)
+//
+//=============================================================================
+bool VehicleCentral::RemoveNetworkGhostVehicle( Vehicle* vehicle )
+{
+    if( vehicle == NULL )
+    {
+        return false;
+    }
+
+    if( vehicle->mVehicleCentralIndex != -1 )
+    {
+        // Not a network ghost (it is in the active list) -- refuse to tear it down
+        // through this path so we can never double-own or double-free a normal car.
+        return false;
+    }
+
+    // Mirror RemoveVehicleFromActiveList's DSG-removal dance: switch to the
+    // vehicle's own render layer before removing from the world scene.
+    int& curRenderLayer = GetRenderManager()->rCurWorldRenderLayer();
+    int orgRenderLayer = curRenderLayer;
+    curRenderLayer = vehicle->GetRenderLayerEnum();
+
+    GetRenderManager()->pWorldScene()->Remove( (DynaPhysDSG*)vehicle );
+
+    curRenderLayer = orgRenderLayer;
+
+    GetWorldPhysicsManager()->RemoveFromAnyOtherCurrentDynamicsListAndCollisionArea( vehicle );
+    vehicle->RemoveSelfAndFreeCollisionAreaIndex();
+
+    vehicle->ActivateTriggers( false );
+
+    vehicle->mVehicleCentralIndex = -1;
+
+    // Balance the ownership AddRef from AddNetworkGhostVehicle. This leaves the
+    // object alive (refcount >= 1) for the caller to delete.
+    vehicle->Release();
+
+    return true;
+}
+
+
+//=============================================================================
 // VehicleCentral::KillEmAll
 //=============================================================================
 // Description: Comment

@@ -64,4 +64,26 @@ namespace net
         // Returns true if the state may be relayed, false to drop it.
         virtual bool ValidatePeerState(PeerId from, const uint8_t* data, uint16_t size) = 0;
     };
+
+    // -------------------------------------------------------------------
+    // Dedicated mission-progress channel (PID_MISSION_STATE).
+    //
+    // Mission progress is small (~13 bytes) and slow-moving compared to the
+    // per-frame player transform, so it rides its own packet id + cadence
+    // instead of bloating every transform snapshot. The same relay semantics as
+    // player state apply: the server relays a framed [sender][payload] to all
+    // other peers (omitting the sender), and every session (including the host,
+    // through its loopback client) delivers remote blobs to the sink.
+    // -------------------------------------------------------------------
+
+    // ILocalMissionProvider: the session asks "what is the local mission
+    // progress to send to peers?" Fills `out` with the serialized blob (the
+    // game's MissionSyncState bytes). Returns false when there is nothing to
+    // send yet.
+    class IMissionStateProvider
+    {
+    public:
+        virtual ~IMissionStateProvider() = default;
+        virtual bool GetMissionState(uint8_t* out, uint16_t capacity, uint16_t& size) = 0;
+    };
 }

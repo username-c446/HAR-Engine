@@ -48,6 +48,11 @@ void RemoteVehicleWorldView::SyncDriver(int playerId, const PlayerNetworkState& 
     entry.targetX = state.x;
     entry.targetY = state.y;
     entry.targetZ = state.z;
+    entry.targetYaw = state.vehYaw;
+    entry.targetSteer = state.vehSteer;
+    entry.targetSpeedKmh = state.vehSpeedKmh;
+    entry.targetState = state.vehState;
+    entry.targetFlags = state.vehFlags;
     entry.smoothingApplied = false;
 }
 
@@ -101,12 +106,27 @@ void RemoteVehicleWorldView::Update(float dt)
         entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
         entry.smoothingApplied = true;
 
+        // Decrementally rotate the yaw toward its target over the shortest arc
+        // (mirrors RemotePlayerWorldView's facing smoothing).
+        static const float kPi = 3.14159265f;
+        float diff = entry.targetYaw - entry.visualYaw;
+        while (diff >  kPi) diff -= 2.0f * kPi;
+        while (diff < -kPi) diff += 2.0f * kPi;
+        if (diff != 0.0f) entry.visualYaw += diff * alpha;
+        if (entry.visualYaw >  kPi) entry.visualYaw -= 2.0f * kPi;
+        if (entry.visualYaw < -kPi) entry.visualYaw += 2.0f * kPi;
+
         if (m_sink.move)
         {
             PlayerNetworkState state;
             state.x = entry.visualX;
             state.y = entry.visualY;
             state.z = entry.visualZ;
+            state.vehYaw = entry.visualYaw;
+            state.vehSteer = entry.targetSteer;
+            state.vehSpeedKmh = entry.targetSpeedKmh;
+            state.vehState = entry.targetState;
+            state.vehFlags = entry.targetFlags;
             m_sink.move(kv.first, entry.handle, state);
         }
     }
@@ -124,6 +144,11 @@ void RemoteVehicleWorldView::SpawnFor(int playerId, const PlayerNetworkState& st
     entry.targetX = entry.visualX = state.x;
     entry.targetY = entry.visualY = state.y;
     entry.targetZ = entry.visualZ = state.z;
+    entry.targetYaw = entry.visualYaw = state.vehYaw;
+    entry.targetSteer = state.vehSteer;
+    entry.targetSpeedKmh = state.vehSpeedKmh;
+    entry.targetState = state.vehState;
+    entry.targetFlags = state.vehFlags;
     entry.smoothingApplied = false;
     m_entries[playerId] = entry;
 

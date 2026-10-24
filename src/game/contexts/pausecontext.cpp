@@ -36,6 +36,7 @@
 #include <interiors/interiormanager.h>
 #include <meta/triggervolumetracker.h>
 #include <mission/gameplaymanager.h>
+#include <network/NetworkMatchManager.h>
 #include <presentation/gui/guisystem.h>
 #include <presentation/gui/ingame/guimanageringame.h>
 #include <presentation/gui/ingame/guiscreenhud.h>
@@ -463,6 +464,19 @@ void PauseContext::OnStop( ContextEnum nextContext )
 //=============================================================================
 void PauseContext::OnUpdate( unsigned int elapsedTime )
 {
+    // Keep the online match alive while paused. The network layer is normally
+    // driven from GameplayContext::OnUpdate, which the gameflow does NOT call
+    // while we are in the Pause context. If we stop pumping it here, a paused
+    // client stops sending its state/heartbeat: the server and other clients
+    // keep showing this player standing still at the last pre-pause position,
+    // and the peer is one liveness-timeout away from being dropped. Pumping the
+    // match here keeps a paused client visible and connected.
+    NetworkMatchManager* pMatch = NetworkMatchManager::GetInstance();
+    if ( pMatch != NULL && pMatch->IsInMatch() )
+    {
+        pMatch->Update();
+    }
+
     // update game data manager
     GetGameDataManager()->Update( elapsedTime );
 

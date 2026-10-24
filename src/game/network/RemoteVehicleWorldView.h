@@ -63,6 +63,11 @@ private:
         int netVehicleId;
         float targetX, targetY, targetZ;
         float visualX, visualY, visualZ;
+        float targetYaw, visualYaw; // smoothed over shortest arc (mirrors player facing)
+        uint8_t targetSteer;
+        uint16_t targetSpeedKmh;
+        uint8_t targetState;
+        uint8_t targetFlags;
         bool smoothingApplied;
     };
 

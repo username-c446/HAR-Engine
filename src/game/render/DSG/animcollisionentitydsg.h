@@ -21,6 +21,7 @@
 
 #include <render/DSG/collisionentitydsg.h>
 #include <worldsim/physicsairef.h>
+#include <network/PlatformDirWorldEventEmitter.h>
 
 
 //========================================
@@ -127,7 +128,13 @@ public:
     }
     void SetAnimationDirection( float fDirection )
     {
-        mfDirection = fDirection;
+        if ( fDirection != mfDirection )
+        {
+            mfDirection = fDirection;
+            // Direction really changed: mirror the new playback direction.
+            net::EmitPlatformDirWorldEvent( static_cast<uint32_t>( GetUID() ),
+                                            static_cast<int32_t>( mfDirection ) );
+        }
     }
     
     void SetAction( ActionButton::AnimSwitch* pActionButton );

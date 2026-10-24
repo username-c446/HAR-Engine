@@ -95,6 +95,7 @@
 #include <network/RemoteVehicleWorldView.h>
 #include <console/console.h>
 #include <worldsim/redbrick/vehicle.h>
+#include <worldsim/redbrick/geometryvehicle.h>
 #include <worldsim/vehiclecentral.h>
 
 #include <render/breakables/breakablesmanager.h>
@@ -143,6 +144,16 @@ namespace
     //    client does not wrongly drop the host's state (peer id 0 == world index 0
     //    is a coincidence of connect order, not a semantic link).
     // See docs/MULTIPLAYER_SYNC_MANIFEST.ru.md, "Индекс аватара vs сетевой peer-id".
+
+    // Scales a radian heading to the wire's uint16 (radians * 1000, clamped).
+    const float kAngleScale = 1000.0f;
+    const uint16_t kAngleMax = 65535;
+    // Steer-angle wire scale: byte units per degree. -45..+45 deg ~ -128..127.
+    const float kSteerUnitsPerDeg = 255.0f / 90.0f;
+    // Jump never clears DURING the action; latch the rising edge so actionEvent
+    // is non-zero only for the single snapshot where the local jump started.
+    static uint8_t s_lastJumpFlag = 0;
+
     bool GameplayLocalStateProvider( PlayerNetworkState& outState )
     {
         AvatarManager* am = GetAvatarManager();
@@ -177,6 +188,10 @@ namespace
             {
                 outState.flags |= PlayerNetworkState::FLAG_IN_AIR;
             }
+            if ( pChar->IsTurbo() )
+            {
+                outState.flags |= PlayerNetworkState::FLAG_LOCO_TURBO;
+            }
         }
 
         Vehicle* vehicle = avatar->GetVehicle();
@@ -200,6 +215,25 @@ namespace
                 : static_cast<int>( reinterpret_cast<uintptr_t>( vehicle ) & 0x7FFFFFFF );
 
             outState.vehicleSpeed = vehicle->GetSpeedKmh();
+
+            // Loco/action channels are meaningless while in a machine: zero them.
+            outState.motionAngle = 0;
+            outState.facingAngle = 0;
+            outState.speedFactor = 0;
+            outState.characterState = 0;
+            outState.actionEvent = 0;
+
+            // Faithful kinematic vehicle mirror fields.
+            outState.vehYaw = vehicle->GetFacingInRadians();
+            float steerDeg = vehicle->mWheelTurnAngle * (180.0f / rmt::PI);
+            outState.vehSteer = static_cast<uint8_t>(
+                static_cast<int8_t>( steerDeg * kSteerUnitsPerDeg ) );
+            float kmh = vehicle->GetSpeedKmh();
+            outState.vehSpeedKmh = kmh < 0.0f ? 0 : ( kmh > 65535.0f ? 65535 : static_cast<uint16_t>( kmh ) );
+            outState.vehState = static_cast<uint8_t>( vehicle->mVehicleState );
+            outState.vehFlags = 0;
+            if ( vehicle->mBrakeLightsOn )    outState.vehFlags |= PlayerNetworkState::VEH_FLAG_BRAKE;
+            if ( vehicle->mReverseLightsOn )  outState.vehFlags |= PlayerNetworkState::VEH_FLAG_REVERSE;
         }
         else
         {
@@ -207,6 +241,66 @@ namespace
             outState.netVehicleId = 0;
             outState.vehicleSpeed = 0.0f;
             outState.inVehicle = 0;
+
+            // Zero the machine-mirror fields (unused on foot).
+            outState.vehYaw = 0.0f;
+            outState.vehSteer = 0;
+            outState.vehSpeedKmh = 0;
+            outState.vehState = 0;
+            outState.vehFlags = 0;
+
+            // Continuous locomotion + one-shot action for the on-foot state.
+            outState.motionAngle = 0;
+            outState.facingAngle = 0;
+            outState.speedFactor = 0;
+            outState.characterState = 0;
+            outState.actionEvent = 0;
+            if ( pChar != NULL )
+            {
+                if ( pChar->GetFacingDir() >= 0.0f && pChar->GetFacingDir() < 2.0f * rmt::PI )
+                {
+                    int f = static_cast<int>( pChar->GetFacingDir() * kAngleScale );
+                    outState.facingAngle = static_cast<uint16_t>( f < 0 ? 0 : ( f > kAngleMax ? kAngleMax : f ) );
+                }
+                // DesiredDir is the direction of travel. If it is unusable, fall
+                // back to the facing angle (the character pivots in place / walks
+                // facing wherever it is headed by default).
+                float desiredDir = pChar->GetDesiredDir();
+                if ( desiredDir < 0.0f || desiredDir >= 2.0f * rmt::PI )
+                {
+                    desiredDir = pChar->GetFacingDir();
+                }
+                int m = static_cast<int>( desiredDir * kAngleScale );
+                outState.motionAngle = static_cast<uint16_t>( m < 0 ? 0 : ( m > kAngleMax ? kAngleMax : m ) );
+
+                float maxSpeed = pChar->GetMaxSpeed();
+                if ( maxSpeed > 0.0f )
+                {
+                    float frac = pChar->GetDesiredSpeed() / maxSpeed;
+                    frac = frac < 0.0f ? 0.0f : ( frac > 1.0f ? 1.0f : frac );
+                    outState.speedFactor = static_cast<uint8_t>( frac * 255.0f );
+                }
+                else
+                {
+                    outState.speedFactor = 0;
+                }
+
+                CharacterAi::StateManager* sm = pChar->GetStateManager();
+                if ( sm != NULL )
+                {
+                    outState.characterState = static_cast<uint8_t>( sm->GetState() );
+                }
+
+                // One-shot action: rising edge of the local jump -> ACTION_JUMP on
+                // exactly this snapshot, then back to ACTION_NONE. Kept minimal;
+                // the remaining ACTION_* ids are reserved for later passes.
+                uint8_t jumpNow = ( outState.flags & PlayerNetworkState::FLAG_JUMPING ) ? 1u : 0u;
+                if ( jumpNow && s_lastJumpFlag == 0 )
+                {
+                    outState.actionEvent = static_cast<uint8_t>( PlayerNetworkState::ACTION_JUMP );
+                }
+                s_lastJumpFlag = jumpNow;
+            }
         }
         return true;
     }
@@ -235,11 +329,21 @@ namespace
     // mirror what other network players report through their PlayerNetworkState.
     void* RemotePlayerSpawn( int playerId )
     {
+        static int s_spawnDiagLogged = 0;
+        {
+            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_spawn_diag.txt", "a" );
+            if (f) { fprintf( f, "[SPAWN] RemotePlayerSpawn(playerId=%d) call#%d\n", playerId, s_spawnDiagLogged++ ); fclose( f ); }
+        }
         char name[32];
         sprintf( name, "mp_remote_%d", playerId );
         Character* c = GetCharacterManager()->AddCharacter(
             CharacterManager::NPC, name, "homer", "npd", NULL );
-        if ( c == NULL ) return NULL;
+        if ( c == NULL )
+        {
+            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_spawn_diag.txt", "a" );
+            if (f) { fprintf( f, "[SPAWN]   -> AddCharacter returned NULL!\n" ); fclose( f ); }
+            return NULL;
+        }
         // AddCharacter does NOT put NPCs into the world scene (only PCs get
         // AddToWorldScene there), so an NPC would exist but never render.
         // Also, an NPC in its default state is static: locomotion is not driven
@@ -275,17 +379,32 @@ namespace
                 c->GetWalkerLocomotionAction()->GetDriver();
             if ( driver != NULL )
             {
-                rmt::Vector cur;
-                c->GetPosition( &cur );
-                rmt::Vector delta = pos - cur;
-                float horizDist = sqrtf( delta.x * delta.x + delta.z * delta.z );
-                float speed = ( horizDist > 0.05f ) ? ( horizDist * 8.0f ) : 0.0f;
+                // Use the reported continuous-locomotion fields directly. Only
+                // when characterState says the sender is LOCO (walking/running)
+                // do we drive the pose with these; otherwise we leave the remote
+                // character sitting in whatever its current action is.
+                if ( state.characterState == static_cast<uint8_t>(CharacterAi::LOCO) )
+                {
+                    float motionRad = state.motionAngle / 1000.0f;
+                    float facingRad = state.facingAngle / 1000.0f;
 
-                driver->SetDesiredFacingAngle( state.rotY );
-                driver->SetDesiredMotionAngle( state.rotY );
-                driver->SetDesiredVelocity( speed );
-                c->SetFacingDir( state.rotY );
-                c->SetDesiredDir( state.rotY );
+                    // Scale the 0..255 fraction by the sender-consistent max
+                    // speed. GetMaxSpeed() already folds turbo in; a remote turbo
+                    // bumper is mirrored by also raising the clamp here.
+                    float maxSpeed = c->GetMaxSpeed();
+                    if ( ( state.flags & PlayerNetworkState::FLAG_LOCO_TURBO )
+                         && !c->IsTurbo() )
+                    {
+                        maxSpeed = CharacterTune::sfMaxSpeed + CharacterTune::sfDashBurstMax;
+                    }
+                    float speed = ( state.speedFactor / 255.0f ) * maxSpeed;
+
+                    driver->SetDesiredMotionAngle( motionRad );
+                    driver->SetDesiredFacingAngle( facingRad );
+                    driver->SetDesiredVelocity( speed );
+                    c->SetFacingDir( facingRad );
+                    c->SetDesiredDir( motionRad );
+                }
             }
         }
 
@@ -299,7 +418,7 @@ namespace
         {
             c->SetPosition( pos );
         }
-    }
+}
 
     void RemotePlayerDespawn( int playerId, void* handle )
     {
@@ -328,21 +447,44 @@ namespace
         c->GetActionController()->GetNextSequencer()->EndSequence();
     }
 
-    // Ghost-vehicle sink: mirrors a remote driver's machine in the world.
+    // The remote player started a one-shot action (rising edge of actionEvent):
+    // play the matching skeletal animation locally. This pass plumbs the
+    // transport/rising-edge and routes ACTION_JUMP to RemotePlayerJump; the
+    // other ids are reserved for later passes (no-op for now).
+    void RemotePlayerAction( int playerId, void* handle, uint8_t actionEvent )
+    {
+        switch ( actionEvent )
+        {
+        case static_cast<uint8_t>( PlayerNetworkState::ACTION_JUMP ):
+            RemotePlayerJump( playerId, handle );
+            break;
+        default:
+            // Reserved for later passes (SLAM, DODGE, CELEBRATION, ...): no-op.
+            break;
+        }
+    }
+
+// Ghost-vehicle sink: mirrors a remote driver's machine in the world.
     // The vehicle is created through VehicleCentral just like a normal car, so
     // the correct model renders. We keep it simple: the ghost tracks the remote
     // driver's reported position each frame; collisions are those of a normal
     // active vehicle.
-    void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
+void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
     {
         (void)netVehicleId;
-        if ( model == NULL || model[0] == '\0' ) return NULL;
-        Vehicle* v = GetVehicleCentral()->InitVehicle(
-            model, true /*addToActiveVehicleList*/, NULL,
-            VT_TRAFFIC, VehicleCentral::FORCE_NO_DRIVER, false, false );
-        if ( v == NULL ) return NULL;
-        // Tag the handle with the remote player so we can identify/track it.
         (void)playerId;
+        // Create a network ghost that is opaque to the rest of the game: it is
+        // placed in the world scene + collision so the remote car renders and
+        // blocks, but it is NOT registered in VehicleCentral's sweepable
+        // active-vehicle list and carries no type any game manager sweeps. This
+        // guarantees TrafficManager / parked-cars / mission-reset / husk logic can
+        // never steal or free the ghost under the network layer (the use-after-free
+        // / heap-corruption hazard on the multi-client host). Ownership is
+        // relinquished on despawn by RemoteVehicleDespawn (which must NOT delete
+        // the ghost: the final Release() inside RemoveNetworkGhostVehicle already
+        // frees it).
+        Vehicle* v = GetVehicleCentral()->AddNetworkGhostVehicle( model );
+        if ( v == NULL ) return NULL;
         return v;
     }
 
@@ -352,7 +494,46 @@ namespace
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
         rmt::Vector pos( state.x, state.y, state.z );
-        v->SetPosition( &pos );
+
+        // Kinematic mirror: position + heading through a matrix (the established
+        // spawn pattern, see vehicle.cpp ResetOnSpot ~1391). SetTransform resets
+        // speed, so the reported speed is re-applied afterwards to keep wheels
+        // spinning.
+        rmt::Matrix m;
+        m.Identity();
+        m.FillRotateXYZ( 0.0f, state.vehYaw, 0.0f );
+        m.FillTranslate( pos );
+        v->SetTransform( m );
+
+        // SetTransform zeroes mSpeed/mSpeedKmh; restore so wheels spin.
+        v->mSpeed = ( state.vehSpeedKmh > 3000.0f ) ? 3000.0f : static_cast<float>( state.vehSpeedKmh ) / 3.6f;
+        v->mSpeedKmh = state.vehSpeedKmh;
+
+        // Steering: the signed steer byte maps -128..127 to -45..+45 degrees.
+        float steerDeg = static_cast<int8_t>( state.vehSteer ) / ( 255.0f / 90.0f );
+        float steerRad = steerDeg * ( rmt::PI / 180.0f );
+        v->SetWheelTurnAngleDirectlyInRadiansForDusitOnly( steerRad );
+
+        // Visual brake/reverse lights, null-guarded per the plan.
+        if ( v->mGeometryVehicle != NULL )
+        {
+            if ( state.vehFlags & PlayerNetworkState::VEH_FLAG_BRAKE )
+            {
+                v->mGeometryVehicle->ShowBrakeLights();
+            }
+            else
+            {
+                v->mGeometryVehicle->HideBrakeLights();
+            }
+            if ( state.vehFlags & PlayerNetworkState::VEH_FLAG_REVERSE )
+            {
+                v->mGeometryVehicle->ShowReverseLights();
+            }
+            else
+            {
+                v->mGeometryVehicle->HideReverseLights();
+            }
+        }
     }
 
     void RemoteVehicleDespawn( int playerId, void* handle )
@@ -360,8 +541,20 @@ namespace
         (void)playerId;
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
-        GetVehicleCentral()->RemoveVehicleFromActiveList( v );
-        delete v;
+        // The ghost is NOT in the active list (see AddNetworkGhostVehicle), so
+        // RemoveVehicleFromActiveList would be a no-op. Use the dedicated ghost
+        // teardown that undoes the world-scene + collision registration.
+        //
+        // NOTE: we must NOT `delete v` here. AddNetworkGhostVehicle took two
+        // references (the explicit ownership AddRef + the world scene's AddRef),
+        // so RemoveNetworkGhostVehicle's final Release() drops the count to 0 and
+        // radLoadObject::Release() SELF-DELETES the Vehicle (it frees the object
+        // whenever the count is < 2). An extra `delete v` here is therefore a
+        // second free of the same block -> heap corruption (0xc0000005) that
+        // kills the host as soon as two remotes drive and their ghosts
+        // spawn/despawn. This sink's only job is to relinquish the ownership; the
+        // teardown already freed the object.
+        GetVehicleCentral()->RemoveNetworkGhostVehicle( v );
     }
 
     // Singleton access without leading to circular includes.
@@ -470,6 +663,11 @@ GameplayContext::~GameplayContext()
 //=============================================================================
 void GameplayContext::OnStart( ContextEnum previousContext )
 {
+    {
+        FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_autostart_diag.txt", "a" );
+        if (f) { fprintf( f, "[MP] GameplayContext::OnStart prev=%d host=%d join=%d\n", (int)previousContext, (int)CommandLineOptions::GetHostMode(), (int)CommandLineOptions::GetJoinMode() ); fclose( f ); }
+    }
+
     // Common to all playing contexts.
     //
     PlayingContext::OnStart( previousContext );
@@ -486,6 +684,25 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     pMatchMgr->SetLocalStateProvider( &GameplayLocalStateProvider );
     pMatchMgr->SetMissionStateProvider( &GameplayMissionStateProvider );
 
+    // Consume replicated world events from remote peers. Today we mirror
+    // WE_VEHICLE_DESTROYED: when a peer reports a machine exploded, we find the
+    // matching local Vehicle (by its stable net id) and re-fire the local
+    // EVENT_VEHICLE_DESTROYED so the usual husk-swap / destruction logic reacts.
+    // If the vehicle is not ours (e.g. a remote driver's ghost, which is not in
+    // VehicleCentral), we do nothing — the ghost is despawned by the drive-state
+    // stream once the remote driver reports "no longer in a vehicle".
+    pMatchMgr->SetWorldEventSink(
+        []( const net::WorldEventCodec::Decoded* ev )
+        {
+            if ( ev == nullptr || ev->type != net::WE_VEHICLE_DESTROYED ) return;
+            net::VehicleDestroyedPayload payload;
+            if ( !net::VehicleDestroyedPayload::Decode( ev->payload, ev->payloadSize, payload ) )
+                return;
+            Vehicle* local = GetVehicleCentral()->GetVehicle( payload.netVehicleId );
+            if ( local == nullptr ) return;   // not one of ours; ghost handled by state stream
+            GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( local ) );
+        } );
+
     // Auto-start a match from the command line (-host <port> / -join <ip:port>).
     // Useful for scripted/testing launches of host and client copies.
     bool autoHost = CommandLineOptions::GetHostMode();
@@ -500,16 +717,26 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     (void)hostPassword; (void)hostSlots; (void)joinPassword;
     if (autoHost || autoJoin)
     {
-        // Auto-start is exercised only via explicit host/join args; keep on.
+        // Diagnostic: the engine does not write printf to a redirected stdout,
+        // so dump the autostart result to a file we can read after launch.
+        auto mpDiag = []() -> FILE*
+        {
+            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_autostart_diag.txt", "a" );
+            return f;
+        };
         if (autoHost)
         {
             pMatchMgr->SetHostConfig( hostPassword[0] != '\0' ? hostPassword : NULL, hostSlots );
-            pMatchMgr->StartHost( hostPort );
+            bool started = pMatchMgr->StartHost( hostPort );
+            FILE* f = mpDiag();
+            if (f) { fprintf( f, "[MP AUTOSTART] StartHost(port=%u) -> %s\n", hostPort, started ? "true" : "false" ); fclose( f ); }
         }
         else if (autoJoin)
         {
             if (joinPassword[0] != '\0') pMatchMgr->SetClientPassword( joinPassword );
-            pMatchMgr->JoinHost( s_autoJoinIp, joinPort );
+            bool joined = pMatchMgr->JoinHost( s_autoJoinIp, joinPort );
+            FILE* f = mpDiag();
+            if (f) { fprintf( f, "[MP AUTOSTART] JoinHost(%s:%u) -> %s\n", s_autoJoinIp, joinPort, joined ? "true" : "false" ); fclose( f ); }
         }
     }
 
@@ -518,6 +745,7 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     sink.spawn = &RemotePlayerSpawn;
     sink.move = &RemotePlayerMove;
     sink.jump = &RemotePlayerJump;
+    sink.action = &RemotePlayerAction;
     sink.despawn = &RemotePlayerDespawn;
     GetRemotePlayerWorldView()->SetSink( sink );
 
@@ -741,6 +969,10 @@ void GameplayContext::OnStart( ContextEnum previousContext )
 //=============================================================================
 void GameplayContext::OnStop( ContextEnum nextContext )
 {
+    {
+        FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/host_exit_diag.txt", "a" );
+        if (f) { fprintf( f, "[EXIT] GameplayContext::OnStop nextContext=%d\n", (int)nextContext ); fclose( f ); }
+    }
     GetPresentationManager()->OnGameplayStop();
 
     // turn off controller rumble, to comply w/ TCR/TRC standards
@@ -897,11 +1129,29 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
     if (pMatch != NULL && pMatch->IsInMatch())
     {
         pMatch->Update();
+        // Diagnostic: how many remote players does this process actually know?
+        {
+            static int s_cntDiag = 0;
+            if ( (++s_cntDiag & 0x3F) == 0 )
+            {
+                int n = pMatch->GetRemotePlayers().GetPlayerCount();
+                FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_cnt_diag.txt", "a" );
+                if (f) { fprintf( f, "[CNT] tick=%d remotePlayerCount=%d\n", s_cntDiag, n ); fclose( f ); }
+            }
+        }
         // Reflect remote players' latest states in the world.
         GetRemotePlayerWorldView()->Sync( pMatch->GetRemotePlayers() );
         // Advance each remote player's visual position smoothly toward its
         // target so network refresh does not produce teleports.
-        GetRemotePlayerWorldView()->Update( elapsedTime );
+        //
+        // NOTE: the world-view Update(float dt) contract is SECONDS (its
+        // m_smoothingSeconds field and every unit test treat dt as seconds).
+        // elapsedTime is MILLISECONDS, so we must normalise before passing it,
+        // otherwise alpha = 1 - exp(-lambda*dt) is fed a value ~1000x too large
+        // and every remote player's visual position teleports its full distance
+        // to the latest reported target on the very first Update — destroying
+        // the smoothing this call exists to provide.
+        GetRemotePlayerWorldView()->Update( static_cast<float>( elapsedTime ) / 1000.0f );
         // Mirror remote drivers' ghost vehicles (spawn/move/despawn) and step
         // their positions smoothly as well.
         pMatch->GetRemotePlayers().ForEachPlayer(
@@ -913,7 +1163,8 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
             NULL );
         // Drop ghost vehicles of remote players who are no longer connected.
         GetRemoteVehicleWorldView()->Prune( pMatch->GetRemotePlayers() );
-        GetRemoteVehicleWorldView()->Update( elapsedTime );
+        // Ms -> seconds, as with the player view above (see the NOTE there).
+        GetRemoteVehicleWorldView()->Update( static_cast<float>( elapsedTime ) / 1000.0f );
 
         // Surface join/leave notifications as console messages.
         std::vector<NetworkMatchManager::JoinLeaveEvent> events;

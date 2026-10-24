@@ -683,8 +683,21 @@ void NPCController::Update( float seconds )
             //rAssert( rmt::Epsilon( myFacing.MagnitudeSqr(), 1.0f, 0.001f ) );
 
             rmt::Vector toPlayer = playerPos - myPos;
-            toPlayer.NormalizeSafe();
-            rAssert( rmt::Epsilon( toPlayer.MagnitudeSqr(), 1.0f, 0.001f ) );
+            if ( toPlayer.MagnitudeSqr() > 1e-6f )
+            {
+                toPlayer.NormalizeSafe();
+            }
+            else
+            {
+                // The target avatar sits on our own position (e.g. a networked
+                // ghost spawned at our feet, or split-screen P1 == P2). There is
+                // no meaningful direction to face; fall back to the current
+                // facing so the NPC keeps its last orientation instead of
+                // asserting on a zero-length vector.
+                toPlayer.Set( myFacing.x, myFacing.y, myFacing.z );
+                toPlayer.NormalizeSafe();
+            }
+            //rAssert( rmt::Epsilon( toPlayer.MagnitudeSqr(), 1.0f, 0.001f ) );
 
             //cosN for N being > half the animation turn angle
             const float COSALPHA_TURN_TOLERANCE = 0.8387f; 

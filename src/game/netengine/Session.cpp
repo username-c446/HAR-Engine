@@ -33,6 +33,7 @@ namespace net
         constexpr const PacketId kIdSeed       = PID_WORLD_SEED;
         constexpr const PacketId kIdPlayerList = PID_PLAYER_LIST;
         constexpr const PacketId kIdState      = PID_PLAYER_STATE;
+        constexpr const PacketId kIdMission   = PID_MISSION_STATE;
         constexpr const PacketId kIdAuth       = PID_AUTH;
         constexpr const PacketId kIdPing       = PID_PING;
         constexpr const PacketId kIdPong       = PID_PONG;
@@ -171,6 +172,16 @@ namespace net
                 // players through its loopback client — it will receive the
                 // relayed copy there. So we do NOT feed the sink directly.
             }
+            if (rp.id == kIdMission)
+            {
+                // Dedicated mission-progress relay: forward the small blob to
+                // every OTHER peer, framed like player state. No validator.
+                uint8_t framed[2 + MAX_PACKET_PAYLOAD];
+                if (rp.size + 2 > sizeof(framed)) return;
+                WriteU16Le(framed, rp.from);
+                std::memcpy(framed + 2, rp.data, rp.size);
+                m_server->Broadcast(kIdMission, framed, static_cast<uint16_t>(rp.size + 2), rp.from);
+            }
         });
 
         // Server side: on connect, admit the peer only if the session is open
@@ -261,6 +272,13 @@ namespace net
                 if (from != m_selfId)               // ignore echo of ourselves
                     HandleRemoteState(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
             }
+            else if (rp.id == kIdMission && rp.size >= 2 + 1)
+            {
+                PeerId from = ReadU16Le(rp.data);
+                if (from != m_selfId)               // ignore echo of ourselves
+                    HandleRemoteMissionState(from, rp.data + 2,
+                                             static_cast<uint16_t>(rp.size - 2));
+            }
         });
 
         return true;
@@ -320,6 +338,13 @@ namespace net
                 if (from != m_selfId)
                     HandleRemoteState(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
             }
+            else if (rp.id == kIdMission && rp.size >= 2 + 1)
+            {
+                PeerId from = ReadU16Le(rp.data);
+                if (from != m_selfId)
+                    HandleRemoteMissionState(from, rp.data + 2,
+                                             static_cast<uint16_t>(rp.size - 2));
+            }
         });
 
         return true;
@@ -336,6 +361,7 @@ namespace net
         m_port = 0;
         m_peerRoster.clear();
         m_joinLeave = nullptr;
+        m_missionTick = 0;
     }
 
     void Session::Update()
@@ -345,6 +371,7 @@ namespace net
 
         SendAuthIfDue();
         SendLocalStateIfDue();
+        SendMissionStateIfDue();
     }
 
     void Session::SendAuthIfDue()
@@ -378,7 +405,32 @@ namespace net
         // simplicity (self-echo filtered on the sink by peer id).
         if (m_client && m_client->SendTo(kIdState, m_stateScratch, size))
             return; // client-session: sent to the server (which relays)
-        if (m_server) m_server->Broadcast(kIdState, m_stateScratch, size, 0);
+        if (m_server)
+        {
+            m_server->Broadcast(kIdState, m_stateScratch, size, 0);
+            return;
+        }
+    }
+
+    void Session::SendMissionStateIfDue()
+    {
+        if (!m_missionState) return;
+        if (!IsJoined()) return;
+
+        // Slower, frame-based cadence: default ~every 18 Update frames (≈ every
+        // 3rd state send at the default 6-frame player-state cadence) so mission
+        // progress does not pile onto every transform snapshot.
+        if (++m_missionTick < m_missionSendEvery) return;
+        m_missionTick = 0;
+
+        uint16_t size = 0;
+        if (!m_missionState->GetMissionState(m_missionScratch, sizeof(m_missionScratch), size))
+            return;
+        if (size == 0) return;
+
+        if (m_client && m_client->SendTo(kIdMission, m_missionScratch, size))
+            return; // client-session: sent to the server (which relays)
+        if (m_server) m_server->Broadcast(kIdMission, m_missionScratch, size, 0);
     }
 
     bool Session::SendCustomEvent(const uint8_t* data, uint16_t size)
@@ -395,6 +447,11 @@ namespace net
     void Session::HandleRemoteState(PeerId from, const uint8_t* data, uint16_t size)
     {
         if (m_remoteSink) m_remoteSink->ApplyRemoteState(from, data, size);
+    }
+
+    void Session::HandleRemoteMissionState(PeerId from, const uint8_t* data, uint16_t size)
+    {
+        if (m_missionSink) m_missionSink(from, data, size);
     }
 
     void Session::SetHostPassword(const char* password)

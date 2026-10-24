@@ -34,6 +34,7 @@
 #include <camera/supercammanager.h>
 
 #include <main/game.h>
+#include <main/commandlineoptions.h>
 #include <mission/gameplaymanager.h>
 #include <mission/charactersheet/charactersheetmanager.h>
 #include <cheats/cheatinputsystem.h>
@@ -217,9 +218,17 @@ void FollowCam::Update( unsigned int milliseconds )
 
     //---------  Test to see if the target is still unstable
 
+    // The auto-triggered cinematic jump camera (airborne off a ramp -> dramatic
+    // locked view) is a configurable engine option. By default it is OFF, so
+    // going airborne keeps the normal follow camera. Real crashes (IsUnstable)
+    // and sharp turns (IsQuickTurn) still switch to the unstable view regardless
+    // of the option.
+    const bool airCinematicEnabled = CommandLineOptions::CinematicJumpsEnabled();
+
     if ( !GetFlag((Flag)FIRST_TIME) &&
          !GetFlag((Flag)CUT) && 
-         ( target->IsUnstable() || target->IsQuickTurn() || target->IsAirborn() ) &&
+         ( target->IsUnstable() || target->IsQuickTurn() ||
+           ( airCinematicEnabled && target->IsAirborn() ) ) &&
          !GetSuperCamManager()->GetSCC( GetPlayerID() )->IsCutCam()
        )
     {

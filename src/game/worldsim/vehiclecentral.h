@@ -73,6 +73,22 @@ class VehicleCentral : public LoadingManager::ProcessRequestsCallback
         bool RemoveVehicleFromActiveList(Vehicle* vehicle);              
         // remove from dsg
 
+        // Creates a "network ghost" vehicle used to mirror a remote driver's
+        // machine in a networked match. Unlike InitVehicle+AddVehicleToActiveList,
+        // the ghost is placed into the world scene and collision system (so it
+        // renders and blocks) but is NOT registered in the sweepable active-vehicle
+        // list and carries no type that any game manager (TrafficManager, parked
+        // cars, mission reset, chase/husk logic) treats as one of its own. It is
+        // therefore opaque to the rest of the game: no normal manager may remove or
+        // free it. Ownership is exclusive — the caller (remote-vehicle despawn sink)
+        // must call RemoveNetworkGhostVehicle then delete it. Returns NULL on failure.
+        Vehicle* AddNetworkGhostVehicle( const char* name );
+        // Tears the ghost down: removes it from the world scene and releases its
+        // collision area/index, then Releases the ownership ref taken at creation.
+        // Does NOT delete the object; the caller deletes it after this returns.
+        // Returns false if the pointer was never registered by AddNetworkGhostVehicle.
+        bool RemoveNetworkGhostVehicle( Vehicle* vehicle );
+
         //Triage hack, only for demo mode, or until Greg actually 
         //addrefs and releases --dm 12/01/02
         VehicleController* RemoveVehicleController( int mAIIndex );

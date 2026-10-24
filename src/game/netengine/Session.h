@@ -116,6 +116,20 @@ namespace net
         // Broadcast cadence for local state. Default every 6th Update (~10 Hz).
         void SetStateSendEvery(unsigned n) { m_stateSendEvery = (n > 0) ? n : 1; }
 
+        // ---- dedicated mission-progress channel (PID_MISSION_STATE) -------
+
+        // The session asks this provider for the local mission-progress blob and
+        // ships it to peers on its own (slower) cadence. May be null (idle).
+        void SetMissionStateProvider(IMissionStateProvider* p) { m_missionState = p; }
+        // The session delivers remote mission-progress blobs to this sink.
+        using MissionStateFn = std::function<void(PeerId from, const uint8_t* data, uint16_t size)>;
+        void SetMissionStateSink(MissionStateFn fn) { m_missionSink = std::move(fn); }
+
+        // Broadcast cadence for mission progress, in Update frames: mission is sent
+        // every m_missionSendEvery frames. Default 18 (≈ every 3rd player-state
+        // send at the default 6-frame state cadence, ~3.3 Hz at 60 fps).
+        void SetMissionSendEvery(unsigned n) { m_missionSendEvery = (n > 0) ? n : 1; }
+
         // ---- open user-data channel (0x8000+) -------------------------------
 
         // Callback for inbound custom events. `from` is the originating peer;
@@ -134,6 +148,11 @@ namespace net
         void SendLocalStateIfDue();
         // Delivers an inbound state packet to m_remoteSink.
         void HandleRemoteState(PeerId from, const uint8_t* data, uint16_t size);
+        // Sends the local mission-progress blob (from m_missionState) to all
+        // peers, on the slower frame-based mission cadence.
+        void SendMissionStateIfDue();
+        // Delivers an inbound mission-state packet to m_missionSink.
+        void HandleRemoteMissionState(PeerId from, const uint8_t* data, uint16_t size);
         // Presents the client-side password to the host once the ENet peer is
         // up (and only once). No-op when absent or already sent.
         void SendAuthIfDue();
@@ -162,6 +181,13 @@ namespace net
         unsigned             m_stateSendEvery = 6;
         unsigned             m_stateTick     = 0;
         uint8_t              m_stateScratch[MAX_PACKET_PAYLOAD];
+
+        // Dedicated mission-progress channel (PID_MISSION_STATE).
+        IMissionStateProvider* m_missionState = nullptr;
+        MissionStateFn         m_missionSink;  // inbound mission-progress sink
+        unsigned               m_missionSendEvery = 18; // update frames between mission sends
+        unsigned               m_missionTick = 0;
+        uint8_t                m_missionScratch[MAX_PACKET_PAYLOAD];
 
         // Client-side password setter (no-op on a host).
         void SetClientPassword(const char* password);

@@ -13,6 +13,19 @@ void PlayerNetworkState::Serialize(char* buffer) const
     net::WriteFloat(p, vehicleSpeed);
     *p++ = inVehicle;
     *p++ = flags;
+    // ---- loco ----
+    net::WriteU16(p, motionAngle);
+    net::WriteU16(p, facingAngle);
+    *p++ = speedFactor;
+    *p++ = characterState;
+    // ---- action ----
+    *p++ = actionEvent;
+    // ---- vehicle mirror ----
+    net::WriteFloat(p, vehYaw);
+    *p++ = vehSteer;
+    net::WriteU16(p, vehSpeedKmh);
+    *p++ = vehState;
+    *p++ = vehFlags;
 }
 
 void PlayerNetworkState::Deserialize(const char* buffer)
@@ -27,4 +40,17 @@ void PlayerNetworkState::Deserialize(const char* buffer)
     vehicleSpeed = net::ReadFloat(p);
     inVehicle = static_cast<uint8_t>(*p++);
     flags = static_cast<uint8_t>(*p++);
+    // ---- loco ----
+    motionAngle = net::ReadU16(p);
+    facingAngle = net::ReadU16(p);
+    speedFactor = static_cast<uint8_t>(*p++);
+    characterState = static_cast<uint8_t>(*p++);
+    // ---- action ----
+    actionEvent = static_cast<uint8_t>(*p++);
+    // ---- vehicle mirror ----
+    vehYaw = net::ReadFloat(p);
+    vehSteer = static_cast<uint8_t>(*p++);
+    vehSpeedKmh = net::ReadU16(p);
+    vehState = static_cast<uint8_t>(*p++);
+    vehFlags = static_cast<uint8_t>(*p++);
 }

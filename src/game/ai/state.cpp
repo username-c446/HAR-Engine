@@ -47,6 +47,7 @@
 
 #include <gameflow/gameflow.h>
 #include <main/game.h>
+#include <main/commandlineoptions.h>
 
 #include <meta/locator.h>
 
@@ -1412,13 +1413,20 @@ void GetOut::Enter( void )
 
     bool iris = !destroyed && (mObstructed || mpCharacter->GetTargetVehicle()->mIrisTransition);
 
+    // EXITCARFADE command-line flag (default OFF): the legacy get-out-of-car
+    // mechanic is an iris-wipe fade to black followed by a teleport. When the
+    // flag is OFF—the default—skip the wipe/teleport entirely and always play
+    // the normal GTA-style walking get-out animation (GetOut::DoGetOut). When
+    // EXITCARFADE is set to ON, preserve the original iris + teleport behavior.
+    bool useNormalExit = !CommandLineOptions::ExitCarFadeEnabled();
+
     if(mFirst)
     {
         mFirst = false;
         GetEventManager()->TriggerEvent( EVENT_GETOUTOFVEHICLE_START, mpCharacter );
     }
 
-    if ( !iris || mpCharacter != GetCharacterManager()->GetCharacter(0))
+    if ( useNormalExit || !iris || mpCharacter != GetCharacterManager()->GetCharacter(0))
     {
         mpCharacter->AddToWorldScene();
         mpCharacter->SetScale(1.0f);

@@ -8,6 +8,10 @@
 #include "ClientModManager.h"
 #include "MissionSyncState.h"
 #include "WorldEvent.h"
+#include "CoinWorldEventEmitter.h"
+#include "BreakableWorldEventEmitter.h"
+#include "PlatformDirWorldEventEmitter.h"
+#include "StatePropWorldEventEmitter.h"
 #include "MissionSyncManager.h"
 #include "../game/netengine/Packet.h"
 #include "../game/netengine/PacketRegistry.h"
@@ -171,6 +175,16 @@ namespace NetworkTests
             state.vehicleSpeed = 66.0f;
             state.inVehicle = 1;
             state.flags = PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR;
+            state.motionAngle = 1234;
+            state.facingAngle = 4321;
+            state.speedFactor = 200;
+            state.characterState = 1; // CharacterAi::LOCO
+            state.actionEvent = PlayerNetworkState::ACTION_JUMP;
+            state.vehYaw = 2.5f;
+            state.vehSteer = 64;
+            state.vehSpeedKmh = 88;
+            state.vehState = 1;
+            state.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE | PlayerNetworkState::VEH_FLAG_REVERSE;
 
             char buffer[PlayerNetworkState::SERIALIZED_SIZE];
             state.Serialize(buffer);
@@ -187,14 +201,68 @@ namespace NetworkTests
             Assert::AreEqual(state.vehicleSpeed, restored.vehicleSpeed);
             Assert::AreEqual(state.inVehicle, restored.inVehicle);
             Assert::AreEqual(static_cast<int>(state.flags), static_cast<int>(restored.flags));
+            Assert::AreEqual(static_cast<int>(state.motionAngle), static_cast<int>(restored.motionAngle));
+            Assert::AreEqual(static_cast<int>(state.facingAngle), static_cast<int>(restored.facingAngle));
+            Assert::AreEqual(static_cast<int>(state.speedFactor), static_cast<int>(restored.speedFactor));
+            Assert::AreEqual(static_cast<int>(state.characterState), static_cast<int>(restored.characterState));
+            Assert::AreEqual(static_cast<int>(state.actionEvent), static_cast<int>(restored.actionEvent));
+            Assert::AreEqual(state.vehYaw, restored.vehYaw);
+            Assert::AreEqual(static_cast<int>(state.vehSteer), static_cast<int>(restored.vehSteer));
+            Assert::AreEqual(static_cast<int>(state.vehSpeedKmh), static_cast<int>(restored.vehSpeedKmh));
+            Assert::AreEqual(static_cast<int>(state.vehState), static_cast<int>(restored.vehState));
+            Assert::AreEqual(static_cast<int>(state.vehFlags), static_cast<int>(restored.vehFlags));
         }
 
         TEST_METHOD(SerializedSizeIsStable)
         {
             // Serialization must not depend on struct padding/alignment.
-            // 4 floats (x,y,z,rotY) + vehicleModel[16] + int32 netVehicleId
-            // + float vehicleSpeed + uint8 inVehicle + uint8 padding.
-            Assert::AreEqual<int>(4 * 4 + 16 + 4 + 4 + 1 + 1, PlayerNetworkState::SERIALIZED_SIZE);
+            // 4 floats + vehicleModel[16] + int32 + float + 2*uint8         (base 42)
+            // + 2*uint16 + 2*uint8 + uint8                                  (loco +7 = 49)
+            // + uint8                                                       (action +1 = 50)
+            // + float + uint8 + uint16 + uint8 + uint8                      (vehicle mirror +9 = 59?? -> 58)
+            // Correct: 42 (base) + 4 (2*u16) + 2 (2*u8) + 1 (action) + 4 (float) + 1 (u8) + 2 (u16) + 1 (u8) + 1 (u8) = 58.
+            Assert::AreEqual<int>(4 * 4 + 16 + 4 + 4 + 2 + 4 + 2 + 1 + 4 + 1 + 2 + 1 + 1, PlayerNetworkState::SERIALIZED_SIZE);
+        }
+
+        TEST_METHOD(LocoFieldsRoundTripSerialize)
+        {
+            // Continuous-locomotion + vehicle-mirror fields survive a wire
+            // round-trip, and the new stable SERIALIZED_SIZE is enforced.
+            PlayerNetworkState state;
+            state.x = 1.0f; state.y = 2.0f; state.z = 3.0f; state.rotY = 0.5f;
+            strcpy(state.vehicleModel, "homer");
+            state.netVehicleId = 9;
+            state.vehicleSpeed = 50.0f;
+            state.inVehicle = 1;
+            state.flags = PlayerNetworkState::FLAG_LOCO_TURBO;
+            state.motionAngle = 3141;   // ~PI radians
+            state.facingAngle = 1000;   // 1 radian
+            state.speedFactor = 128;    // half speed
+            state.characterState = 1;   // LOCO
+            state.actionEvent = PlayerNetworkState::ACTION_JUMP;
+            state.vehYaw = 1.75f;
+            state.vehSteer = static_cast<uint8_t>(static_cast<int8_t>(30 * (255.0f / 90.0f))); // ~+30 deg
+            state.vehSpeedKmh = 95;
+            state.vehState = 0;         // VS_NORMAL
+            state.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE;
+
+            Assert::AreEqual<int>(58, PlayerNetworkState::SERIALIZED_SIZE, L"SERIALIZED_SIZE drifted.");
+            char buffer[PlayerNetworkState::SERIALIZED_SIZE];
+            state.Serialize(buffer);
+            PlayerNetworkState restored;
+            restored.Deserialize(buffer);
+
+            Assert::AreEqual(static_cast<int>(state.motionAngle), static_cast<int>(restored.motionAngle));
+            Assert::AreEqual(static_cast<int>(state.facingAngle), static_cast<int>(restored.facingAngle));
+            Assert::AreEqual(static_cast<int>(state.speedFactor), static_cast<int>(restored.speedFactor));
+            Assert::AreEqual(static_cast<int>(state.characterState), static_cast<int>(restored.characterState));
+            Assert::AreEqual(static_cast<int>(state.flags), static_cast<int>(restored.flags));
+            Assert::AreEqual(static_cast<int>(state.actionEvent), static_cast<int>(restored.actionEvent));
+            Assert::AreEqual(state.vehYaw, restored.vehYaw);
+            Assert::AreEqual(static_cast<int>(state.vehSteer), static_cast<int>(restored.vehSteer));
+            Assert::AreEqual(static_cast<int>(state.vehSpeedKmh), static_cast<int>(restored.vehSpeedKmh));
+            Assert::AreEqual(static_cast<int>(state.vehState), static_cast<int>(restored.vehState));
+            Assert::AreEqual(static_cast<int>(state.vehFlags), static_cast<int>(restored.vehFlags));
         }
     };
 
@@ -748,6 +816,8 @@ namespace NetworkTests
         {
             int spawnCount;
             int despawnCount;
+            int actionCount; // number of times the action sink fired (rising edges)
+            std::vector<uint8_t> lastActions; // the actionEvents seen at each fire
             std::map<int, PlayerNetworkState> lastMoves;
         };
 
@@ -770,6 +840,13 @@ namespace NetworkTests
         {
             (void)handle;
             g_fakeWorld.lastMoves[playerId] = state;
+        }
+        void FakeAction(int playerId, void* handle, uint8_t actionEvent)
+        {
+            (void)playerId;
+            (void)handle;
+            g_fakeWorld.actionCount++;
+            g_fakeWorld.lastActions.push_back(actionEvent);
         }
         void FakeDespawn(int playerId, void* handle)
         {
@@ -873,6 +950,97 @@ namespace NetworkTests
             view.Clear();
         }
 
+        TEST_METHOD(UpdateInterpretsDtInSecondsNotMilliseconds)
+        {
+            // REGRESSION (multiplayer sync bug): GameplayContext::OnUpdate feeds
+            // the world view a per-frame dt. `elapsedTime` there is milliseconds
+            // but RemotePlayerWorldView::Update(float dt) is documented (and
+            // unit-tested) as SECONDS, via its m_smoothingSeconds field. If a
+            // caller passes milliseconds (e.g. 16 for a 60fps frame), alpha =
+            // 1 - exp(-lambda * 16) underflows to ~1.0 and the remote player's
+            // visual position teleports its ENTIRE distance to the latest
+            // reported target on the first Update — so "remote players spawn but
+            // never smoothly move". This test pins the seconds contract: a
+            // realistic per-frame dt in seconds must advance only PARTWAY toward
+            // a far target, never teleport the whole way.
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(0.12f); // the production default
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
+            players.UpdatePlayer(1, p);
+            view.Sync(players); // spawn at 0,0,0
+            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[1].x);
+
+            // Target far ahead; advance by one 60fps frame, expressed in seconds.
+            p.x = 100.0f;
+            players.UpdatePlayer(1, p);
+            view.Sync(players);
+            view.Update(1.0f / 60.0f); // ~16.7 ms, correctly in seconds
+            float first = g_fakeWorld.lastMoves[1].x;
+            Assert::IsTrue(first > 0.0f && first < 100.0f,
+                L"A per-frame dt in seconds must NOT teleport the visual position "
+                L"to the target (that is the ms-vs-seconds regression).");
+
+            view.Clear();
+        }
+
+        TEST_METHOD(FacingSmoothsToTargetOverShortestArc)
+        {
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(1.0f); // slow: first step visibly between angles
+
+            const float kPi = 3.14159265f;
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = p.y = p.z = 0.0f;
+            p.rotY = 0.0f;
+            players.UpdatePlayer(1, p);
+            view.Sync(players); // spawn facing 0
+            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[1].rotY);
+
+            // Target jumps to ~350deg (6.1 rad). The shortest arc is +10deg
+            // through 0, so the smoothed value must go NEGATIVE (e.g. -few deg),
+            // not climb toward +350.
+            p.rotY = 350.0f * kPi / 180.0f;
+            players.UpdatePlayer(1, p);
+            view.Sync(players);
+            view.Update(0.1f);
+            float first = g_fakeWorld.lastMoves[1].rotY;
+            Assert::IsTrue(first < 0.0f && first > -1.0f,
+                L"Facing should rotate back (-few deg) toward 350 through the short arc.");
+
+            // Converge. Result should normalize near -10deg (== 350), not +350.
+            for (int i = 0; i < 40; ++i)
+            {
+                view.Sync(players);
+                view.Update(0.1f);
+            }
+            float end = g_fakeWorld.lastMoves[1].rotY;
+            Assert::IsTrue(fabsf(end + 10.0f * kPi / 180.0f) < 0.05f,
+                L"Facing should converge to -10deg (== 350deg), normalized.");
+
+            view.Clear();
+        }
+
         TEST_METHOD(NoMovementWithoutUpdate)
         {
             g_fakeWorld.spawnCount = 0;
@@ -953,6 +1121,175 @@ namespace NetworkTests
             Assert::AreEqual(100.0f, g_fakeWorld.lastMoves[3].y,
                 L"While jumping, the height must snap instantly into place.");
             // Horizontal may still be interpolating (not a full snap) — that's fine.
+
+            view.Clear();
+        }
+
+        TEST_METHOD(RemotePoseAppliesLocomotionDriver)
+        {
+            // A remote state reporting LOCO + a non-zero speed factor must reach
+            // the move sink with those continuous-locomotion fields intact, so a
+            // real driver (wired on the game side) can animate the walk.
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(1.0f); // keep the visual position mostly stationary
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
+            p.motionAngle = 2500;      // ~2.5 rad
+            p.facingAngle = 1000;      // 1.0 rad
+            p.speedFactor = 192;       // ~75% speed
+            p.characterState = 1;      // CharacterAi::LOCO
+            p.flags = PlayerNetworkState::FLAG_LOCO_TURBO;
+            players.UpdatePlayer(5, p);
+            view.Sync(players); // spawn: initial move carries the fields verbatim
+            view.Update(1.0f);
+
+            PlayerNetworkState got = g_fakeWorld.lastMoves[5];
+            Assert::AreEqual(static_cast<int>(p.motionAngle), static_cast<int>(got.motionAngle),
+                L"Move sink must carry the reported motionAngle.");
+            Assert::AreEqual(static_cast<int>(p.facingAngle), static_cast<int>(got.facingAngle),
+                L"Move sink must carry the reported facingAngle.");
+            Assert::AreEqual(static_cast<int>(p.speedFactor), static_cast<int>(got.speedFactor),
+                L"Move sink must carry the reported speedFactor.");
+            Assert::AreEqual(static_cast<int>(p.characterState), static_cast<int>(got.characterState),
+                L"Move sink must carry the reported characterState (LOCO).");
+            Assert::AreEqual(static_cast<int>(p.flags), static_cast<int>(got.flags),
+                L"Move sink must carry the reported flags (turbo included).");
+
+            // A later frame with a NON-LOCO state must NOT overwrite the driver
+            // target on the move sink (gated by characterState in the game sink);
+            // the view still forwards the new state verbatim so the game side can
+            // decide.
+            PlayerNetworkState p2 = p;
+            p2.characterState = 5; // INSIM
+            p2.speedFactor = 0;
+            players.UpdatePlayer(5, p2);
+            view.Sync(players);
+            view.Update(1.0f);
+            PlayerNetworkState got2 = g_fakeWorld.lastMoves[5];
+            Assert::AreEqual(static_cast<int>(5), static_cast<int>(got2.characterState),
+                L"Move sink must forward the non-LOCO characterState unchanged.");
+
+            view.Clear();
+        }
+
+        TEST_METHOD(ActionEventRisingEdgeFiresOnce)
+        {
+            // The action sink must fire ONLY on the rising edge of a non-zero
+            // actionEvent — continuous non-zero action must not re-fire.
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.actionCount = 0;
+            g_fakeWorld.lastActions.clear();
+            g_fakeWorld.lastMoves.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.action = &FakeAction;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(0.01f);
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
+            p.actionEvent = PlayerNetworkState::ACTION_NONE;
+            players.UpdatePlayer(6, p);
+            view.Sync(players); // spawn with none
+            Assert::AreEqual(0, g_fakeWorld.actionCount, L"Spawn with ACTION_NONE must not fire.");
+
+            // First non-zero action -> fires once.
+            p.actionEvent = PlayerNetworkState::ACTION_JUMP;
+            players.UpdatePlayer(6, p);
+            view.Sync(players);
+            Assert::AreEqual(1, g_fakeWorld.actionCount, L"Action rising edge must fire once.");
+            Assert::AreEqual(static_cast<int>(PlayerNetworkState::ACTION_JUMP),
+                static_cast<int>(g_fakeWorld.lastActions[0]));
+
+            // Same action stays non-zero on the next packet -> must NOT re-fire.
+            view.Sync(players);
+            view.Sync(players);
+            Assert::AreEqual(1, g_fakeWorld.actionCount, L"Continuous non-zero action must not re-fire.");
+
+            // A different action id is a new rising edge -> fires again.
+            p.actionEvent = PlayerNetworkState::ACTION_DODGE; // reserved id passes through transport
+            players.UpdatePlayer(6, p);
+            view.Sync(players);
+            Assert::AreEqual(2, g_fakeWorld.actionCount, L"A different action id is a new rising edge.");
+
+            // Back to none, then the same jump again -> fires a fresh rising edge.
+            p.actionEvent = PlayerNetworkState::ACTION_NONE;
+            players.UpdatePlayer(6, p);
+            view.Sync(players);
+            p.actionEvent = PlayerNetworkState::ACTION_JUMP;
+            players.UpdatePlayer(6, p);
+            view.Sync(players);
+            Assert::AreEqual(3, g_fakeWorld.actionCount, L"Returning to a cleared action re-arms the edge.");
+
+            view.Clear();
+        }
+
+        TEST_METHOD(VehicleYawSteerRoundTrip)
+        {
+            // Vehicle mirror fields survive the remote-vehicle view: it forwards
+            // the smoothed yaw + steer/speed/state to the move sink, and the yaw
+            // is smoothed over the shortest arc (near 350deg converges back through 0).
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemoteVehicleWorldView view;
+            RemoteVehicleWorldView::Sink sink;
+            sink.spawn = &FakeVehicleSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(1.0f); // slow: first step visibly between angles
+
+            PlayerNetworkState v;
+            v.x = 0.0f; v.y = 0.0f; v.z = 0.0f;
+            v.inVehicle = 1;
+            strcpy(v.vehicleModel, "homer");
+            v.netVehicleId = 11;
+            v.vehYaw = 0.0f;
+            v.vehSteer = 0;
+            v.vehSpeedKmh = 60;
+            v.vehState = 0;
+            v.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE;
+            view.SyncDriver(9, v);
+            view.Update(1.0f);
+
+            PlayerNetworkState got = g_fakeWorld.lastMoves[9];
+            Assert::AreEqual(static_cast<int>(v.vehSteer), static_cast<int>(got.vehSteer),
+                L"Steer should reach the move sink.");
+            Assert::AreEqual(static_cast<int>(v.vehSpeedKmh), static_cast<int>(got.vehSpeedKmh),
+                L"Speed should reach the move sink.");
+            Assert::AreEqual(static_cast<int>(v.vehState), static_cast<int>(got.vehState),
+                L"Vehicle state should reach the move sink.");
+            Assert::AreEqual(static_cast<int>(v.vehFlags), static_cast<int>(got.vehFlags),
+                L"Vehicle flags should reach the move sink.");
+
+            // Yaw jumps to ~350deg. Shortest arc is through 0 => first step negative.
+            const float kPi = 3.14159265f;
+            v.vehYaw = 350.0f * kPi / 180.0f;
+            view.SyncDriver(9, v);
+            view.Update(0.1f);
+            Assert::IsTrue(g_fakeWorld.lastMoves[9].vehYaw < 0.0f && g_fakeWorld.lastMoves[9].vehYaw > -1.0f,
+                L"Vehicle yaw should rotate back through the short arc, not climb to +350.");
+            for (int i = 0; i < 40; ++i) { view.SyncDriver(9, v); view.Update(0.1f); }
+            Assert::IsTrue(fabsf(g_fakeWorld.lastMoves[9].vehYaw + 10.0f * kPi / 180.0f) < 0.05f,
+                L"Vehicle yaw should converge to -10deg (== 350deg).");
 
             view.Clear();
         }
@@ -1068,6 +1405,97 @@ namespace NetworkTests
             view.Prune(empty);
             Assert::AreEqual(1, g_fakeWorld.despawnCount,
                 L"Ghost of a disconnected remote driver should be removed.");
+
+            view.Clear();
+        }
+
+        // Regression for the two-remote-driver host crash: when a SECOND remote
+        // driver is present, both ghosts are spawned in the same ForEachPlayer
+        // pass and frequently rebuilt on model/inVehicle toggles. The world-view
+        // contract is that EVERY despawn must be matched one-to-one with a prior
+        // spawn for THAT player. If SyncDriver ever emits an extra despawn (or a
+        // despawn with no matching live ghost), the real game sink ends up
+        // destroying a ghost that is already gone -> double-free / heap
+        // corruption. This test drives two players through enter/exit + model
+        // toggles and asserts spawn/despawn balance is exact.
+        TEST_METHOD(TwoDriversEnterExitAndToggleStayBalanced)
+        {
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemoteVehicleWorldView view;
+            RemoteVehicleWorldView::Sink sink;
+            sink.spawn = &FakeVehicleSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            view.SetSmoothing(0.01f);
+
+            PlayerNetworkState onFoot;
+            onFoot.x = 0.0f; onFoot.y = 0.0f; onFoot.z = 0.0f; onFoot.inVehicle = 0;
+            onFoot.vehicleModel[0] = '\0';
+
+            PlayerNetworkState carHomer = onFoot;
+            carHomer.inVehicle = 1;
+            strcpy(carHomer.vehicleModel, "homer");
+            carHomer.netVehicleId = 1;
+            carHomer.x = 10.0f;
+
+            PlayerNetworkState carCop = onFoot;
+            carCop.inVehicle = 1;
+            strcpy(carCop.vehicleModel, "cops_v");
+            carCop.netVehicleId = 2;
+            carCop.x = 40.0f;
+
+            int expectedSpawns = 0, expectedDespawns = 0;
+
+            // Both players enter at the same time (the exact two-spawn-per-frame
+            // condition from OnUpdate's ForEachPlayer(SyncDriver) pass).
+            view.SyncDriver(1, carHomer); ++expectedSpawns;
+            view.SyncDriver(2, carCop);  ++expectedSpawns;
+            view.Update(0.1f);
+            Assert::AreEqual(expectedSpawns, g_fakeWorld.spawnCount, L"Both ghosts should spawn in one pass.");
+            Assert::AreEqual(0, g_fakeWorld.despawnCount, L"Entering must not despawn anything.");
+
+            // Both drive to new positions; the Update() step must not spawn/despawn.
+            carHomer.x = 20.0f; carCop.x = 60.0f;
+            view.SyncDriver(1, carHomer);
+            view.SyncDriver(2, carCop);
+            view.Update(0.1f);
+            Assert::AreEqual(expectedSpawns, g_fakeWorld.spawnCount, L"Driving must never spawn/despawn.");
+            Assert::AreEqual(0, g_fakeWorld.despawnCount, L"Driving must never spawn/despawn.");
+
+            // Player 1 toggles model (DespawnIt + SpawnFor = one despawn + one spawn); player 2 stays.
+            view.SyncDriver(1, carCop); ++expectedDespawns; ++expectedSpawns;
+            view.Update(0.1f);
+            Assert::AreEqual(3, g_fakeWorld.spawnCount, L"Model toggle respawns player 1's ghost.");
+            Assert::AreEqual(1, g_fakeWorld.despawnCount,
+                L"Model toggle despawns player 1's old ghost exactly once (no double-despawn).");
+            // Both ghosts are still live after the toggle.
+            Assert::AreEqual(2, static_cast<int>(g_fakeWorld.lastMoves.count(1) + g_fakeWorld.lastMoves.count(2)),
+                L"Both drivers must still have live ghosts after a single-player toggle.");
+
+            // Player 2 exits (despawn only). Player 1 still driving.
+            view.SyncDriver(2, onFoot); ++expectedDespawns;
+            view.Update(0.1f);
+            Assert::AreEqual(3, g_fakeWorld.spawnCount,
+                L"Spawn count must equal 2 (both entrances) + 1 (toggle respawn) = 3.");
+            Assert::AreEqual(2, g_fakeWorld.despawnCount,
+                L"Despawn count must equal 1 (toggle) + 1 (exit) = 2.");
+            // Invariant: live ghosts = spawns - despawns. After B's exit only A's
+            // ghost survives, so spawns - despawns must be exactly 1 (= no
+            // double-despawn / double-free).
+            Assert::AreEqual(1, g_fakeWorld.spawnCount - g_fakeWorld.despawnCount,
+                L"Live ghost count (spawns - despawns) must be exactly 1 after one driver exits.");
+
+            // Both on foot -> all ghosts gone; prune with an empty set is a no-op.
+            view.SyncDriver(1, onFoot); ++expectedDespawns;
+            view.Prune(RemotePlayerManager());
+            view.Update(0.1f);
+            Assert::AreEqual(expectedSpawns, expectedDespawns,
+                L"Every spawned ghost must have been despawned exactly once by the end (spawn==despawn).");
+            Assert::AreEqual(g_fakeWorld.spawnCount, g_fakeWorld.despawnCount,
+                L"The fake sink must have seen exactly one despawn per spawn (no double-despawn).");
 
             view.Clear();
         }
@@ -1773,7 +2201,76 @@ namespace NetworkTests
 
             joiner.Leave(); host.Leave();
         }
-    };
+    // Dedicated mission-progress channel: mission progress rides its own packet
+        // id (PID_MISSION_STATE) and cadence, independent of the transform blob.
+        // A joiner with a mission provider publishes progress; the host's mission
+        // sink receives the exact MissionSyncState via the server relay.
+        TEST_METHOD(MissionStateRelaysThroughDedicatedChannel)
+        {
+            struct MissionProvider : net::IMissionStateProvider
+            {
+                MissionSyncState ms;
+                MissionProvider() { ms.Clear(); }
+                bool GetMissionState(uint8_t* out, uint16_t cap, uint16_t& size) override
+                {
+                    if (cap < (uint16_t)MissionSyncState::SERIALIZED_SIZE) return false;
+                    ms.Serialize(reinterpret_cast<char*>(out));
+                    size = (uint16_t)MissionSyncState::SERIALIZED_SIZE;
+                    return true;
+                }
+            };
+            struct MissionSink
+            {
+                int got = 0;
+                net::PeerId from = 0;
+                MissionSyncState last;
+            };
+
+            MissionProvider joinerProv;
+            joinerProv.ms.missionIndex = 7;
+            joinerProv.ms.stageIndex = 2;
+            joinerProv.ms.objectiveIndex = 1;
+            joinerProv.ms.inMission = 1;
+
+            MissionSink hostSink;
+            unsigned short port = PickFreePort();
+
+            net::Session host;
+            host.SetMissionStateSink(
+                [&](net::PeerId f, const uint8_t* d, uint16_t n)
+                {
+                    if (n < (uint16_t)MissionSyncState::SERIALIZED_SIZE) return;
+                    hostSink.from = f;
+                    hostSink.last.Deserialize(reinterpret_cast<const char*>(d));
+                    hostSink.got++;
+                });
+            Assert::IsTrue(host.StartHost(port, 0xBEEF));
+
+            net::Session joiner;
+            joiner.SetMissionStateProvider(&joinerProv);
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            // Pump generously: mission cadence is every 18 Update frames, so the
+            // joiner must advance several send windows for the host to receive it.
+            for (int i = 0; i < 800 && hostSink.got == 0; ++i)
+            {
+                host.Update();
+                joiner.Update();
+            }
+
+            Assert::IsTrue(hostSink.got > 0,
+                L"Host should receive the joiner's mission state via the relay.");
+            Assert::AreEqual((int)joiner.GetLocalPeerId(), (int)hostSink.from,
+                L"Sender id should round-trip.");
+            Assert::AreEqual(7, hostSink.last.missionIndex);
+            Assert::AreEqual(2, hostSink.last.stageIndex);
+            Assert::AreEqual(1, hostSink.last.objectiveIndex);
+            Assert::AreEqual((int)1, (int)hostSink.last.inMission);
+
+            joiner.Leave(); host.Leave();
+        }
+    }; // NetEngineTransportTests
 
     TEST_CLASS(P3DWriterTests)
     {
@@ -2019,6 +2516,208 @@ namespace NetworkTests
 
             joiner.Leave();
             host.Leave();
+        }
+
+        TEST_METHOD(VehicleDestroyedWorldEventRoundTripsCodecAndRelay)
+        {
+            // Codec + payload round-trip: a WE_VEHICLE_DESTROYED with a known
+            // netVehicleId and x,y,z payload must encode/decode losslessly.
+            const int32_t kId = 12;
+            const float kX = 101.0f, kY = -3.5f, kZ = 77.25f;
+            uint8_t payload[net::VehicleDestroyedPayload::SERIALIZED_SIZE];
+            net::VehicleDestroyedPayload::Encode(payload, kId, kX, kY, kZ);
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_VEHICLE_DESTROYED, 0x33, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_VEHICLE_DESTROYED, L"Type must round-trip.");
+            net::VehicleDestroyedPayload out;
+            Assert::IsTrue(net::VehicleDestroyedPayload::Decode(d.payload, d.payloadSize, out),
+                           L"Payload decode should succeed.");
+            Assert::AreEqual((int)kId, (int)out.netVehicleId, L"netVehicleId must round-trip.");
+            Assert::AreEqual(kX, out.x, L"x must round-trip.");
+            Assert::AreEqual(kY, out.y, L"y must round-trip.");
+            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
+
+            // Relay: the encoded event travels host -> joiner through the open
+            // channel and the joiner's sink decodes the exact vehicle payload.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA56));
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            int joinerGot = 0;
+            net::VehicleDestroyedPayload joinerPayload;
+            joiner.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
+                auto e = net::WorldEventCodec::Decode(data, size);
+                if (!e.valid || e.type != net::WE_VEHICLE_DESTROYED) return;
+                net::VehicleDestroyedPayload p;
+                if (!net::VehicleDestroyedPayload::Decode(e.payload, e.payloadSize, p)) return;
+                joinerPayload = p;
+                joinerGot++;
+            });
+
+            uint8_t b2[net::MAX_PACKET_PAYLOAD];
+            uint16_t m = net::WorldEventCodec::Encode(
+                b2, sizeof(b2), net::WE_VEHICLE_DESTROYED,
+                static_cast<uint16_t>(host.GetLocalPeerId()), payload, sizeof(payload));
+            Assert::IsTrue(m > 0);
+            Assert::IsTrue(host.SendCustomEvent(b2, m), L"Host SendCustomEvent failed.");
+
+            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the vehicle event.");
+            Assert::AreEqual((int)kId, (int)joinerPayload.netVehicleId,
+                             L"Relayed netVehicleId must match.");
+            Assert::AreEqual(kX, joinerPayload.x, L"Relayed x must match.");
+            Assert::AreEqual(kY, joinerPayload.y, L"Relayed y must match.");
+            Assert::AreEqual(kZ, joinerPayload.z, L"Relayed z must match.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(CoinCollectedPayloadRoundTrips)
+        {
+            // Codec + payload round-trip: a WE_COIN_COLLECTED with a known
+            // persistentId and x,y,z payload must encode/decode losslessly.
+            const int32_t kId = 55;
+            const float kX = 1.0f, kY = 2.5f, kZ = -9.75f;
+            uint8_t payload[net::CoinCollectedPayload::SERIALIZED_SIZE];
+            net::CoinCollectedPayload::Encode(payload, kId, kX, kY, kZ);
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_COIN_COLLECTED, 0x44, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_COIN_COLLECTED, L"Type must round-trip.");
+            net::CoinCollectedPayload out;
+            Assert::IsTrue(net::CoinCollectedPayload::Decode(d.payload, d.payloadSize, out),
+                           L"Payload decode should succeed.");
+            Assert::AreEqual((int)kId, (int)out.persistentId, L"persistentId must round-trip.");
+            Assert::AreEqual(kX, out.x, L"x must round-trip.");
+            Assert::AreEqual(kY, out.y, L"y must round-trip.");
+            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
+
+            // Relay: the encoded event travels host -> joiner through the open
+            // channel and the joiner's sink decodes the exact coin payload.
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xAA57));
+            net::Session joiner;
+            Assert::IsTrue(joiner.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+
+            int joinerGot = 0;
+            net::CoinCollectedPayload joinerPayload;
+            joiner.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
+                auto e = net::WorldEventCodec::Decode(data, size);
+                if (!e.valid || e.type != net::WE_COIN_COLLECTED) return;
+                net::CoinCollectedPayload p;
+                if (!net::CoinCollectedPayload::Decode(e.payload, e.payloadSize, p)) return;
+                joinerPayload = p;
+                joinerGot++;
+            });
+
+            uint8_t b2[net::MAX_PACKET_PAYLOAD];
+            uint16_t m = net::WorldEventCodec::Encode(
+                b2, sizeof(b2), net::WE_COIN_COLLECTED,
+                static_cast<uint16_t>(host.GetLocalPeerId()), payload, sizeof(payload));
+            Assert::IsTrue(m > 0);
+            Assert::IsTrue(host.SendCustomEvent(b2, m), L"Host SendCustomEvent failed.");
+
+            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
+            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the coin event.");
+            Assert::AreEqual((int)kId, (int)joinerPayload.persistentId,
+                             L"Relayed persistentId must match.");
+            Assert::AreEqual(kX, joinerPayload.x, L"Relayed x must match.");
+            Assert::AreEqual(kY, joinerPayload.y, L"Relayed y must match.");
+            Assert::AreEqual(kZ, joinerPayload.z, L"Relayed z must match.");
+
+            joiner.Leave();
+            host.Leave();
+        }
+
+        TEST_METHOD(BreakablePayloadRoundTrips)
+        {
+            const int32_t kId = 1024;
+            const float kX = 12.0f, kY = -4.25f, kZ = 88.5f;
+            uint8_t payload[net::BreakablePayload::SERIALIZED_SIZE];
+            net::BreakablePayload::Encode(payload, kId, kX, kY, kZ);
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_BREAKABLE, 0x55, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_BREAKABLE, L"Type must round-trip.");
+            net::BreakablePayload out;
+            Assert::IsTrue(net::BreakablePayload::Decode(d.payload, d.payloadSize, out),
+                           L"Payload decode should succeed.");
+            Assert::AreEqual((int)kId, (int)out.persistentId, L"persistentId must round-trip.");
+            Assert::AreEqual(kX, out.x, L"x must round-trip.");
+            Assert::AreEqual(kY, out.y, L"y must round-trip.");
+            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
+        }
+
+        TEST_METHOD(PlatformDirPayloadRoundTrips)
+        {
+            const uint32_t kUid = 0xDEADBEEF;
+            const int32_t kDir = -1;
+            uint8_t payload[net::PlatformDirPayload::SERIALIZED_SIZE];
+            net::PlatformDirPayload::Encode(payload, kUid, static_cast<int8_t>(kDir));
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_PLATFORM_DIR, 0x66, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_PLATFORM_DIR, L"Type must round-trip.");
+            net::PlatformDirPayload out;
+            Assert::IsTrue(net::PlatformDirPayload::Decode(d.payload, d.payloadSize, out),
+                           L"Payload decode should succeed.");
+            Assert::IsTrue(out.objectUID == kUid, L"objectUID must round-trip.");
+            Assert::AreEqual((int)kDir, (int)out.dir, L"dir must round-trip.");
+
+            // Reversed direction also round-trips (forward is 0, reverse is -1).
+            net::PlatformDirPayload::Encode(payload, kUid, static_cast<int8_t>(1));
+            Assert::IsTrue(net::PlatformDirPayload::Decode(
+                payload, net::PlatformDirPayload::SERIALIZED_SIZE, out), L"Decode dir=1 should succeed.");
+            Assert::AreEqual(1, (int)out.dir, L"dir=1 must round-trip.");
+        }
+
+        TEST_METHOD(StatePropPayloadRoundTrips)
+        {
+            const uint32_t kUid = 0x1234ABCD;
+            const uint8_t kState = 3;
+            uint8_t payload[net::StatePropPayload::SERIALIZED_SIZE];
+            net::StatePropPayload::Encode(payload, kUid, kState);
+
+            uint8_t buf[net::MAX_PACKET_PAYLOAD];
+            uint16_t n = net::WorldEventCodec::Encode(
+                buf, sizeof(buf), net::WE_STATEPROP, 0x77, payload, sizeof(payload));
+            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
+
+            auto d = net::WorldEventCodec::Decode(buf, n);
+            Assert::IsTrue(d.valid, L"Decode should succeed.");
+            Assert::IsTrue(d.type == net::WE_STATEPROP, L"Type must round-trip.");
+            net::StatePropPayload out;
+            Assert::IsTrue(net::StatePropPayload::Decode(d.payload, d.payloadSize, out),
+                           L"Payload decode should succeed.");
+            Assert::IsTrue(out.objectUID == kUid, L"objectUID must round-trip.");
+            Assert::AreEqual((int)kState, (int)out.state, L"state must round-trip.");
         }
     };
 }

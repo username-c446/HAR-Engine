@@ -111,11 +111,27 @@ struct PlayerNetworkState {
     int32 netVehicleId;       // стабильный сетевой id машины
     float vehicleSpeed;       // скорость машины (км/ч) для валидации
     uint8 inVehicle;          // 1 = в машине
-    uint8 padding;            // выравнивание размера
+    uint8 flags;              // FLAG_JUMPING | FLAG_IN_AIR | FLAG_LOCO_TURBO
+    // --- непрерывный локомоушн (пешком) ---
+    uint16 motionAngle;       // желаемое направление движения, рад*1000
+    uint16 facingAngle;       // желаемый фейсинг, рад*1000
+    uint8  speedFactor;       // 0..255 доля максимальной скорости
+    uint8  characterState;    // CharacterAi::CharacterState (LOCO и т.п.)
+    // --- одноразовое действие ---
+    uint8  actionEvent;       // ACTION_*; 0 = нет (латч по rising-edge)
+    // --- кинематическое зеркало машины (inVehicle) ---
+    float  vehYaw;            // курс машины, рад
+    uint8  vehSteer;          // знаковый руль -128..127 -> -45..+45°
+    uint16 vehSpeedKmh;       // скорость, км/ч
+    uint8  vehState;          // VS_NORMAL / VS_SLIP / VS_EBRAKE_SLIP
+    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE
 };
 ```
 
-- `SERIALIZED_SIZE = 4*4 + 16 + 4 + 4 + 1 + 1 = 42` байта.
+- `SERIALIZED_SIZE = 42 (база) + 7 (локомоушн) + 1 (actionEvent) + 9 (машина) = 58` байт.
+- В машине поля локомоушна/действия обнуляются, пешком — поля машины.
+- `actionEvent` сейчас заполняется только `ACTION_JUMP` (rising-edge прыжка);
+  остальные `ACTION_*` (SLAM, DODGE, CELEB…) зарезервированы, на приёмнике no-op.
 - Сериализация little-endian совместимая, свободна от padding-багов
   (`Serialize`/`Deserialize` в `PlayerNetworkState.cpp` через `net::Write*`).
 - **Связь с валидацией:** поле `inVehicle` выбирает лимит скорости на сервере
@@ -212,11 +228,20 @@ struct PlayerNetworkState {
 - `Prune(players)` — деспавн машин водителей, пропавших из авторитетного набора.
 - `Update(dt)` — интерполяция позиции (тот же механизм, что у пеших).
 
+- `Update(dt)` также сглаживает `vehYaw` по кратчайшей дуге; руль/скорость/
+  состояние/флаги передаются в move-sink как есть.
+
 ### Sink в gameplay-контексте (`RemoteVehicleSpawn/Move/Despawn`)
-- Спавн через `VehicleCentral::InitVehicle(model, addToActiveList, ...,
-  VT_TRAFFIC, FORCE_NO_DRIVER, ...)` — без водителя, транспорт создаётся как
-  обычный активный.
-- Move — `SetPosition`; Despawn — `RemoveVehicleFromActiveList` + `delete`.
+- Спавн через `VehicleCentral::AddNetworkGhostVehicle(model)` — «сетевой
+  призрак»: в сцене и коллизии (рендерится и блокирует), но **не** в
+  active-list и без типа, который чистит какой-либо менеджер (трафик,
+  припаркованные, ресет миссии, husk). Никто, кроме сети, его не освободит.
+- Move — кинематическое зеркало: `SetTransform` (позиция + `vehYaw`), затем
+  повторно выставляется скорость (SetTransform её обнуляет — иначе колёса не
+  крутятся), руль, огни тормоза/заднего хода.
+- Despawn — `RemoveNetworkGhostVehicle` (финальный `Release()` сам удаляет
+  объект). **Не** вызывать `delete` — двойное освобождение крашило хост при
+  двух удалённых водителях.
 
 ---
 
@@ -256,6 +281,10 @@ mp_standalone join   <hostIp> [port] [--password pw]
 - `HOSTPORT=<port>` — автостарт хоста.
 - `JOINIP=<ip[:port]>` — автостарт join.
 - `HOSTPASS=<pw>`, `HOSTSLOTS=<n>`, `JOINPASS=<pw>` — конфигурация.
+- Опции геймплея (не сетевые, по умолчанию выкл.): `FREEROAM` (уровень в
+  Sunday Drive без миссии), `ALLOWCARFLIP` (авто-переворот машины),
+  `CINEMATICJUMPS` (кинокамера прыжков), `EXITCARFADE` (старый выход из машины
+  с затемнением и телепортом).
 - Все эти опции применяются в `GameplayContext::OnStart`, затем
   `ClearNetworkOptions()` очищает их, чтобы не перезапустить матч повторно.
 
@@ -310,6 +339,13 @@ mp_standalone join   <hostIp> [port] [--password pw]
 - Ключевой договор: изменение позиции НЕ двигает модель в `Sync` — только
   задаёт цель; реальное движение происходит в `Update`. Это убирает рывки и
   джиттер на частоте пакетов.
+- Фейсинг (`rotY`) сглаживается по кратчайшей дуге (350° → 10° через 0).
+- Поля локомоушна (`motionAngle`/`facingAngle`/`speedFactor`/`characterState`,
+  turbo) передаются в move-sink без предсглаживания: в игре при
+  `characterState == LOCO` ими управляет `LocomotionDriver` пуппета
+  (`SetFacingDir` + скорость от `GetMaxSpeed()`).
+- `action`-sink вызывается один раз на rising-edge ненулевого `actionEvent`
+  (`RemotePlayerAction`: `ACTION_JUMP` → `RemotePlayerJump`).
 
 ---
 
@@ -326,12 +362,34 @@ mp_standalone join   <hostIp> [port] [--password pw]
   для UI «кто в какой миссии».
 - `MissionSyncManager` агрегирует локальный + удалённые прогрессы, тестируем.
 
-> Примечание о текущей реализации: в движковом слое `netengine` миссионная
-> полезная нагрузка переносится тем же generic-релеем, что и состояние игрока
-> (который пропускает произвольные блобы). Полноценный отдельный
-> `PID_MISSION_STATE` в `net::Session` не выделен; co-op-релей миссии на
-> движковом слое — открытая задача (тест `MissionStateRelaysBetweenClientsThroughServer`
-> покрывает перенос произвольного блоба через релей).
+- **Движковый канал:** отдельный `PID_MISSION_STATE` в `net::Session`.
+  Провайдер — `IMissionStateProvider` (`WorldInterfaces.h`), sink —
+  `SetMissionStateSink`. Отправка на своей, более редкой каденции
+  (`SetMissionSendEvery`, по умолчанию раз в 18 кадров ≈ 3,3 Гц). Сервер
+  ретранслирует `[sender][payload]` всем, кроме отправителя, без валидатора.
+- `NetworkMatchManager::AttachMissionChannel()` связывает `GameMissionAdapter`
+  с сессией; удалённые прогрессы — `GetRemoteMissionStates()` /
+  `GetRemoteMissionState(peerId, out)`. Тест — `MissionStateRelaysThroughDedicatedChannel`.
+
+### 12.1 События мира (`WorldEvent`, релей через `PID_USER`)
+
+Разовые изменения мира идут через `WorldEventCodec` (заголовок 6 байт +
+POD-полезная нагрузка без игровых типов). Эмиттеры — `src/game/network/*WorldEventEmitter.*`,
+безопасный no-op вне матча:
+
+| Тип | Эмиттер / точка вызова | Payload |
+|---|---|---|
+| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG` (смена состояния) | uid + state |
+| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (разрушение) | persistentId + xyz |
+| `WE_VEHICLE_DESTROYED` 0x03 | `EmitVehicleDestroyedWorldEvent` — `vehicle.cpp` (взрыв) | netVehicleId + xyz |
+| `WE_COIN_COLLECTED` 0x04 | `EmitCoinCollectedWorldEvent` — `CoinManager::CheckCollection` | persistentId + xyz |
+| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `animcollisionentitydsg.h` | uid + direction |
+
+Приёмник (`gameplaycontext.cpp`, `SetWorldEventSink`) сейчас применяет только
+`WE_VEHICLE_DESTROYED`: находит локальную машину по net id и повторно
+шлёт `EVENT_VEHICLE_DESTROYED` (husk-логика). Призраки удалённых водителей
+не трогаются — их снимает поток drive-state. Остальные типы пока только
+передаются (приём — следующий шаг, см. `PRECISE_MULTIPLAYER_PLAN.ru.md`).
 
 ## 13. Точки интеграции в игровой цикл (`gameplaycontext.cpp`)
 

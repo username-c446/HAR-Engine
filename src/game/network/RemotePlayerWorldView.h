@@ -21,6 +21,7 @@ public:
     typedef void* (*SpawnFn)(int playerId);
     typedef void  (*MoveFn)(int playerId, void* handle, const PlayerNetworkState& state);
     typedef void  (*JumpFn)(int playerId, void* handle); // rising edge of a remote jump
+    typedef void  (*ActionFn)(int playerId, void* handle, uint8_t actionEvent); // rising edge of a non-zero ACTION_*
     typedef void  (*DespawnFn)(int playerId, void* handle);
 
     struct Sink
@@ -28,6 +29,7 @@ public:
         SpawnFn spawn;
         MoveFn move;
         JumpFn jump;
+        ActionFn action;
         DespawnFn despawn;
     };
 
@@ -57,6 +59,15 @@ private:
         void* handle;
         float targetX, targetY, targetZ;
         float visualX, visualY, visualZ;
+        float targetFacing, visualFacing; // yaw (radians); smoothed over shortest arc
+        // Locomotion / one-shot channels carried verbatim so Update() can re-emit
+        // them to the move sink (which drives the remote character's locomotion).
+        uint16_t targetMotionAngle;
+        uint16_t targetFacingAngle;
+        uint8_t  targetSpeedFactor;
+        uint8_t  targetCharacterState;
+        uint8_t  targetActionEvent; // latched: fires the action sink only on rising edge
+        uint8_t  targetFlags;       // FLAG_* set (turbo etc.)
         bool smoothingApplied;
         bool jumping; // last reported FLAG_JUMPING/FLAG_IN_AIR — snap Y, don't smooth
     };

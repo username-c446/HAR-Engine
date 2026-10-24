@@ -40,6 +40,39 @@ namespace net
     static constexpr const uint16_t WORLD_EVENT_HEADER_SIZE = 1 + 1 + 2 + 2;
     static_assert(WORLD_EVENT_HEADER_SIZE < MAX_PACKET_PAYLOAD, "header must fit a packet");
 
+    // Payload for WE_VEHICLE_DESTROYED: the stable net id of the destroyed
+    // machine + the world position where it exploded, so receivers can mirror
+    // the husk / drop the ghost without dragging game types into the codec.
+    struct VehicleDestroyedPayload
+    {
+        int32_t netVehicleId = 0;
+        float   x = 0.0f;
+        float   y = 0.0f;
+        float   z = 0.0f;
+
+        static constexpr const int SERIALIZED_SIZE = sizeof(int32_t) + sizeof(float) * 3;
+        static_assert(SERIALIZED_SIZE >= 0 && SERIALIZED_SIZE < MAX_PACKET_PAYLOAD,
+                      "vehicle-destroyed payload must fit a packet");
+
+        static void Encode(uint8_t* out, int32_t id, float px, float py, float pz)
+        {
+            Writer w(out, SERIALIZED_SIZE);
+            w.WriteU32(static_cast<uint32_t>(id));
+            w.WriteFloat(px);
+            w.WriteFloat(py);
+            w.WriteFloat(pz);
+        }
+
+        static bool Decode(const uint8_t* data, uint16_t size, VehicleDestroyedPayload& out)
+        {
+            if (size < static_cast<uint16_t>(SERIALIZED_SIZE)) return false;
+            Reader r(data, size);
+            uint32_t id = 0;
+            if (!r.ReadU32(id)) return false;
+            out.netVehicleId = static_cast<int32_t>(id);
+            return r.ReadFloat(out.x) && r.ReadFloat(out.y) && r.ReadFloat(out.z);
+        }
+    };
     class WorldEventCodec
     {
     public:

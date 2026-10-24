@@ -52,6 +52,13 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
         entry.targetX = entry.visualX = state.x;
         entry.targetY = entry.visualY = state.y;
         entry.targetZ = entry.visualZ = state.z;
+        entry.targetFacing = entry.visualFacing = state.rotY;
+        entry.targetMotionAngle = state.motionAngle;
+        entry.targetFacingAngle = state.facingAngle;
+        entry.targetSpeedFactor = state.speedFactor;
+        entry.targetCharacterState = state.characterState;
+        entry.targetActionEvent = state.actionEvent;
+        entry.targetFlags = state.flags;
         entry.smoothingApplied = false;
         entry.jumping = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
         m_entries[playerId] = entry;
@@ -70,9 +77,23 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
     {
         m_sink.jump(playerId, entry.handle);
     }
+    // Rising edge of a non-zero one-shot action: fire the general action
+    // channel once (mirrors the jump-latch pattern above). Continuous non-zero
+    // actionEvent must not re-fire.
+    if ( state.actionEvent != 0 && state.actionEvent != entry.targetActionEvent && m_sink.action )
+    {
+        m_sink.action(playerId, entry.handle, state.actionEvent);
+    }
     entry.targetX = state.x;
     entry.targetY = state.y;
     entry.targetZ = state.z;
+    entry.targetFacing = state.rotY;
+    entry.targetMotionAngle = state.motionAngle;
+    entry.targetFacingAngle = state.facingAngle;
+    entry.targetSpeedFactor = state.speedFactor;
+    entry.targetCharacterState = state.characterState;
+    entry.targetActionEvent = state.actionEvent;
+    entry.targetFlags = state.flags;
     entry.smoothingApplied = false;
     entry.jumping = jumpingNow;
 }
@@ -108,12 +129,33 @@ void RemotePlayerWorldView::Update(float dt)
         }
         entry.smoothingApplied = true;
 
+        // Deferred facing: rotate decrementally toward the target yaw, taking
+        // the shortest arc around the circle so a 350deg -> 10deg turn moves
+        // forward through 0 rather than backwards through 180.
+        static const float kPi = 3.14159265f;
+        float diff = entry.targetFacing - entry.visualFacing;
+        while (diff >  kPi) diff -= 2.0f * kPi;
+        while (diff < -kPi) diff += 2.0f * kPi;
+        if (diff != 0.0f) entry.visualFacing += diff * alpha;
+        // Normalize to [-PI, PI].
+        if (entry.visualFacing >  kPi) entry.visualFacing -= 2.0f * kPi;
+        if (entry.visualFacing < -kPi) entry.visualFacing += 2.0f * kPi;
+
         if (m_sink.move)
         {
             PlayerNetworkState state;
             state.x = entry.visualX;
             state.y = entry.visualY;
             state.z = entry.visualZ;
+            state.rotY = entry.visualFacing;
+            // Locomotion channels: pass the raw reported targets through — the
+            // LocomotionDriver on the game side does its own facing/speed
+            // smoothing, so we must not pre-smooth the angles here.
+            state.motionAngle = entry.targetMotionAngle;
+            state.facingAngle = entry.targetFacingAngle;
+            state.speedFactor = entry.targetSpeedFactor;
+            state.characterState = entry.targetCharacterState;
+            state.flags = entry.targetFlags;
             m_sink.move(kv.first, entry.handle, state);
         }
     }

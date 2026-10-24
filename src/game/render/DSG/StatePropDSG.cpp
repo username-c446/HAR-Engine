@@ -41,6 +41,8 @@
 #include <worldsim/avatar.h>
 #include <mission/gameplaymanager.h>
 #include <worldsim/redbrick/rootmatrixdriver.h>
+#include <network/BreakableWorldEventEmitter.h>
+#include <network/StatePropWorldEventEmitter.h>
 
 
 //===========================================================================
@@ -676,6 +678,10 @@ StatePropDSG::RecieveEvent( int callback , CStateProp* stateProp )
 
     case StatePropEnum::eRemoveFromWorld:
         GetBreakablesManager()->RemoveBrokenObjectFromWorld( this, RenderEnums::LevelSlot, m_IsDynaLoaded );
+        {
+            const rmt::Vector& pos = rPosition();
+            net::EmitBreakableWorldEvent( mPersistentObjectID, pos.x, pos.y, pos.z );
+        }
         GetPersistentWorldManager()->OnObjectBreak( mPersistentObjectID );
         break;
     case StatePropEnum::eSpawn1Coin:
@@ -968,7 +974,12 @@ StatePropDSG::GetAIRef()
 void 
 StatePropDSG::SetState( int state )
 {
+    unsigned int oldState = GetState();
     mpStateProp->SetState( state );
+    if ( mpStateProp != NULL && GetState() != oldState )
+    {
+        net::EmitStatePropWorldEvent( GetStatePropUID(), static_cast<uint8_t>( GetState() ) );
+    }
 }
 
 // Lets send this thing an event and hope that the artists

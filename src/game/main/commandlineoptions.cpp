@@ -103,6 +103,34 @@ void CommandLineOptions::HandleOption( const char* const optionIn )
 
     char option[ 256 ];
     strcpy( option, optionIn );
+    // Tolerate a single leading '-' (or "--") so CLI forms like `-skipfe`,
+    // `-L1`, `-HOSTPORT=47820`, `-join ...` are accepted identically to the
+    // no-dash legacy forms (`skipfe L1 HOSTPORT=...`). The rest of this
+    // function compares options verbatim, so without this strip a dash-prefixed
+    // argument silently reaches the "Unhandled command line option" fallback and
+    // the game boots into the normal menu instead of auto-starting a match.
+    {
+        const char* p = strchr( option, '=' );
+        // Only strip leading dashes when there is no '=' before them (so
+        // HOSTPORT=... and JOINIP=... keep their value intact and untouched).
+        // 'strncmp(option, "HOSTPORT=",9)' below relies on starts-with, so we
+        // must not shift past the token name.
+        size_t dash = 0;
+        while ( option[dash] == '-' ) ++dash;
+        if ( dash > 0 )
+        {
+            const char* eq = strchr( option, '=' );
+            size_t nameLen = eq ? static_cast<size_t>( eq - option ) : strlen( option );
+            // Only strip if the dashes precede the whole name (not an '=' value).
+            if ( dash <= nameLen )
+            {
+                // Shift the name+value left over the dashes; the '=' (if any)
+                // and the name stay, only the leading '-' run is removed.
+                size_t total = strlen( option );
+                memmove( option, option + dash, total - dash + 1 );
+            }
+        }
+    }
     rReleasePrintf( "Commandline Option: %s\n", option );
 
     // Network auto-start: -host <port> and -join <ip[:port]>
@@ -213,6 +241,10 @@ void CommandLineOptions::HandleOption( const char* const optionIn )
     {
         orValue <<= CLO_SKIP_SUNDAY;
     }
+    else if( strcmp( strupr(option), "FREEROAM" ) == 0 )
+    {
+        orValue <<= CLO_FREEROAM;
+    }
     else if( strcmp( strupr(option), "SKIPFE" ) == 0 )
     {
         orValue <<= CLO_SKIP_FE;
@@ -220,6 +252,10 @@ void CommandLineOptions::HandleOption( const char* const optionIn )
     else if( strcmp( strupr(option), "HEADLESS" ) == 0 )
     {
         orValue <<= CLO_HEADLESS;
+    }
+    else if( strcmp( strupr(option), "ALLOWCARFLIP" ) == 0 )
+    {
+        orValue <<= CLO_ALLOW_CAR_FLIP;
     }
     else if( strcmp( strupr(option), "FEGAGS" ) == 0 )
     {
@@ -292,6 +328,14 @@ void CommandLineOptions::HandleOption( const char* const optionIn )
     else if( strcmp( strupr( option), "PRINTFRAMERATE" ) == 0 )
     {
         orValue <<= CLO_PRINT_FRAMERATE;
+    }
+    else if( strcmp( strupr( option), "CINEMATICJUMPS" ) == 0 )
+    {
+        orValue <<= CLO_CINEMATIC_JUMPS;
+    }
+    else if( strcmp( strupr( option), "EXITCARFADE" ) == 0 )
+    {
+        orValue <<= CLO_EXIT_CAR_FADE;
     }
     else if ( strcmp( strupr( option ), "SHOWDYNALOAD" ) == 0 )
     {
