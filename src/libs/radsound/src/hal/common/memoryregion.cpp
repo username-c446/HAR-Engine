@@ -388,8 +388,8 @@ unsigned int radSoundHalBufferCalculateMemorySize
 
     // The size of the buffer is 
 
-    sizeInBytes = ::radMemoryRoundUp( sizeInBytes, 
-        radMemorySpace_OptimalMultiple * pIRadSoundHalAudioFormat->GetNumberOfChannels( ) );
+    sizeInBytes = static_cast< unsigned int >( ::radMemoryRoundUp( sizeInBytes, 
+        static_cast< size_t >( radMemorySpace_OptimalMultiple ) * pIRadSoundHalAudioFormat->GetNumberOfChannels( ) ) );
 
     unsigned int result = pIRadSoundHalAudioFormat->ConvertSizeType(
         resultType,

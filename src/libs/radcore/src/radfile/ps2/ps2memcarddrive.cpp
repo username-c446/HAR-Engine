@@ -1036,8 +1036,8 @@ radDrive::CompletionStatus radPs2MemcardDrive::FindNext
     else
     {
         pHandle->m_Offset++;
-        strncpy( pDirectoryInfo->m_Name, (char*) m_pDirInfo->EntryName, sizeof( pDirectoryInfo->m_Name ) );
-        pDirectoryInfo->m_Name[ sizeof( pDirectoryInfo->m_Name ) ] = '\0';
+        strncpy( pDirectoryInfo->m_Name, (char*) m_pDirInfo->EntryName, sizeof( pDirectoryInfo->m_Name ) - 1 );
+        pDirectoryInfo->m_Name[ sizeof( pDirectoryInfo->m_Name ) - 1 ] = '\0';
         pDirectoryInfo->m_Type = IRadDrive::DirectoryInfo::IsSaveGame;
     }
 

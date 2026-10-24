@@ -802,7 +802,7 @@ inline void radMemoryBinAllocator::InternalBin::SetUpFreeList( void )
     IndexToPtr( 0 )->m_NextFreeIndex = 1;
 
 
-    for( FREE_BLOCK_INDEX_TYPE element = 1; element < m_NumberOfElements - 1; element ++ )
+    for( unsigned int element = 1; element < m_NumberOfElements - 1; element ++ )
     {
         FreeBlock * pFb = IndexToPtr( element );
 
