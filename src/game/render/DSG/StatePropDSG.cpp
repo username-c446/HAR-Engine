@@ -41,8 +41,7 @@
 #include <worldsim/avatar.h>
 #include <mission/gameplaymanager.h>
 #include <worldsim/redbrick/rootmatrixdriver.h>
-#include <network/BreakableWorldEventEmitter.h>
-#include <network/StatePropWorldEventEmitter.h>
+#include <network/NetWorldHooks.h>
 
 
 //===========================================================================
@@ -89,7 +88,8 @@ mpStateProp( NULL ),
 mpPhysObj( NULL ),
 mpProcAnimator( 0 ),
 m_ShadowElement( -1 ),
-m_SimAnimJoint( -1 )
+m_SimAnimJoint( -1 ),
+mNetRemoved( false )
 {
     CLASSTRACKER_CREATE( StatePropDSG );
     mTransform.Identity();
@@ -105,6 +105,7 @@ m_SimAnimJoint( -1 )
 StatePropDSG::~StatePropDSG()
 {
     CLASSTRACKER_DESTROY( StatePropDSG );
+    networld::UnregisterObject( this );
     GetAnimEntityDSGManager()->Remove( this );
     delete mpProcAnimator;
     mpProcAnimator = 0;
@@ -677,12 +678,23 @@ StatePropDSG::RecieveEvent( int callback , CStateProp* stateProp )
         break;
 
     case StatePropEnum::eRemoveFromWorld:
-        GetBreakablesManager()->RemoveBrokenObjectFromWorld( this, RenderEnums::LevelSlot, m_IsDynaLoaded );
         {
-            const rmt::Vector& pos = rPosition();
-            net::EmitBreakableWorldEvent( mPersistentObjectID, pos.x, pos.y, pos.z );
+            if ( mNetRemoved )
+            {
+                break;
+            }
+            mNetRemoved = true;
+            // Broken for everyone: the server records it (first write wins) and
+            // late joiners get it in their snapshot. Sent before the removal,
+            // which may release this object.
+            const unsigned char broken = 1;
+            networld::RequestObjectState( this, net::WOC_BROKEN, net::WSP_FIRST_WRITE, &broken, 1 );
+            networld::UnregisterObject( this );
+            short persistentId = mPersistentObjectID;
+            GetBreakablesManager()->RemoveBrokenObjectFromWorld( this, RenderEnums::LevelSlot, m_IsDynaLoaded );
+            // NOTE: `this` may be released by the removal above; only locals from here.
+            GetPersistentWorldManager()->OnObjectBreak( persistentId );
         }
-        GetPersistentWorldManager()->OnObjectBreak( mPersistentObjectID );
         break;
     case StatePropEnum::eSpawn1Coin:
         GenerateCoins( 1 );
@@ -978,18 +990,42 @@ StatePropDSG::SetState( int state )
     mpStateProp->SetState( state );
     if ( mpStateProp != NULL && GetState() != oldState )
     {
-        // The stateprop uid names the prop TYPE (shared by every instance), so
-        // the position lets receivers pick the right instance.
-        const rmt::Vector& pos = rPosition();
-        net::EmitStatePropWorldEvent( static_cast<uint32_t>( GetStatePropUID() ),
-                                      static_cast<uint8_t>( GetState() ),
-                                      pos.x, pos.y, pos.z );
+        // Forced state change (door, gate, mechanism): replicate it.
+        const unsigned char state = static_cast<unsigned char>( GetState() );
+        networld::RequestObjectState( this, net::WOC_STATE, net::WSP_LAST_WRITE, &state, 1 );
+    }
+}
+
+void
+StatePropDSG::NetApply( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased )
+{
+    StatePropDSG* prop = static_cast<StatePropDSG*>( handle );
+    if ( prop == NULL || erased || value.len < 1 )
+    {
+        return;
+    }
+    if ( channel == net::WOC_STATE )
+    {
+        if ( prop->mpStateProp != NULL && prop->GetState() != value.bytes[ 0 ] )
+        {
+            prop->SetState( value.bytes[ 0 ] );
+        }
+    }
+    else if ( channel == net::WOC_BROKEN && value.bytes[ 0 ] != 0 )
+    {
+        prop->ApplyRemoteBreak();
     }
 }
 
 void
 StatePropDSG::ApplyRemoteBreak()
 {
+    if ( mNetRemoved )
+    {
+        return;
+    }
+    mNetRemoved = true;
+    networld::UnregisterObject( this );
     short persistentId = mPersistentObjectID;
     GetBreakablesManager()->RemoveBrokenObjectFromWorld( this, RenderEnums::LevelSlot, m_IsDynaLoaded );
     // NOTE: `this` may be released by the removal above; only locals from here.

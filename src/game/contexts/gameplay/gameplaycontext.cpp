@@ -94,7 +94,9 @@
 #include <network/MissionSyncState.h>
 #include <network/RemotePlayerWorldView.h>
 #include <network/RemoteVehicleWorldView.h>
-#include <network/WorldEventApply.h>
+#include <network/NetWorldHooks.h>
+#include <set>
+#include <network/EconomyConfig.h>
 #include <network/LocalActionLatch.h>
 #include <render/DSG/StatePropDSG.h>
 #include <render/DSG/animcollisionentitydsg.h>
@@ -236,6 +238,7 @@ namespace
             outState.vehFlags = 0;
             if ( vehicle->mBrakeLightsOn )    outState.vehFlags |= PlayerNetworkState::VEH_FLAG_BRAKE;
             if ( vehicle->mReverseLightsOn )  outState.vehFlags |= PlayerNetworkState::VEH_FLAG_REVERSE;
+            if ( vehicle->IsVehicleDestroyed() ) outState.vehFlags |= PlayerNetworkState::VEH_FLAG_DESTROYED;
         }
         else
         {
@@ -326,19 +329,13 @@ namespace
     // mirror what other network players report through their PlayerNetworkState.
     void* RemotePlayerSpawn( int playerId )
     {
-        static int s_spawnDiagLogged = 0;
-        {
-            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_spawn_diag.txt", "a" );
-            if (f) { fprintf( f, "[SPAWN] RemotePlayerSpawn(playerId=%d) call#%d\n", playerId, s_spawnDiagLogged++ ); fclose( f ); }
-        }
         char name[32];
         sprintf( name, "mp_remote_%d", playerId );
         Character* c = GetCharacterManager()->AddCharacter(
             CharacterManager::NPC, name, "homer", "npd", NULL );
         if ( c == NULL )
         {
-            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_spawn_diag.txt", "a" );
-            if (f) { fprintf( f, "[SPAWN]   -> AddCharacter returned NULL!\n" ); fclose( f ); }
+            rReleasePrintf( "net: could not spawn remote player %d\n", playerId );
             return NULL;
         }
         // AddCharacter does NOT put NPCs into the world scene (only PCs get
@@ -495,95 +492,6 @@ namespace
         }
     }
 
-    // ---- inbound world events (see net::DispatchWorldEvent) ----------------
-    // Search radii for matching the sender's object instance to ours. Static
-    // world objects sit at identical coordinates on every client; vehicles move,
-    // so they get a looser radius.
-    const float kWorldObjectMatchDist = 1.0f;
-    const float kVehicleMatchDist = 6.0f;
-
-    void RemoteWorldStateProp( uint16_t origin, const net::StatePropPayload& p )
-    {
-        (void)origin;
-        if ( GetAnimEntityDSGManager() == NULL ) return;
-        StatePropDSG* prop = GetAnimEntityDSGManager()->FindStateProp(
-            p.objectUID, rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
-        if ( prop != NULL && prop->GetState() != p.state )
-        {
-            prop->SetState( p.state );
-        }
-    }
-
-    void RemoteWorldBreakable( uint16_t origin, const net::BreakablePayload& p )
-    {
-        (void)origin;
-        short persistentId = static_cast<short>( p.persistentId );
-        StatePropDSG* prop = NULL;
-        if ( GetAnimEntityDSGManager() != NULL )
-        {
-            prop = ( persistentId >= 0 )
-                ? GetAnimEntityDSGManager()->FindStatePropByPersistentId( persistentId )
-                : GetAnimEntityDSGManager()->FindNearestStateProp( rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
-        }
-        if ( prop != NULL )
-        {
-            prop->ApplyRemoteBreak();
-        }
-        else if ( persistentId >= 0 )
-        {
-            // Sector not loaded here: record it so the prop never spawns.
-            GetPersistentWorldManager()->OnObjectBreak( persistentId );
-        }
-    }
-
-    void RemoteWorldVehicleDestroyed( uint16_t origin, const net::VehicleDestroyedPayload& p )
-    {
-        (void)origin;
-        // VehicleCentral slot indices differ per client (traffic is local), so
-        // the sender's id alone could name an unrelated car here. Take the
-        // nearest live vehicle to the blast instead. Remote drivers' ghosts are
-        // not in VehicleCentral; the drive-state stream despawns them.
-        VehicleCentral* vc = GetVehicleCentral();
-        if ( vc == NULL ) return;
-        int count = VehicleCentral::GetMaxActiveVehicles();
-        int i = net::FindNearestWorldObject( count, false, 0u, p.x, p.y, p.z, kVehicleMatchDist,
-            []( int ) { return 0u; },
-            [vc]( int k, float& x, float& y, float& z )
-            {
-                Vehicle* v = vc->GetVehicle( k );
-                if ( v == NULL || v->IsVehicleDestroyed() ) { x = y = z = 1.0e9f; return; }
-                const rmt::Vector& pos = v->GetPosition();
-                x = pos.x; y = pos.y; z = pos.z;
-            } );
-        if ( i < 0 ) return;
-        Vehicle* local = vc->GetVehicle( i );
-        if ( local != NULL )
-        {
-            GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( local ) );
-        }
-    }
-
-    void RemoteWorldCoinCollected( uint16_t origin, const net::CoinCollectedPayload& p )
-    {
-        (void)origin;
-        if ( GetCoinManager() != NULL )
-        {
-            GetCoinManager()->ApplyRemoteCoinCollected( static_cast<short>( p.persistentId ) );
-        }
-    }
-
-    void RemoteWorldPlatformDir( uint16_t origin, const net::PlatformDirPayload& p )
-    {
-        (void)origin;
-        if ( GetAnimEntityDSGManager() == NULL ) return;
-        AnimCollisionEntityDSG* e = GetAnimEntityDSGManager()->FindCollEntity(
-            p.objectUID, rmt::Vector( p.x, p.y, p.z ), kWorldObjectMatchDist );
-        if ( e != NULL )
-        {
-            e->SetAnimationDirection( static_cast<float>( p.dir ) );
-        }
-    }
-
 // Ghost-vehicle sink: mirrors a remote driver's machine in the world.
     // The vehicle is created through VehicleCentral just like a normal car, so
     // the correct model renders. We keep it simple: the ghost tracks the remote
@@ -608,52 +516,57 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
         return v;
     }
 
+    // Ghosts whose destruction (explosion) has already been shown.
+    std::set<Vehicle*> s_explodedGhosts;
+
+    // Kinematic mirror shared by remote drivers' machines and remote-owned
+    // traffic: position + heading through a matrix (the established spawn
+    // pattern, see vehicle.cpp ResetOnSpot), then the reported speed (which
+    // SetTransform zeroes), steering and lights. A ghost never simulates.
+    void ApplyGhostKinematics( Vehicle* v, float x, float y, float z, float yaw, float speedKmh,
+                               float steerRad, bool brake, bool reverse, bool destroyed )
+    {
+        rmt::Matrix m;
+        m.Identity();
+        m.FillRotateXYZ( 0.0f, yaw, 0.0f );
+        m.FillTranslate( rmt::Vector( x, y, z ) );
+        v->SetTransform( m );
+
+        if ( speedKmh < 0.0f ) speedKmh = 0.0f;
+        v->mSpeedKmh = speedKmh;
+        v->mSpeed = speedKmh / 3.6f;
+        v->SetWheelTurnAngleDirectlyInRadiansForDusitOnly( steerRad );
+
+        if ( v->mGeometryVehicle != NULL )
+        {
+            if ( brake )   v->mGeometryVehicle->ShowBrakeLights();   else v->mGeometryVehicle->HideBrakeLights();
+            if ( reverse ) v->mGeometryVehicle->ShowReverseLights(); else v->mGeometryVehicle->HideReverseLights();
+        }
+
+        // The owner blew it up: show the explosion once on this ghost.
+        if ( destroyed && s_explodedGhosts.insert( v ).second )
+        {
+            v->PlayExplosionEffect();
+        }
+        else if ( !destroyed )
+        {
+            s_explodedGhosts.erase( v );
+        }
+    }
+
     void RemoteVehicleMove( int playerId, void* handle, const PlayerNetworkState& state )
     {
         (void)playerId;
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
-        rmt::Vector pos( state.x, state.y, state.z );
-
-        // Kinematic mirror: position + heading through a matrix (the established
-        // spawn pattern, see vehicle.cpp ResetOnSpot ~1391). SetTransform resets
-        // speed, so the reported speed is re-applied afterwards to keep wheels
-        // spinning.
-        rmt::Matrix m;
-        m.Identity();
-        m.FillRotateXYZ( 0.0f, state.vehYaw, 0.0f );
-        m.FillTranslate( pos );
-        v->SetTransform( m );
-
-        // SetTransform zeroes mSpeed/mSpeedKmh; restore so wheels spin.
-        v->mSpeed = ( state.vehSpeedKmh > 3000.0f ) ? 3000.0f : static_cast<float>( state.vehSpeedKmh ) / 3.6f;
-        v->mSpeedKmh = state.vehSpeedKmh;
-
         // Steering: the signed steer byte maps -128..127 to -45..+45 degrees.
-        float steerDeg = static_cast<int8_t>( state.vehSteer ) / ( 255.0f / 90.0f );
-        float steerRad = steerDeg * ( rmt::PI / 180.0f );
-        v->SetWheelTurnAngleDirectlyInRadiansForDusitOnly( steerRad );
-
-        // Visual brake/reverse lights, null-guarded per the plan.
-        if ( v->mGeometryVehicle != NULL )
-        {
-            if ( state.vehFlags & PlayerNetworkState::VEH_FLAG_BRAKE )
-            {
-                v->mGeometryVehicle->ShowBrakeLights();
-            }
-            else
-            {
-                v->mGeometryVehicle->HideBrakeLights();
-            }
-            if ( state.vehFlags & PlayerNetworkState::VEH_FLAG_REVERSE )
-            {
-                v->mGeometryVehicle->ShowReverseLights();
-            }
-            else
-            {
-                v->mGeometryVehicle->HideReverseLights();
-            }
-        }
+        float steerDeg = static_cast<int8_t>( state.vehSteer ) / kSteerUnitsPerDeg;
+        ApplyGhostKinematics( v, state.x, state.y, state.z, state.vehYaw,
+                              static_cast<float>( state.vehSpeedKmh ),
+                              steerDeg * ( rmt::PI / 180.0f ),
+                              ( state.vehFlags & PlayerNetworkState::VEH_FLAG_BRAKE ) != 0,
+                              ( state.vehFlags & PlayerNetworkState::VEH_FLAG_REVERSE ) != 0,
+                              ( state.vehFlags & PlayerNetworkState::VEH_FLAG_DESTROYED ) != 0 );
     }
 
     void RemoteVehicleDespawn( int playerId, void* handle )
@@ -674,7 +587,81 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
         // kills the host as soon as two remotes drive and their ghosts
         // spawn/despawn. This sink's only job is to relinquish the ownership; the
         // teardown already freed the object.
+        s_explodedGhosts.erase( v );
         GetVehicleCentral()->RemoveNetworkGhostVehicle( v );
+    }
+
+    // ---- remote-owned dynamic entities (NetEntityManager sink) -------------
+
+    void* NetEntitySpawnGhost( uint64_t id, const net::NetEntitySpawn& spawn )
+    {
+        (void)id;
+        if ( spawn.kind != net::NEK_TRAFFIC_CAR ) return NULL;
+        Vehicle* v = GetVehicleCentral()->AddNetworkGhostVehicle( spawn.model );
+        if ( v != NULL )
+        {
+            ApplyGhostKinematics( v, spawn.x, spawn.y, spawn.z, spawn.yaw, 0.0f, 0.0f, false, false, false );
+        }
+        return v;
+    }
+
+    void NetEntityMoveGhost( void* handle, const net::NetEntityMotion& m )
+    {
+        Vehicle* v = static_cast<Vehicle*>( handle );
+        if ( v == NULL ) return;
+        float steerRad = ( m.steer / 127.0f ) * 45.0f * ( rmt::PI / 180.0f );
+        ApplyGhostKinematics( v, m.x, m.y, m.z, m.yaw, static_cast<float>( m.speedKmh ), steerRad,
+                              ( m.flags & net::NetEntityMotion::MF_BRAKE ) != 0,
+                              ( m.flags & net::NetEntityMotion::MF_REVERSE ) != 0,
+                              ( m.flags & net::NetEntityMotion::MF_DESTROYED ) != 0 );
+    }
+
+    void NetEntityDespawnGhost( void* handle )
+    {
+        Vehicle* v = static_cast<Vehicle*>( handle );
+        if ( v == NULL ) return;
+        s_explodedGhosts.erase( v );
+        // See RemoteVehicleDespawn: the teardown releases (and frees) the ghost.
+        GetVehicleCentral()->RemoveNetworkGhostVehicle( v );
+    }
+
+    // Samples one of OUR traffic cars for the entity stream.
+    bool NetEntitySampleTraffic( void* handle, net::NetEntityMotion& out )
+    {
+        Vehicle* v = static_cast<Vehicle*>( handle );
+        if ( v == NULL ) return false;
+        rmt::Vector pos;
+        v->GetPosition( &pos );
+        out.x = pos.x; out.y = pos.y; out.z = pos.z;
+        out.yaw = v->GetFacingInRadians();
+        float kmh = v->GetSpeedKmh();
+        out.speedKmh = kmh < 0.0f ? 0 : ( kmh > 65535.0f ? 65535 : static_cast<uint16_t>( kmh ) );
+        float steerDeg = v->mWheelTurnAngle * ( 180.0f / rmt::PI );
+        float steerUnits = steerDeg / 45.0f * 127.0f;
+        out.steer = static_cast<int8_t>( steerUnits > 127.0f ? 127 : ( steerUnits < -127.0f ? -127 : steerUnits ) );
+        out.flags = 0;
+        if ( v->mBrakeLightsOn )       out.flags |= net::NetEntityMotion::MF_BRAKE;
+        if ( v->mReverseLightsOn )     out.flags |= net::NetEntityMotion::MF_REVERSE;
+        if ( v->IsVehicleDestroyed() ) out.flags |= net::NetEntityMotion::MF_DESTROYED;
+        return true;
+    }
+
+    // ---- local coin bank <-> server ledger (PlayerEconomy) -----------------
+
+    int64_t EconomyGetBalance( net::CounterId counter )
+    {
+        (void)counter;
+        return GetCoinManager()->GetBankValue();
+    }
+
+    void EconomySetBalance( net::CounterId counter, int64_t balance )
+    {
+        (void)counter;
+        if ( balance < 0 ) balance = 0;
+        if ( balance > INT32_MAX ) balance = INT32_MAX;
+        // Straight to the character sheet (the bank's store): not reported back.
+        GetCharacterSheetManager()->SetNumberOfTokens( GetGameplayManager()->GetCurrentLevelIndex(),
+                                                       static_cast<int>( balance ) );
     }
 
     // Singleton access without leading to circular includes.
@@ -783,11 +770,6 @@ GameplayContext::~GameplayContext()
 //=============================================================================
 void GameplayContext::OnStart( ContextEnum previousContext )
 {
-    {
-        FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_autostart_diag.txt", "a" );
-        if (f) { fprintf( f, "[MP] GameplayContext::OnStart prev=%d host=%d join=%d\n", (int)previousContext, (int)CommandLineOptions::GetHostMode(), (int)CommandLineOptions::GetJoinMode() ); fclose( f ); }
-    }
-
     // Common to all playing contexts.
     //
     PlayingContext::OnStart( previousContext );
@@ -804,23 +786,18 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     pMatchMgr->SetLocalStateProvider( &GameplayLocalStateProvider );
     pMatchMgr->SetMissionStateProvider( &GameplayMissionStateProvider );
 
-    // Consume replicated world events from remote peers: door/mechanism
-    // states, broken props, destroyed vehicles, collected world coins and
-    // platform directions. DispatchWorldEvent applies each inside a
-    // RemoteWorldEventScope so the mirrored change is not re-broadcast.
+    // Replicated world services: the coin bank feeds the server ledger, and
+    // remote-owned traffic is mirrored as kinematic ghosts. Static world
+    // objects register themselves while the level loads (NetWorldRegistry).
     net::LocalActionLatch::Reset();
+    NetworkMatchManager::Economy().SetBalanceAccess( &EconomyGetBalance, &EconomySetBalance );
     {
-        net::WorldEventHandlers handlers;
-        handlers.stateProp = &RemoteWorldStateProp;
-        handlers.breakable = &RemoteWorldBreakable;
-        handlers.vehicleDestroyed = &RemoteWorldVehicleDestroyed;
-        handlers.coinCollected = &RemoteWorldCoinCollected;
-        handlers.platformDir = &RemoteWorldPlatformDir;
-        pMatchMgr->SetWorldEventSink(
-            [handlers]( const net::WorldEventCodec::Decoded* ev )
-            {
-                net::DispatchWorldEvent( ev, handlers );
-            } );
+        NetEntityManager::Sink entitySink;
+        entitySink.spawn = &NetEntitySpawnGhost;
+        entitySink.move = &NetEntityMoveGhost;
+        entitySink.despawn = &NetEntityDespawnGhost;
+        NetworkMatchManager::Entities().SetSink( entitySink );
+        NetworkMatchManager::Entities().SetSampler( &NetEntitySampleTraffic );
     }
 
     // Auto-start a match from the command line (-host <port> / -join <ip:port>).
@@ -837,26 +814,21 @@ void GameplayContext::OnStart( ContextEnum previousContext )
     (void)hostPassword; (void)hostSlots; (void)joinPassword;
     if (autoHost || autoJoin)
     {
-        // Diagnostic: the engine does not write printf to a redirected stdout,
-        // so dump the autostart result to a file we can read after launch.
-        auto mpDiag = []() -> FILE*
-        {
-            FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_autostart_diag.txt", "a" );
-            return f;
-        };
         if (autoHost)
         {
             pMatchMgr->SetHostConfig( hostPassword[0] != '\0' ? hostPassword : NULL, hostSlots );
-            bool started = pMatchMgr->StartHost( hostPort );
-            FILE* f = mpDiag();
-            if (f) { fprintf( f, "[MP AUTOSTART] StartHost(port=%u) -> %s\n", hostPort, started ? "true" : "false" ); fclose( f ); }
+            if ( !pMatchMgr->StartHost( hostPort ) )
+            {
+                rReleasePrintf( "net: could not host on port %u\n", hostPort );
+            }
         }
         else if (autoJoin)
         {
             if (joinPassword[0] != '\0') pMatchMgr->SetClientPassword( joinPassword );
-            bool joined = pMatchMgr->JoinHost( s_autoJoinIp, joinPort );
-            FILE* f = mpDiag();
-            if (f) { fprintf( f, "[MP AUTOSTART] JoinHost(%s:%u) -> %s\n", s_autoJoinIp, joinPort, joined ? "true" : "false" ); fclose( f ); }
+            if ( !pMatchMgr->JoinHost( s_autoJoinIp, joinPort ) )
+            {
+                rReleasePrintf( "net: could not join %s:%u\n", s_autoJoinIp, joinPort );
+            }
         }
     }
 
@@ -1089,10 +1061,6 @@ void GameplayContext::OnStart( ContextEnum previousContext )
 //=============================================================================
 void GameplayContext::OnStop( ContextEnum nextContext )
 {
-    {
-        FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/host_exit_diag.txt", "a" );
-        if (f) { fprintf( f, "[EXIT] GameplayContext::OnStop nextContext=%d\n", (int)nextContext ); fclose( f ); }
-    }
     GetPresentationManager()->OnGameplayStop();
 
     // turn off controller rumble, to comply w/ TCR/TRC standards
@@ -1248,17 +1216,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
     NetworkMatchManager* pMatch = NetworkMatchManager::GetInstance();
     if (pMatch != NULL && pMatch->IsInMatch())
     {
-        pMatch->Update();
-        // Diagnostic: how many remote players does this process actually know?
-        {
-            static int s_cntDiag = 0;
-            if ( (++s_cntDiag & 0x3F) == 0 )
-            {
-                int n = pMatch->GetRemotePlayers().GetPlayerCount();
-                FILE* f = fopen( "C:/Users/User/AppData/Local/Temp/gigatool/mp_cnt_diag.txt", "a" );
-                if (f) { fprintf( f, "[CNT] tick=%d remotePlayerCount=%d\n", s_cntDiag, n ); fclose( f ); }
-            }
-        }
+        pMatch->Update( static_cast<float>( elapsedTime ) / 1000.0f );
         // Reflect remote players' latest states in the world.
         GetRemotePlayerWorldView()->Sync( pMatch->GetRemotePlayers() );
         // Advance each remote player's visual position smoothly toward its

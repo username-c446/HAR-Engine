@@ -27,6 +27,7 @@
 // Forward References
 //========================================
 class Vehicle;
+namespace net { struct WorldStateValue; }
 class CarStartLocator;
 
 //=============================================================================
@@ -78,7 +79,8 @@ private:
         ParkedCarInfo() : 
             mCar( NULL ), 
             mHusk( NULL ),
-            mLoadedZoneUID( 0 )
+            mLoadedZoneUID( 0 ),
+            mNetLoc( -1 )
             //mActiveListIndex( -1 ) 
         { mName[0] ='\0'; };
 
@@ -86,11 +88,38 @@ private:
         Vehicle* mCar;
         Vehicle* mHusk;
         tUID mLoadedZoneUID;
+        int  mNetLoc;   // locator index in its zone while parked (-1: not parked)
         //int mActiveListIndex; 
     };
     
     //Where all the parked cars are
     ParkedCarInfo* mParkedCars;
+
+    // ---- network: server-authoritative parked cars -------------------------
+    // The placement of a zone (which car type on which locator, colour) is a
+    // first-write world-state record: the first client to load the zone
+    // decides and publishes it, everyone else (and late joiners) uses it, and a
+    // client that lost the race re-places from the authoritative plan. A car a
+    // player drives away is marked taken so other clients remove their copy.
+    struct NetZone
+    {
+        NetZone() : mZone( 0 ), mNumLocs( 0 ) {}
+        tUID         mZone;
+        unsigned int mNumLocs;
+        rmt::Vector  mPos[ MAX_LOCATORS_PER_ZONE ];
+        float        mRot[ MAX_LOCATORS_PER_ZONE ];
+    };
+    NetZone mNetZones[ MAX_ZONES ];
+
+    static void NetApplyZone( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased );
+    static void NetApplyCar( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased );
+    NetZone* FindNetZone( tUID zone );
+    bool     IsTypeFree( unsigned int type ) const;
+    bool     IsTaken( tUID zone, unsigned int loc ) const;
+    bool     PlaceCar( unsigned int type, NetZone& zone, unsigned int loc, const pddiColour& colour );
+    void     RemoveParkedCar( ParkedCarInfo& info );
+    void     ClearZoneCars( tUID zone );
+    void     ApplyPopulation( NetZone& zone, const net::WorldStateValue& plan );
     unsigned int mNumCarTypes;
     unsigned int mNumParkedCars;
 

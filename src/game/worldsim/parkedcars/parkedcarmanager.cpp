@@ -40,6 +40,8 @@
 #include <render/rendermanager/worldrenderlayer.h>
 
 #include <meta/carstartlocator.h>
+#include <network/NetWorldHooks.h>
+#include <worldsim/character/charactermanager.h>
 
 #include <main/commandlineoptions.h>
 
@@ -130,6 +132,28 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
             //Let's choose some for this zone and reset the data.
             if ( mNumLocators > 0 )
             {
+                // Network: remember this zone's locators (they leave the
+                // inventory below) so an authoritative plan can be applied later.
+                NetZone* netZone = FindNetZone( 0 );
+                if ( netZone != NULL )
+                {
+                    netZone->mZone = mLoadingZoneUID;
+                    netZone->mNumLocs = mNumLocators;
+                    for ( unsigned int l = 0; l < mNumLocators; ++l )
+                    {
+                        mLocators[ l ]->GetLocation( &netZone->mPos[ l ] );
+                        netZone->mRot[ l ] = mLocators[ l ]->GetRotation();
+                    }
+                }
+                // In a match the server may already hold this zone's placement
+                // (another player loaded it first): use it instead of rolling.
+                net::WorldStateValue serverPlan;
+                bool haveServerPlan = netZone != NULL && networld::IsInMatch() &&
+                    networld::FindObjectState( net::WOK_PARKED_CAR, mLoadingZoneUID, 0, net::WOC_POPULATION, serverPlan );
+                // The plan we roll locally: count | (loc, type, r, g, b)*
+                unsigned char plan[ 1 + 5 * MAX_DIFFERENT_CARS ];
+                plan[ 0 ] = 0;
+
                 //Choose a locator or two.
                 unsigned int max = mNumCarTypes / MAX_ZONES;
                 bool isOdd = mNumCarTypes % 2 == 1;
@@ -141,7 +165,7 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
                 //Allocate the max num of parked cars among these locators.
                 unsigned int i;
                 unsigned int allocated = 0;
-                for ( i = 0; i < mNumLocators && i < max && allocated < mNumCarTypes - mNumParkedCars; ++i )
+                for ( i = 0; !haveServerPlan && i < mNumLocators && i < max && allocated < mNumCarTypes - mNumParkedCars; ++i )
                 {
                     unsigned int which = rand() % mNumLocators;
                     if ( !(mLocators[ which ]->GetFlag( Locator::ACTIVE )) )
@@ -193,35 +217,49 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
 
                         //rAssert( car );  //If this fails then mNumParkedCars is invalid or there's mem stompage
 
-                        if ( car )
+                        if ( car && netZone != NULL )
                         {
                             //Assign a new random colour
                             pddiColour colour;
                             TrafficManager::GetInstance()->GenerateRandomColour( colour );
-                            car->mGeometryVehicle->SetTrafficBodyColour( colour );
 
-                            int added = GetVehicleCentral()->AddVehicleToActiveList( car );
-                            rAssert( added != -1 );
-                            //info->mActiveListIndex = added;
-
-                            //Set the position and facing and reset.
-                            rmt::Vector location;
-                            mLocators[ which ]->GetLocation( &location );
-                            car->SetInitialPositionGroundOffsetAutoAdjust( &location );
-
-                            car->SetResetFacingInRadians( mLocators[ which ]->GetRotation() );
-
-                            car->Reset();
-
-                            car->GetSimState()->SetControl( sim::simSimulationCtrl );
-
-                            //Turn off the headlights
-                            car->mGeometryVehicle->EnableLights( false );
-
-                            ++mNumParkedCars;
-                            ++allocated;
+                            // PlaceCar claims the slot itself (and registers the
+                            // car's network identity).
+                            info->mLoadedZoneUID = 0;
+                            unsigned int type = static_cast<unsigned int>( info - mParkedCars );
+                            if ( PlaceCar( type, *netZone, which, colour ) )
+                            {
+                                unsigned char* e = &plan[ 1 + 5 * plan[ 0 ] ];
+                                e[ 0 ] = static_cast<unsigned char>( which );
+                                e[ 1 ] = static_cast<unsigned char>( type );
+                                e[ 2 ] = static_cast<unsigned char>( colour.Red() );
+                                e[ 3 ] = static_cast<unsigned char>( colour.Green() );
+                                e[ 4 ] = static_cast<unsigned char>( colour.Blue() );
+                                ++plan[ 0 ];
+                                ++allocated;
+                            }
                         }
-                    }                
+                        else if ( info != NULL )
+                        {
+                            info->mLoadedZoneUID = 0; // no zone slot to place into
+                        }
+                    }
+                }
+
+                if ( netZone != NULL )
+                {
+                    networld::RegisterObject( net::WOK_PARKED_CAR, netZone->mZone, 0, netZone, &ParkedCarManager::NetApplyZone );
+                    if ( haveServerPlan )
+                    {
+                        ApplyPopulation( *netZone, serverPlan );
+                    }
+                    else
+                    {
+                        // First come, first served: the server keeps the first
+                        // plan; a losing client re-places from it (NetApplyZone).
+                        networld::RequestObjectState( netZone, net::WOC_POPULATION, net::WSP_FIRST_WRITE,
+                                                      plan, static_cast<unsigned char>( 1 + 5 * plan[ 0 ] ) );
+                    }
                 }
 
                 //Remove all the locators
@@ -240,12 +278,21 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
         {
             //Make all the parked cars in the dynazone available to the new zone.
             tUID sectionNameUID = static_cast<tName*>(pEventData)->GetUID();
+            NetZone* netZone = FindNetZone( sectionNameUID );
+            if ( netZone != NULL && sectionNameUID != static_cast< tUID >( 0 ) )
+            {
+                networld::UnregisterObject( netZone );
+                netZone->mZone = 0;
+                netZone->mNumLocs = 0;
+            }
             unsigned int i;
             for ( i = 0; i < mNumCarTypes; ++i )
             {
                 if ( mParkedCars[ i ].mLoadedZoneUID == sectionNameUID )
                 {
                     //Make this puppy available.
+                    networld::UnregisterObject( mParkedCars[ i ].mCar );
+                    mParkedCars[ i ].mNetLoc = -1;
                     mParkedCars[ i ].mLoadedZoneUID = 0;
                     mNumParkedCars--;
 
@@ -338,6 +385,14 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
             }
             // otherwise, it sure does...
 
+            // Blown up for everyone (first write wins): other clients run the
+            // same husk swap on their copy. Ignored while applying a remote one.
+            if ( !isFreeCar && info->mNetLoc >= 0 )
+            {
+                const unsigned char broken = 1;
+                networld::RequestObjectState( v, net::WOC_BROKEN, net::WSP_FIRST_WRITE, &broken, 1 );
+            }
+
             // First, grab some information about the car
             rmt::Vector initPos, initDir;
             v->GetPosition( &initPos );
@@ -408,6 +463,27 @@ void ParkedCarManager::HandleEvent( EventEnum id, void* pEventData )
         }
         break;
 
+    case EVENT_GETINTOVEHICLE_END:
+        {
+            // The local player drove a parked car away: taken for everyone, so
+            // other clients drop their copy (the car itself is mirrored by our
+            // player stream from now on).
+            Character* character = static_cast<Character*>( pEventData );
+            if ( character == NULL || character != GetCharacterManager()->GetCharacter( 0 ) )
+            {
+                break;
+            }
+            Vehicle* v = character->GetTargetVehicle();
+            ParkedCarInfo* info = NULL;
+            bool isFreeCar = false;
+            FindParkedCarInfo( v, info, isFreeCar );
+            if ( info != NULL && !isFreeCar && info->mNetLoc >= 0 )
+            {
+                const unsigned char taken = 1;
+                networld::RequestObjectState( v, net::WOC_TAKEN, net::WSP_FIRST_WRITE, &taken, 1 );
+            }
+        }
+        break;
     case EVENT_REPAIR_CAR:
         {
             // NOTE: When we want to support other cars than the user car 
@@ -781,6 +857,182 @@ void ParkedCarManager::RemoveFreeCarIfClose( const rmt::Vector& position )
 //=============================================================================
 // ParkedCarManager::ParkedCarManager
 //=============================================================================
+// Network: server-authoritative parked cars (see ParkedCarManager::NetZone)
+//=============================================================================
+ParkedCarManager::NetZone* ParkedCarManager::FindNetZone( tUID zone )
+{
+    for ( unsigned int z = 0; z < MAX_ZONES; ++z )
+    {
+        if ( mNetZones[ z ].mZone == zone )
+        {
+            return &mNetZones[ z ];
+        }
+    }
+    return NULL;
+}
+
+bool ParkedCarManager::IsTypeFree( unsigned int type ) const
+{
+    if ( type >= mNumCarTypes || mParkedCars[ type ].mCar == NULL ||
+         mParkedCars[ type ].mLoadedZoneUID != static_cast< tUID >( 0 ) )
+    {
+        return false;
+    }
+    AvatarManager* am = GetAvatarManager();
+    for ( int pi = 0; pi < am->GetNumAvatars(); ++pi )
+    {
+        Avatar* avatar = am->GetAvatarForPlayer( pi );
+        if ( avatar && avatar->GetCharacter() && avatar->GetCharacter()->IsInCar() &&
+             avatar->GetVehicle() == mParkedCars[ type ].mCar )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ParkedCarManager::IsTaken( tUID zone, unsigned int loc ) const
+{
+    net::WorldStateValue v;
+    return networld::FindObjectState( net::WOK_PARKED_CAR, zone, loc + 1, net::WOC_TAKEN, v ) ||
+           networld::FindObjectState( net::WOK_PARKED_CAR, zone, loc + 1, net::WOC_BROKEN, v );
+}
+
+bool ParkedCarManager::PlaceCar( unsigned int type, NetZone& zone, unsigned int loc, const pddiColour& colour )
+{
+    if ( loc >= zone.mNumLocs || !IsTypeFree( type ) || IsTaken( zone.mZone, loc ) )
+    {
+        return false;
+    }
+    ParkedCarInfo& info = mParkedCars[ type ];
+    Vehicle* car = info.mCar;
+    car->mGeometryVehicle->SetTrafficBodyColour( colour );
+    int added = GetVehicleCentral()->AddVehicleToActiveList( car );
+    rAssert( added != -1 );
+    if ( added == -1 )
+    {
+        return false;
+    }
+    car->SetInitialPositionGroundOffsetAutoAdjust( &zone.mPos[ loc ] );
+    car->SetResetFacingInRadians( zone.mRot[ loc ] );
+    car->Reset();
+    car->GetSimState()->SetControl( sim::simSimulationCtrl );
+    car->mGeometryVehicle->EnableLights( false );
+    info.mLoadedZoneUID = zone.mZone;
+    info.mNetLoc = static_cast<int>( loc );
+    ++mNumParkedCars;
+    // Per-car identity (zone, locator) for taken / destroyed.
+    networld::RegisterObject( net::WOK_PARKED_CAR, zone.mZone, loc + 1, car, &ParkedCarManager::NetApplyCar );
+    return true;
+}
+
+void ParkedCarManager::RemoveParkedCar( ParkedCarInfo& info )
+{
+    if ( info.mCar == NULL || info.mLoadedZoneUID == static_cast< tUID >( 0 ) || info.mHusk != NULL )
+    {
+        return;
+    }
+    networld::UnregisterObject( info.mCar );
+    GetVehicleCentral()->RemoveVehicleFromActiveList( info.mCar );
+    info.mLoadedZoneUID = 0;
+    info.mNetLoc = -1;
+    mNumParkedCars--;
+}
+
+void ParkedCarManager::ClearZoneCars( tUID zone )
+{
+    for ( unsigned int j = 0; j < mNumCarTypes; ++j )
+    {
+        if ( mParkedCars[ j ].mLoadedZoneUID == zone && mParkedCars[ j ].mNetLoc >= 0 &&
+             GetGameplayManager()->GetCurrentVehicle() != mParkedCars[ j ].mCar )
+        {
+            RemoveParkedCar( mParkedCars[ j ] );
+        }
+    }
+}
+
+void ParkedCarManager::ApplyPopulation( NetZone& zone, const net::WorldStateValue& plan )
+{
+    if ( plan.len < 1 || plan.len < 1 + 5 * plan.bytes[ 0 ] )
+    {
+        return;
+    }
+    unsigned int count = plan.bytes[ 0 ];
+
+    // Already exactly this plan? (idempotent re-apply / our own confirmation)
+    unsigned int matching = 0;
+    unsigned int placedHere = 0;
+    for ( unsigned int j = 0; j < mNumCarTypes; ++j )
+    {
+        if ( mParkedCars[ j ].mLoadedZoneUID != zone.mZone || mParkedCars[ j ].mNetLoc < 0 )
+        {
+            continue;
+        }
+        ++placedHere;
+        for ( unsigned int k = 0; k < count; ++k )
+        {
+            const unsigned char* e = &plan.bytes[ 1 + 5 * k ];
+            if ( e[ 0 ] == static_cast<unsigned int>( mParkedCars[ j ].mNetLoc ) && e[ 1 ] == j )
+            {
+                ++matching;
+            }
+        }
+    }
+    if ( matching == placedHere && placedHere == count )
+    {
+        return;
+    }
+
+    ClearZoneCars( zone.mZone );
+    for ( unsigned int k = 0; k < count; ++k )
+    {
+        const unsigned char* e = &plan.bytes[ 1 + 5 * k ];
+        pddiColour colour( e[ 2 ], e[ 3 ], e[ 4 ] );
+        PlaceCar( e[ 1 ], zone, e[ 0 ], colour );
+    }
+}
+
+void ParkedCarManager::NetApplyZone( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased )
+{
+    if ( handle == NULL || erased || channel != net::WOC_POPULATION )
+    {
+        return;
+    }
+    GetInstance().ApplyPopulation( *static_cast<NetZone*>( handle ), value );
+}
+
+void ParkedCarManager::NetApplyCar( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased )
+{
+    Vehicle* v = static_cast<Vehicle*>( handle );
+    if ( v == NULL || erased || value.len < 1 || value.bytes[ 0 ] == 0 )
+    {
+        return;
+    }
+    ParkedCarManager& pcm = GetInstance();
+    ParkedCarInfo* info = NULL;
+    bool isFreeCar = false;
+    pcm.FindParkedCarInfo( v, info, isFreeCar );
+    if ( info == NULL || isFreeCar )
+    {
+        return;
+    }
+    if ( channel == net::WOC_TAKEN )
+    {
+        // Another player drove it away (their machine is mirrored by the
+        // player stream). Our copy goes, unless we are sitting in it.
+        if ( GetGameplayManager()->GetCurrentVehicle() != v )
+        {
+            pcm.RemoveParkedCar( *info );
+        }
+    }
+    else if ( channel == net::WOC_BROKEN && !v->mVehicleDestroyed )
+    {
+        // Blown up elsewhere: run the same husk swap as a local destruction.
+        GetEventManager()->TriggerEvent( EVENT_VEHICLE_DESTROYED, static_cast<void*>( v ) );
+    }
+}
+
+//=============================================================================
 // Description: Constructor.
 //
 // Parameters:  None.
@@ -798,6 +1050,8 @@ ParkedCarManager::ParkedCarManager() :
     GetEventManager()->AddListener( this, EVENT_DUMP_DYNA_SECTION );
     GetEventManager()->AddListener( this, EVENT_DYNAMIC_ZONE_LOAD_ENDED );
     GetEventManager()->AddListener( this, EVENT_VEHICLE_DESTROYED );
+    GetEventManager()->AddListener( this, EVENT_GETINTOVEHICLE_END );
+    GetEventManager()->AddListener( this, EVENT_GETINTOVEHICLE_END );
     GetEventManager()->AddListener( this, EVENT_REPAIR_CAR );
 
     if ( CommandLineOptions::Get( CLO_PARKED_CAR_TEST ) )

@@ -38,7 +38,7 @@
 #include <render/rendermanager/worldrenderlayer.h>
 #include <data/persistentworldmanager.h>
 #include <mission/gameplaymanager.h>
-#include <network/CoinWorldEventEmitter.h>
+#include <network/NetWorldHooks.h>
 #include <mission/charactersheet/charactersheetmanager.h>
 
 /* Watcher stuff */
@@ -455,6 +455,7 @@ void CoinManager::SpawnCoin( ActiveCoin& Coin, const rmt::Vector& Start, float G
     Coin.Position = Start;
     Coin.Position.y = Ground + COIN_HOVER;
     Coin.State = InstaCollect ? CS_SpawnToCollect : CS_InitialSpawning;
+    Coin.NetClaim = 0;
     Coin.Age = Sparkle::sRandom.Float() * rmt::PI;
     Coin.Ground = Ground;
     Coin.Velocity.x = Sparkle::sRandom.FloatSigned();
@@ -495,6 +496,7 @@ void CoinManager::AddFlyDownCoin(void)
     c->Position.y = 0.0f;
     c->Position.z = 0.0f;
     c->State = CS_FlyingFromHUD;
+    c->NetClaim = 0;
     c->Age = 0.0f;
 	c->Velocity.Set(-0.5f, -0.5f, 0.0f);
     c->Velocity.Scale(FLYING_TIME * 2.0f);
@@ -629,44 +631,19 @@ void CoinManager::CheckCollection( ActiveCoin& Coin, const rmt::Vector& AvatarPo
         if( Coin.State == CS_RestingIndefinitely )
         {
             GetPersistentWorldManager()->OnObjectBreak( Coin.PersistentObjectID );
-            net::EmitCoinCollectedWorldEvent( Coin.PersistentObjectID,
-                                              Coin.Position.x, Coin.Position.y, Coin.Position.z );
         }
         Coin.State = CS_Collecting;
         Coin.Age = 0.0f;
     }
 }
 
-bool CoinManager::ApplyRemoteCoinCollected( short persistentId )
-{
-    if( persistentId < 0 )
-    {
-        return false;
-    }
-    GetPersistentWorldManager()->OnObjectBreak( persistentId );
-    for( int i = 0; i < NUM_COINS; ++i )
-    {
-        ActiveCoin& c = mActiveCoins[ i ];
-        if( c.State == CS_RestingIndefinitely && c.PersistentObjectID == persistentId )
-        {
-            // Remove it outright (a decaying coin is still collectable here and
-            // would credit the local bank), with the same vanish sparkle as expiry.
-            c.State = CS_Inactive;
-            --mNumActiveCoins;
-            GetSparkleManager()->AddSparkle( rmt::Vector( c.Position.x, c.Position.y + mCoinBounding.radius, c.Position.z ), 0.25f, 0.5f, rmt::Vector( 0.0f, 0.01f, 0.0f ), Sparkle::SE_Vanish );
-            return true;
-        }
-    }
-    return false;
-}
-
 /*=============================================================================
 Player has picked up a coin. This will increase the player's bank value, fire
 a coin collected event so that we can play a sound
 =============================================================================*/
-void CoinManager::CollectCoins( int Count )
+void CoinManager::CollectCoins( int Count, unsigned long long netClaim )
 {
-	AdjustBankValue( Count );
+	AdjustBankValue( Count, netClaim != 0 ? net::LR_PICKUP_CLAIMED : net::LR_PICKUP, netClaim );
     HeapMgr()->PushHeap( GMA_LEVEL_ZONE );
     GetEventManager()->TriggerEvent( EVENT_COLLECTED_COINS, reinterpret_cast<void*>( (uintptr_t)Count ) );
     HeapMgr()->PopHeap( GMA_LEVEL_ZONE );
@@ -680,7 +657,7 @@ void CoinManager::LoseCoins( int Count, const rmt::Vector* Position )
 {
     int count = rmt::Min( Count, GetBankValue() );
     rAssert( count >= 0 );
-    AdjustBankValue( -count );
+    AdjustBankValue( -count, net::LR_LOSS );
     if( Position )
     {
         // Because we are losing the coins when we are shot (or car explodes) the position tends to be lower
@@ -705,7 +682,7 @@ CoinManager::GetBankValue() const
 /*=============================================================================
 Modify the player's bank value without any special effects.
 =============================================================================*/
-void CoinManager::AdjustBankValue( int DeltaCoins )
+void CoinManager::AdjustBankValue( int DeltaCoins, unsigned char netReason, unsigned long long netClaim )
 {
 /*
     mBankValue += DeltaCoins;
@@ -713,8 +690,21 @@ void CoinManager::AdjustBankValue( int DeltaCoins )
 */
     // tell the character sheet manager
     //
+    int before = GetBankValue();
     GetCharacterSheetManager()->AddTokens( GetGameplayManager()->GetCurrentLevelIndex(),
                                            DeltaCoins );
+    // The server ledger holds the authoritative balance; report what was
+    // actually applied (the sheet clamps at zero).
+    int applied = GetBankValue() - before;
+    if( applied != 0 )
+    {
+        unsigned char reason = netReason;
+        if( reason == kNetReasonBySign )
+        {
+            reason = applied > 0 ? net::LR_REWARD : net::LR_SPEND;
+        }
+        networld::ReportCoins( reason, applied, netClaim );
+    }
 
     if( DeltaCoins > 0 )
     {
@@ -770,6 +760,11 @@ void CoinManager::AddWorldCoin( const rmt::Vector& Position, tUID Sector )
     c->Age = Sparkle::sRandom.Float() * rmt::PI;
     c->Sector = Sector;
     c->PersistentObjectID = persistentID;
+    {
+        // Locator positions come bit-identical from the level data on every client.
+        uint64_t posHash = net::Fnv1a64( 0xCBF29CE484222325ull, &Position, sizeof( float ) * 3 );
+        c->NetClaim = net::MakeWorldObjectId( net::WOK_WORLD_COIN, static_cast<uint64_t>( Sector ), posHash, 0 );
+    }
     ++mNumActiveCoins;
 #ifndef RAD_RELEASE
     dbg_MaxCoins = rmt::Max( (int)mNumActiveCoins, dbg_MaxCoins );
@@ -804,7 +799,8 @@ void CoinManager::UpdateCollecting( ActiveCoin& Coin, const rmt::Vector& AvatarP
         Coin.State = CS_Collected;
         Coin.Age = 0.0f;
 		Coin.HeadingCos = 1;
-        CollectCoins( 1 );
+        CollectCoins( 1, Coin.NetClaim );
+        Coin.NetClaim = 0;
     }
     else
     {
@@ -1021,7 +1017,7 @@ void CoinManager::OnCheatEntered( eCheatID cheatID, bool isEnabled )
 {
     if( cheatID == CHEAT_ID_EXTRA_COINS )
     {
-        this->AdjustBankValue( +100 ); // add 100 coins to bank value
+        this->AdjustBankValue( +100, net::LR_CHEAT ); // add 100 coins to bank value
     }
 }
 

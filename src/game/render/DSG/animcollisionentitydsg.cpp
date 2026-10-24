@@ -110,8 +110,19 @@ mpActionButton( 0 )
 // Return:      N/A.
 //
 //==============================================================================
+void AnimCollisionEntityDSG::NetApply( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased )
+{
+    AnimCollisionEntityDSG* e = static_cast<AnimCollisionEntityDSG*>( handle );
+    if ( e == NULL || erased || channel != net::WOC_ANIM_DIR || value.len < 1 )
+    {
+        return;
+    }
+    e->SetAnimationDirection( static_cast<float>( static_cast<signed char>( value.bytes[ 0 ] ) ) );
+}
+
 AnimCollisionEntityDSG::~AnimCollisionEntityDSG()
 {
+    networld::UnregisterObject( this );
 BEGIN_PROFILE( "AnimColl Destroy" );
     
     tRefCounted::Release( mpDrawable );

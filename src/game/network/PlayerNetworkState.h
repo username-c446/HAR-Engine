@@ -65,6 +65,7 @@ struct PlayerNetworkState
     // Vehicle mirror bits.
     static constexpr const uint8_t VEH_FLAG_BRAKE   = 0x01;
     static constexpr const uint8_t VEH_FLAG_REVERSE = 0x02;
+    static constexpr const uint8_t VEH_FLAG_DESTROYED = 0x04; // machine blown up (ghost shows the explosion)
 
     // Number of bytes Serialize writes / Deserialize reads.
     // 4 floats + vehicleModel[16] + int32 + float + 2*uint8  (base, 42)

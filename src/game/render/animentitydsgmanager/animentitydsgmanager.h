@@ -75,14 +75,6 @@ class AnimEntityDSGManager : public EventListener
         void Remove( AnimCollisionEntityDSG* );
         void Remove( StatePropDSG* );
 
-        // Network world-event lookups (WE_STATEPROP / WE_BREAKABLE /
-        // WE_PLATFORM_DIR). Uids name types, not instances, so the instance
-        // nearest to the sender's position (within maxDist) wins. NULL if none.
-        StatePropDSG* FindStateProp( unsigned int statePropUid, const rmt::Vector& pos, float maxDist );
-        StatePropDSG* FindStatePropByPersistentId( short persistentId );
-        StatePropDSG* FindNearestStateProp( const rmt::Vector& pos, float maxDist );
-        AnimCollisionEntityDSG* FindCollEntity( unsigned int uid, const rmt::Vector& pos, float maxDist );
-
 		void RemoveAll();
 		void Update( unsigned int elapsedTime );
 

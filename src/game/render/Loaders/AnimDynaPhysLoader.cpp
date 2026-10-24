@@ -37,6 +37,7 @@
 #include <constants/physprop.h>
 #include <data/persistentworldmanager.h>
 #include <main/game.h>
+#include <network/NetWorldHooks.h>
 #include <radmath/random.hpp>
 #ifndef RAD_RELEASE
 #include <memory/propstats.h>
@@ -334,6 +335,12 @@ tEntity* AnimDynaPhysLoader::LoadObject(tChunkFile* file, tEntityStore* store)
 
                             mpListenerCB->OnChunkLoaded( pStatePropDSG, mUserData, _id );
                             pStatePropDSG->mPersistentObjectID = persistentID;
+                            // Deterministic network identity: (file, instance name,
+                            // load ordinal) is identical on every client.
+                            networld::RegisterObject( net::WOK_STATEPROP,
+                                                      tEntity::MakeUID( file->GetFilename() ),
+                                                      tEntity::MakeUID( name ),
+                                                      pStatePropDSG, &StatePropDSG::NetApply );
 
                             // Check to see if there is a shadow associated with this object                           
                             tUID compDrawUID = pStatePropDSG->GetDrawableUID();

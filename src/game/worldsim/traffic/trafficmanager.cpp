@@ -48,6 +48,7 @@
 
 #include <render/Culling/ReserveArray.h>
 #include <render/IntersectManager/IntersectManager.h>
+#include <network/NetWorldHooks.h>
 
 //******************************************************************************
 //
@@ -709,7 +710,11 @@ BEGIN_PROFILE( "Traffic Man: Add" );
                                 maxTrafficToUse = MAX_TRAFFIC_MODEL_GROUPS;
                             }
 
-                            if( mNumTraffic < maxTrafficToUse )
+                            // Shared density budget in a match: traffic owned by
+                            // other players around us counts too, so two players
+                            // side by side do not double the cars on the road.
+                            int remoteTraffic = networld::CountRemoteEntitiesNear( center.x, center.z, addRadius );
+                            if( mNumTraffic + remoteTraffic < maxTrafficToUse )
                             {
                                 // set cPos;
                                 cPos = intPts[k];
@@ -1545,6 +1550,23 @@ bool TrafficManager::AddTraffic(Lane* lane, TrafficVehicle* tv)
 
     ::GetEventManager()->TriggerEvent( EVENT_TRAFFIC_SPAWN, v );
 
+    // Replicate: the server registers the car (owned and simulated by us) and
+    // every other player mirrors it as a ghost.
+    {
+        net::NetEntitySpawn spawn;
+        spawn.kind = net::NEK_TRAFFIC_CAR;
+        const char* model = v->GetName();
+        for( int c = 0; model != NULL && model[c] != '\0' && c < (int)sizeof( spawn.model ) - 1; ++c )
+        {
+            spawn.model[c] = model[c];
+        }
+        rmt::Vector pos;
+        v->GetPosition( &pos );
+        spawn.x = pos.x; spawn.y = pos.y; spawn.z = pos.z;
+        spawn.yaw = v->GetFacingInRadians();
+        networld::AddLocalEntity( v, spawn );
+    }
+
     mNumTraffic++;
     return true;
 }
@@ -1564,6 +1586,9 @@ void TrafficManager::RemoveTrafficVehicle( TrafficVehicle* tv )
     Vehicle* v = tv->GetVehicle();
     rAssert( v != NULL );
     v->mTrafficLocomotion->SetActive( false );
+
+    // No longer our traffic: the server erases it for everyone.
+    networld::RemoveLocalEntity( v );
 
     // Remove the vehicle from the lane, if it hasn't been removed
     // already (if the car was Deactivated, it will have already been

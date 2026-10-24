@@ -21,7 +21,7 @@
 
 #include <render/DSG/collisionentitydsg.h>
 #include <worldsim/physicsairef.h>
-#include <network/PlatformDirWorldEventEmitter.h>
+#include <network/NetWorldHooks.h>
 
 
 //========================================
@@ -131,14 +131,16 @@ public:
         if ( fDirection != mfDirection )
         {
             mfDirection = fDirection;
-            // Direction really changed: mirror the new playback direction.
-            net::EmitPlatformDirWorldEvent( static_cast<uint32_t>( GetUID() ),
-                                            static_cast<int32_t>( mfDirection ),
-                                            mTransform.m[3][0], mTransform.m[3][1], mTransform.m[3][2] );
+            // Direction really changed: replicate the new playback direction.
+            const signed char dir = static_cast<signed char>( mfDirection > 0.0f ? 1 : ( mfDirection < 0.0f ? -1 : 0 ) );
+            networld::RequestObjectState( this, net::WOC_ANIM_DIR, net::WSP_LAST_WRITE,
+                                          reinterpret_cast<const unsigned char*>( &dir ), 1 );
         }
     }
     
     void SetAction( ActionButton::AnimSwitch* pActionButton );
+    // NetWorldRegistry apply callback (authoritative direction -> this entity).
+    static void NetApply( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased );
     //////////////////////////////////////////////////////////////////////////
     // tDrawable
     //////////////////////////////////////////////////////////////////////////

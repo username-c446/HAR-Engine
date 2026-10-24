@@ -381,53 +381,11 @@ forcibly for everyone. Mechanic — mission-progress relay, like `PLAYER_STATE`:
   session; remote progress via `GetRemoteMissionStates()` /
   `GetRemoteMissionState(peerId, out)`. Test — `MissionStateRelaysThroughDedicatedChannel`.
 
-### 12.1 World events (`WorldEvent`, relayed over `PID_USER`)
+### 12.1 World state
 
-One-shot world changes go through `WorldEventCodec` (6-byte header + POD
-payload, no game types). Emitters live in `src/game/network/*WorldEventEmitter.*`
-and are a safe no-op outside a match:
-
-| Type | Emitter / call site | Payload |
-|---|---|---|
-| `WE_STATEPROP` 0x01 | `EmitStatePropWorldEvent` — `StatePropDSG::SetState` | type uid + state + xyz |
-| `WE_BREAKABLE` 0x02 | `EmitBreakableWorldEvent` — `StatePropDSG` (`eRemoveFromWorld`) | persistentId + xyz |
-| `WE_VEHICLE_DESTROYED` 0x03 | `EmitVehicleDestroyedWorldEvent` — `vehicle.cpp` (explosion) | netVehicleId + xyz |
-| `WE_COIN_COLLECTED` 0x04 | `EmitCoinCollectedWorldEvent` — `CoinManager::CheckCollection` | persistentId + xyz |
-| `WE_PLATFORM_DIR` 0x05 | `EmitPlatformDirWorldEvent` — `AnimCollisionEntityDSG::SetAnimationDirection` | uid + direction + xyz |
-
-**Sending before join.** `NetworkMatchManager::SendWorldEvent` queues events while
-`Session::IsWelcomed()` is false (the client has not received WELCOME yet, e.g. a
-coin picked up on the spawn point during the handshake) and ships them in order
-from `Update()` with the final `originPeer`. The queue is bounded at 64 events
-(oldest dropped) and cleared on `Leave()`.
-
-**Receiving** — `WorldEventApply.h`: `net::DispatchWorldEvent(ev, WorldEventHandlers)`
-decodes the event and runs the typed handler inside a `RemoteWorldEventScope`.
-Every emitter stays silent while `IsApplyingRemoteWorldEvent()` (a depth counter,
-for the stateprop → break cascade), so a mirrored change never goes back into the
-match. Unknown types (newer peers) and truncated payloads are skipped.
-
-**Instance identification.** A stateprop uid names the prop **type** (shared by
-every instance), and `VehicleCentral` slots differ per client (traffic is local).
-So the receiver takes the nearest object with the same uid to the sender's
-position (`FindNearestWorldObject`, `AnimEntityDSGManager::FindStateProp` /
-`FindCollEntity` / `FindNearestStateProp`): 1 m for static objects, 6 m for vehicles.
-
-Handlers in `gameplaycontext.cpp`:
-- `WE_STATEPROP` → `StatePropDSG::SetState` (if the state differs);
-- `WE_BREAKABLE` → look up by persistentId (by position when id < 0),
-  `StatePropDSG::ApplyRemoteBreak()` (same as `eRemoveFromWorld`); if the sector is
-  not loaded, only `PersistentWorldManager::OnObjectBreak`, so the prop never spawns;
-- `WE_VEHICLE_DESTROYED` → nearest live vehicle in `VehicleCentral` →
-  `EVENT_VEHICLE_DESTROYED` (husk). Ghosts are despawned by the drive-state stream;
-- `WE_COIN_COLLECTED` → `CoinManager::ApplyRemoteCoinCollected`: marks the
-  persistent world and removes a resting coin at once (no bank credit — coins are
-  per player; a decaying coin would still be collectable);
-- `WE_PLATFORM_DIR` → `AnimCollisionEntityDSG::SetAnimationDirection`.
-
-Not synchronized (open): world state for **late joiners** (events are live only,
-there is no snapshot of broken/collected objects), fractional vehicle damage
-(`WE_VEHICLE_DAMAGE`), break animations on the receiver (the prop is removed at once).
+The `WorldEvent` channel over `PID_USER` was removed. Shared world objects, the
+economy and traffic are synchronized server-authoritatively — see **§17**.
+`PID_USER` remains for mods and custom events only.
 
 ## 13. Game-loop integration points (`gameplaycontext.cpp`)
 
@@ -597,3 +555,129 @@ Abort branch of the assert to write `crash.log`.
 already described, do not recreate it and do not add a duplicate transport/packet
 (example: `PACKET_VEHICLE_STATE` is declared, but vehicle data lives in
 `PLAYER_STATE` — don't make a second path). Update this file after major changes.
+
+**We are building an engine.** Solutions are fundamental: shared objects are
+synchronized through the server with stable deterministic ids; receiver-side
+heuristics (matching the "nearest" object by position etc.) are not allowed. Known
+limitations are stated explicitly (§17.7), not papered over.
+
+---
+
+## 17. Replicated world (server-authoritative)
+
+Every shared game object is synchronized **through the server** with stable,
+deterministic network ids. No receiver-side heuristics (nearest-object matching
+etc. is forbidden — see §16). Model: **prediction + arbitration** — the client
+applies a change at once, the server decides, everybody gets the result, and a
+refused prediction is rolled back.
+
+### 17.1 Engine layer `net::WorldState` (`netengine/WorldState.h`)
+- Key `(u64 object, u8 channel)`, value ≤ `WS_MAX_VALUE` (48) bytes, version,
+  owner, policy, flags. Cap `WS_MAX_ENTRIES` (65536) per match.
+- Write policies (fixed by the entry's creator, cannot be downgraded):
+  `WSP_LAST_WRITE` (doors, platforms), `WSP_FIRST_WRITE` (broken/taken — forever;
+  the same value is not a conflict), `WSP_OWNER` (only the owner writes/erases).
+  `WSF_ERASE_ON_OWNER_LEAVE` erases the entry when the owner disconnects; other
+  owned entries are orphaned (owner 0, read-only).
+- Packets: `PID_WS_REQUEST` (C→S), `PID_WS_UPDATE`/`PID_WS_ERASE` (S→all; the
+  requester matches its seq = confirmation), `PID_WS_REJECT` (S→requester, with the
+  current value to roll back to), `PID_WS_SNAPSHOT` (+`_END`) for joiners.
+- Server: `WorldStateTable::Apply`. Client: `WorldStateMirror` (confirmed values +
+  outstanding predictions). Sink: `Session::SetWorldStateSink(entry, reason,
+  origin)`, reasons `WSR_REMOTE/CONFIRM/REJECT/SNAPSHOT/ERASED`.
+- **Late-join snapshot:** right after WELCOME the server streams the whole table in
+  ≤ 512-byte chunks plus `PID_WS_SNAPSHOT_END` (reliable ordered channel: the world
+  arrives before any later change). `Session::SetWorldSyncedFn` /
+  `WorldStateMirror::IsSynced()`.
+- Requests made before WELCOME (and ledger requests) wait in the session outbox
+  (≤ 256, order kept) and go out after WELCOME.
+
+### 17.2 Object identity (`network/WorldObjectId.h`, `NetWorldRegistry`)
+- Static object: `id = FNV-1a64(kind, source uid, instance name uid, ordinal)`,
+  top bit clear. source = file/sector the object was loaded from; ordinal = index
+  of a same-named instance of that source in load order (lowest free one, so a
+  reloaded sector gets the same ids). Identical on every client because every
+  client loads the same data.
+- Dynamic entity: `id = 1<<63 | peerId<<32 | counter`, minted by the owner from its
+  server-assigned peer id; peers can never collide.
+- `NetWorldRegistry` (singleton `NetworkMatchManager::WorldRegistry()`, works
+  outside a match too — objects register while the level loads):
+  `Register(kind, source, name, handle, apply)` / `Unregister` / `Request` /
+  `OnAuthoritative` / `Pump`. State the server already holds for an object that is
+  not loaded yet is applied on registration — deferred to `Pump()` (never inside a
+  loader/destructor). While applying (`IsApplying`), `Request` is ignored, so
+  mirrored changes are never sent back.
+- Channels: `WOC_STATE` (stateprop state), `WOC_BROKEN` (broken/destroyed),
+  `WOC_ANIM_DIR` (door/platform animation direction), `WOC_TAKEN` (parked car driven
+  away), `WOC_POPULATION` (zone parking plan).
+- Integration (`network/NetWorldHooks.h` — thin facade for game code):
+  - `AnimDynaPhysLoader` → `StatePropDSG` (`WOK_STATEPROP`); `SetState` →
+    `WOC_STATE`; `eRemoveFromWorld` → `WOC_BROKEN` (requested before removal);
+    `StatePropDSG::NetApply` applies; `mNetRemoved` prevents a double removal.
+  - `AnimCollLoader` → `AnimCollisionEntityDSG` (`WOK_ANIMCOLL`);
+    `SetAnimationDirection` → `WOC_ANIM_DIR`.
+
+### 17.3 Economy: counters (`netengine/Ledger.h`, `network/EconomyConfig.h`)
+- The engine offers server-authoritative **per-player counters** — the base for any
+  economy (currency, tokens, ammo…). A game declares counters and per-reason rules
+  (`CounterConfig`): `LR_OPENING` (starting balance, once), `LR_PICKUP_CLAIMED`
+  (unique pickup, needs a claim, once per player), `LR_PICKUP`, `LR_REWARD`,
+  `LR_SPEND`, `LR_LOSS`, `LR_CHEAT`; delta and balance bounds. Unknown
+  counters/reasons are refused (secure default).
+- `PID_LEDGER_REQUEST`/`PID_LEDGER_RESULT` (result to the requester only). The host
+  and the dedicated server apply the same rules (`economy::MakeCoinConfig`).
+- **Coins are per player** but server-validated. Every bank change goes through
+  `CoinManager::AdjustBankValue(delta, reason, claim)` (and purchases in
+  `RewardsManager`) with the delta actually applied. A world coin carries a claim =
+  deterministic id (sector + locator position), so one coin cannot be credited
+  twice. `PlayerEconomy` declares the opening balance on join and, whenever none of
+  our requests is in flight, converges the local bank to the server balance
+  (rolls back refusals, repairs drift). If the server refuses the opening balance,
+  economy sync stops for that player (a real balance is never zeroed).
+
+### 17.4 Dynamic entities and traffic (`network/NetEntityManager`)
+- Existence, id and ownership live on the server: a `WS_CHANNEL_ENTITY` (0xFF)
+  record, `WSP_OWNER` + `WSF_ERASE_ON_OWNER_LEAVE`, value = spawn description (kind,
+  model, pose). The owner simulates and streams motion on `PID_ENTITY_STATE`
+  (batched); the server relays **only records of entities the sender owns**. Everyone
+  else shows a smoothed kinematic ghost. A joiner gets every live entity in the
+  snapshot; an owner leaving erases its entities for everyone.
+- Traffic: `TrafficManager::AddTraffic` → `AddLocalEntity`, `RemoveTrafficVehicle` →
+  `RemoveLocalEntity`. Ghosts use `VehicleCentral::AddNetworkGhostVehicle` and the
+  shared `ApplyGhostKinematics` (pose, speed, steer, lights, explosion by flag).
+  **Shared density budget:** spawning counts other players' cars nearby
+  (`CountRemoteEntitiesNear`), so two players side by side do not double traffic.
+- A player's own machine blowing up is `VEH_FLAG_DESTROYED` in `PlayerNetworkState`.
+
+### 17.5 Parked cars (`ParkedCarManager`)
+- A zone's placement (which car type on which locator, colour) is a first-write
+  `WOC_POPULATION` record of object `(WOK_PARKED_CAR, zone)`. The first client to
+  load the zone decides and publishes it; everyone else and joiners use it; a
+  client that lost the race re-places from the authoritative plan (zone locators are
+  cached in `NetZone`).
+- Each placed car is object `(zone, locator+1)`: `WOC_TAKEN` when the local player
+  gets in (other clients remove their copy — the player stream mirrors the car from
+  then on), `WOC_BROKEN` on explosion (other clients run the same husk swap).
+
+### 17.6 Admission and authorization
+- Authorization is **optional** and off by default: without a password the session
+  is open (co-op / session games) and a peer is admitted on connect. A password
+  turns the `PID_AUTH` gate on.
+- In both modes the server accepts nothing but `PID_AUTH` from a peer before it is
+  admitted (`m_admitted`) — an unauthenticated client can neither write the world
+  nor broadcast events. The admitted set is separate from the client-side
+  `GetPeerRoster()` (one shared set used to "un-admit" the host's loopback on every
+  `PLAYER_LIST`).
+- Slot cap: `Session::SetMaxPeers` (`NetworkMatchManager::SetHostConfig`,
+  `mp_standalone --max`); the host's loopback takes one slot.
+
+### 17.7 Known limitations (open)
+- No ownership migration: a traffic car disappears for everyone when its owner
+  drives off and despawns it, even if another player is next to it.
+- Collisions with a kinematic ghost are not sent to its owner (the ghost does not
+  react to a hit); pushed parked cars are simulated per client.
+- A destroyed remote traffic car shows the explosion on the ghost, not a husk model.
+- World state changed by the host before the match started (from a save) is unknown
+  to the server.
+- Two players getting into the same parked car at once: the first wins, the second
+  keeps their copy (entry rollback is not implemented).

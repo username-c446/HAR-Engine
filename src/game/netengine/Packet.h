@@ -34,9 +34,23 @@ namespace net
         PID_PING         = 0x0005, // C->S: heartbeat / RTT probe
         PID_PONG         = 0x0006, // S->C: heartbeat acknowledgment (carries RTT)
         PID_WORLD_SEED   = 0x0007, // S->C: authoritative world seed (u32)
+
+        // Server-authoritative replicated world state (WorldState.h).
+        PID_WS_REQUEST      = 0x0010, // C->S: predicted set/erase {seq, key, op}
+        PID_WS_UPDATE       = 0x0011, // S->all: accepted change {origin, seq, entry}
+        PID_WS_REJECT       = 0x0012, // S->C: refused prediction + current entry
+        PID_WS_ERASE        = 0x0013, // S->all: entry removed {origin, seq, key}
+        PID_WS_SNAPSHOT     = 0x0014, // S->C: late-join snapshot chunk
+        PID_WS_SNAPSHOT_END = 0x0015, // S->C: snapshot complete {total}
+
+        // Server-authoritative counters / economy (Ledger.h).
+        PID_LEDGER_REQUEST  = 0x0020, // C->S: {seq, counter, reason, delta, claim}
+        PID_LEDGER_RESULT   = 0x0021, // S->C: {seq, counter, accepted, balance}
+
         PID_PLAYER_STATE = 0x0100, // relayed per-player transform
         PID_VEHICLE_STATE= 0x0101, // relayed remote driver's machine
         PID_MISSION_STATE= 0x0102, // relayed mission progress
+        PID_ENTITY_STATE = 0x0103, // owner-streamed dynamic entity state (owner-checked relay)
 
         // Open user-data channel in the reserved 0x8000+ range. The engine does
         // not interpret the payload: the session relays it to all other peers

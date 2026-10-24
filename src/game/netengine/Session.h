@@ -9,6 +9,8 @@
 #include "ServerEndpoint.h"
 #include "ClientEndpoint.h"
 #include "WorldInterfaces.h"
+#include "WorldState.h"
+#include "Ledger.h"
 
 #include <cstdint>
 #include <memory>
@@ -29,6 +31,11 @@ namespace net
     // A session is either a Host (owns a ServerEndpoint + its own loopback
     // client) or a Joiner (one ClientEndpoint). It cannot switch modes without
     // Leave() first.
+    //
+    // Server-side admission: until a peer is admitted (immediately on an open
+    // host, after a matching PID_AUTH on a protected one) every packet from it
+    // except PID_AUTH is dropped — an unauthenticated client can neither inject
+    // state nor read the world.
     class Session
     {
     public:
@@ -70,12 +77,9 @@ namespace net
         bool IsHost()   const { return m_server != nullptr; }
         bool IsJoined() const { return m_client != nullptr && m_client->IsConnected(); }
         PeerId GetLocalPeerId() const { return m_selfId; }
-        // True once the server has welcomed us (our peer id is final). A host
-        // relays directly, so it is always welcomed. Before that, anything we
-        // send would go out with a provisional origin or be dropped by a
-        // protected host, so callers should hold sends (see
-        // NetworkMatchManager's world-event queue).
-        bool IsWelcomed() const { return m_server != nullptr || m_welcomed; }
+        // True once the server has welcomed our client (our peer id is final).
+        // Before that, reliable requests (world state, ledger) are queued.
+        bool IsWelcomed() const { return m_welcomed; }
         uint32_t GetWorldSeed() const { return m_worldSeed; }
 
         // Blood metro config: the set of peers currently in the match, NOT
@@ -90,13 +94,21 @@ namespace net
         // NOT send WELCOME/WORLD_SEED until the client authenticates. Joiner
         // side must call SetPassword() with the host's password before/after
         // Join(), and presents it automatically once the host asks for it.
-        // An unset password leaves the host open (no auth required).
+        // Authorization is OPTIONAL and off by default: with no password the
+        // session is open (co-op / session games) and peers are admitted on
+        // connect without any extra round trip. Setting a password turns the
+        // PID_AUTH gate on for the next StartHost().
         void SetHostPassword(const char* password);
         bool HasHostPassword() const { return m_hostPassword[0] != '\0'; }
 
         // Client-side password presented to the host on request. Set before the
         // host requires it; the session stores it and answers PID_AUTH demands.
         void SetPassword(const char* password) { SetClientPassword(password); }
+
+        // Slot cap applied by the next StartHost() (the host's own loopback
+        // client takes one slot). 0 = default (kDefaultMaxPeers).
+        static constexpr const size_t kDefaultMaxPeers = 32;
+        void SetMaxPeers(size_t n) { m_maxPeers = n ? n : kDefaultMaxPeers; }
 
         // Server-authoritative validation hook for relayed state. If set, every
         // inbound player state from a remote peer is passed through the
@@ -136,6 +148,44 @@ namespace net
         // send at the default 6-frame state cadence, ~3.3 Hz at 60 fps).
         void SetMissionSendEvery(unsigned n) { m_missionSendEvery = (n > 0) ? n : 1; }
 
+        // ---- replicated world state (WorldState.h) -------------------------
+
+        // Every authoritative change reaches this sink: remote changes,
+        // confirmations/rejections of our own predictions, snapshot entries and
+        // erasures. The game applies entry.value idempotently.
+        using WorldStateFn = std::function<void(const WorldStateEntry& e, WorldStateReason reason, PeerId origin)>;
+        void SetWorldStateSink(WorldStateFn fn) { m_worldSink = std::move(fn); }
+        // Fired once the late-join snapshot has been fully received.
+        using WorldSyncedFn = std::function<void()>;
+        void SetWorldSyncedFn(WorldSyncedFn fn) { m_worldSynced = std::move(fn); }
+
+        // Requests a change (the caller has already applied it locally). Queued
+        // until WELCOME. Returns false outside a match or for a malformed op.
+        bool RequestWorldState(const WorldStateOp& op);
+        const WorldStateMirror& GetWorldStateMirror() const { return m_worldMirror; }
+        const WorldStateTable&  GetWorldStateTable()  const { return m_worldTable; } // server side
+
+        // ---- server-authoritative counters (Ledger.h) ----------------------
+
+        // Server-side counter rules (host or dedicated server). Kept across
+        // matches; configure before or after StartHost.
+        void ConfigureCounter(CounterId counter, const CounterConfig& cfg) { m_ledgerServer.Configure(counter, cfg); }
+        // Outcome of each of our own requests (roll back !accepted deltas).
+        using LedgerFn = std::function<void(const LedgerOutcome&)>;
+        void SetLedgerSink(LedgerFn fn) { m_ledgerSink = std::move(fn); }
+        // Requests a predicted change. Queued until WELCOME.
+        bool RequestLedgerChange(CounterId counter, uint8_t reason, int32_t delta, uint64_t claim);
+        const LedgerClient& GetLedger() const { return m_ledgerClient; }
+        const LedgerServer& GetLedgerServer() const { return m_ledgerServer; }
+
+        // ---- owner-streamed dynamic entities (PID_ENTITY_STATE) ------------
+
+        // Streams state for entities we own (their WS_CHANNEL_ENTITY record must
+        // be ours; the server drops other records). Batched into packets.
+        bool SendEntityStates(const std::vector<EntityStateRecord>& records);
+        using EntityStateFn = std::function<void(PeerId owner, const EntityStateRecord& rec)>;
+        void SetEntityStateSink(EntityStateFn fn) { m_entitySink = std::move(fn); }
+
         // ---- open user-data channel (0x8000+) -------------------------------
 
         // Callback for inbound custom events. `from` is the originating peer;
@@ -150,6 +200,24 @@ namespace net
         bool SendCustomEvent(const uint8_t* data, uint16_t size);
 
     private:
+        // Server-side packet / peer handling (shared by every host session).
+        void OnServerPacket(const ServerEndpoint::RawPacket& rp);
+        void OnServerPeerEvent(const PeerEvent& e);
+        bool IsAdmitted(PeerId peer) const { return m_admitted.count(peer) != 0; }
+        void AdmitPeer(PeerId peer);
+        void SendWorldSnapshot(PeerId peer);
+        void HandleWorldStateRequest(PeerId from, const uint8_t* data, uint16_t size);
+        void HandleLedgerRequest(PeerId from, const uint8_t* data, uint16_t size);
+        void RelayEntityStates(PeerId from, const uint8_t* data, uint16_t size);
+        void Relay(PacketId id, PeerId from, const uint8_t* data, uint16_t size);
+
+        // Client-side packet handling (host loopback and joiner alike).
+        void OnClientPacket(const ClientEndpoint::RawPacket& rp);
+
+        // Reliable client->server requests queued until WELCOME (bounded).
+        void SendToServerWhenWelcomed(PacketId id, const uint8_t* data, uint16_t size);
+        void FlushOutbox();
+
         // Sends the local player's state (from m_localState) to all peers.
         void SendLocalStateIfDue();
         // Delivers an inbound state packet to m_remoteSink.
@@ -171,14 +239,18 @@ namespace net
         bool         m_welcomed = false; // WELCOME received on the client side
         uint32_t     m_worldSeed = 0;
         uint16_t     m_port     = 0;
+        size_t       m_maxPeers = kDefaultMaxPeers;
         JoinLeaveFn  m_joinLeave;
-        std::set<PeerId> m_peerRoster;  // server-authoritative roster (self excluded)
+        // Kept apart on purpose: a host is both server and (loopback) client, and
+        // the client view excludes itself, so one shared set would "un-admit"
+        // the host's own loopback peer on every PLAYER_LIST.
+        std::set<PeerId> m_admitted;    // server: peers allowed in
+        std::set<PeerId> m_peerRoster;  // client: the other peers in the match
 
         // Authentication / validation state.
         char         m_hostPassword[65] = { 0 };   // host-side required password ("" = open)
         char         m_clientPassword[65] = { 0 }; // client-side presented password
         bool         m_authSent = false;           // client-side PID_AUTH already delivered
-        std::set<PeerId> m_authenticated;          // host-side: peers that passed auth
         IStateValidator* m_validator = nullptr;    // optional state plausibility hook
 
         // World attachment (may be null when world not wired, e.g. dedicated relay).
@@ -195,6 +267,25 @@ namespace net
         unsigned               m_missionSendEvery = 18; // update frames between mission sends
         unsigned               m_missionTick = 0;
         uint8_t                m_missionScratch[MAX_PACKET_PAYLOAD];
+
+        // Replicated world state.
+        WorldStateTable  m_worldTable;   // server: authoritative
+        WorldStateMirror m_worldMirror;  // client: confirmed mirror + predictions
+        WorldStateFn     m_worldSink;
+        WorldSyncedFn    m_worldSynced;
+
+        // Counters / economy.
+        LedgerServer m_ledgerServer;
+        LedgerClient m_ledgerClient;
+        LedgerFn     m_ledgerSink;
+
+        // Owner-streamed entities.
+        EntityStateFn m_entitySink;
+
+        // Client->server reliable requests waiting for WELCOME.
+        struct Outgoing { PacketId id; std::vector<uint8_t> bytes; };
+        static constexpr const size_t kMaxOutbox = 256;
+        std::vector<Outgoing> m_outbox;
 
         // Client-side password setter (no-op on a host).
         void SetClientPassword(const char* password);

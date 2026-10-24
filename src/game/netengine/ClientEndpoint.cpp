@@ -49,7 +49,10 @@ namespace net
     {
         if (m_host)
         {
-            if (m_peer) enet_peer_disconnect(m_peer, 0);
+            // disconnect_now ships the disconnect command immediately. A queued
+            // enet_peer_disconnect would die with the host below, leaving the
+            // server to notice the departure only by timeout.
+            if (m_peer) enet_peer_disconnect_now(m_peer, 0);
             enet_host_destroy(m_host);
             m_host = nullptr;
             m_peer = nullptr;

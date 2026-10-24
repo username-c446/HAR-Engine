@@ -20,10 +20,13 @@
 // and runs standalone.
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <thread>
 #include "p3d/p3dwriter.h"
 
 #include "mp_network_fakes.h"
 #include "ServerModManager.h"   // live server-side Lua event bus (--mod)
+#include "EconomyConfig.h"      // server-side counter rules shared with the game
 
 // Simple game-side typed local provider: a slowly-advancing fake position.
 static struct {
@@ -79,6 +82,19 @@ int main(int argc, char** argv)
     if (strcmp(mode, "server") == 0 || strcmp(mode, "host") == 0) {
         net::Session server;
         if (password != NULL && password[0] != '\0') server.SetHostPassword(password);
+        // Slots for remote players; the server's own loopback client takes one more.
+        if (maxPlayers > 0) server.SetMaxPeers(static_cast<size_t>(maxPlayers) + 1);
+        // Same economy rules as a hosting game (EconomyConfig.h).
+        server.ConfigureCounter(economy::COUNTER_COINS, economy::MakeCoinConfig(false));
+        // Log authoritative world-state traffic (seen through the loopback client)
+        // so cross-process tests can verify replication and late-join snapshots.
+        server.SetWorldStateSink([](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId origin) {
+            printf("[host] world-state %s obj=%016llx ch=%u owner=%u origin=%u len=%u\n",
+                   reason == net::WSR_ERASED ? "erase" : "set",
+                   (unsigned long long)e.key.object, (unsigned)e.key.channel,
+                   (unsigned)e.owner, (unsigned)origin, (unsigned)e.value.len);
+            fflush(stdout);
+        });
         // Log inbound user-data events (PID_USER) so we can verify the open
         // custom-event channel over real sockets between two processes.
         server.SetCustomEventSink([](net::PeerId from, const uint8_t* d, uint16_t size) {
@@ -133,6 +149,7 @@ int main(int argc, char** argv)
         int lastCount = 0;
         for (;;) {
             server.Update();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // do not spin a core
             int count = server.GetPeerRoster().size();
             if (count != lastCount) {
                 printf("[%s] clients in world: %d\n", mode, count);
@@ -162,6 +179,16 @@ int main(int argc, char** argv)
         RemotePlayerManager remote;
         bridge.SetRemotePlayers(&remote);
         bridge.AttachToSession(&client);
+        // Late-join check: print the world snapshot as it arrives.
+        size_t snapshotEntries = 0;
+        client.SetWorldStateSink([&snapshotEntries](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId) {
+            if (reason == net::WSR_SNAPSHOT) ++snapshotEntries;
+            else printf("[join] world-state live obj=%016llx ch=%u\n", (unsigned long long)e.key.object, (unsigned)e.key.channel);
+        });
+        client.SetWorldSyncedFn([&snapshotEntries]() {
+            printf("[join] world synced: %u snapshot entries\n", (unsigned)snapshotEntries);
+            fflush(stdout);
+        });
 
         if (!client.Join(ip, port)) {
             printf("[join] connect failed to %s:%u\n", ip, port);
@@ -173,6 +200,7 @@ int main(int argc, char** argv)
         int tick = 0;
         for (;;) {
             client.Update();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // do not spin a core
             if (client.GetLocalPeerId() != 0) {
                 if (!announced) {
                     printf("[join] SERVER READY, my client id = %u\n",
@@ -201,7 +229,7 @@ int main(int argc, char** argv)
                         return true;
                     },
                     NULL);
-                if (remote.GetPlayerCount() > 0) break;
+                if (remote.GetPlayerCount() > 0 && client.GetWorldStateMirror().IsSynced()) break;
             }
         }
     }

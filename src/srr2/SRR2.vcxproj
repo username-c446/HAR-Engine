@@ -1087,11 +1087,6 @@
     <ClCompile Include="..\game\network\RemoteVehicleWorldView.cpp" />
     <ClCompile Include="..\game\network\MissionSyncManager.cpp" />
     <ClCompile Include="..\game\network\MissionSyncState.cpp" />
-    <ClCompile Include="..\game\network\VehicleWorldEventEmitter.cpp" />
-    <ClCompile Include="..\game\network\CoinWorldEventEmitter.cpp" />
-    <ClCompile Include="..\game\network\BreakableWorldEventEmitter.cpp" />
-    <ClCompile Include="..\game\network\PlatformDirWorldEventEmitter.cpp" />
-    <ClCompile Include="..\game\network\StatePropWorldEventEmitter.cpp" />
 <ClCompile Include="..\game\network\NetworkMatchManager.cpp" />
     <ClCompile Include="..\game\network\NetworkConsoleCommands.cpp" />
     <ClCompile Include="..\game\network\ClientModManager.cpp" />
@@ -1101,6 +1096,12 @@
  <ClCompile Include="..\game\netengine\ServerEndpoint.cpp" />
  <ClCompile Include="..\game\netengine\ClientEndpoint.cpp" />
  <ClCompile Include="..\game\netengine\Session.cpp" />
+    <ClCompile Include="..\game\netengine\WorldState.cpp" />
+    <ClCompile Include="..\game\netengine\Ledger.cpp" />
+    <ClCompile Include="..\game\network\NetWorldRegistry.cpp" />
+    <ClCompile Include="..\game\network\NetEntityManager.cpp" />
+    <ClCompile Include="..\game\network\PlayerEconomy.cpp" />
+    <ClCompile Include="..\game\network\NetWorldHooks.cpp" />
  <ClCompile Include="..\game\netengine\GamePlayerBridge.cpp" />
  <ClCompile Include="..\game\netengine\ENetInit.cpp" />
     <ClCompile Include="..\game\ai\actionbuttonmanager.cpp" />

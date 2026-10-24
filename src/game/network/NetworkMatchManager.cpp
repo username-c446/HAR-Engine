@@ -11,10 +11,12 @@
 #include "../netengine/Session.h"
 #include "../netengine/GamePlayerBridge.h"
 #include "../netengine/WorldInterfaces.h"
+#include "EconomyConfig.h"
 #include "RemotePlayerManager.h"
 #include "RemotePlayerWorldView.h"
 #include "RemoteVehicleWorldView.h"
 #include <chrono>
+#include <cstring>
 
 // Bridges the game's typed MissionStateProvider ((MissionSyncState&) -> bool)
 // to the engine Session's opaque IMissionStateProvider (bytes). Serializes the
@@ -39,13 +41,34 @@ public:
 
 NetworkMatchManager* NetworkMatchManager::spInstance = nullptr;
 
+NetWorldRegistry& NetworkMatchManager::WorldRegistry()
+{
+    static NetWorldRegistry s_registry;
+    return s_registry;
+}
+
+NetEntityManager& NetworkMatchManager::Entities()
+{
+    static NetEntityManager s_entities;
+    return s_entities;
+}
+
+PlayerEconomy& NetworkMatchManager::Economy()
+{
+    static PlayerEconomy s_economy;
+    return s_economy;
+}
+
 NetworkMatchManager::NetworkMatchManager()
     : m_hostPort(0)
     , m_localStateProvider(nullptr)
     , m_missionStateProvider(nullptr)
     , m_hostMaxPlayers(0)
+    , m_allowEconomyCheats(false)
+    , m_entitiesWelcomed(false)
 {
     m_hostPassword[0] = '\0';
+    m_clientPassword[0] = '\0';
 }
 
 NetworkMatchManager::~NetworkMatchManager()
@@ -87,6 +110,12 @@ bool NetworkMatchManager::StartHost(unsigned short port)
     m_bridge->SetTypedLocalProvider(m_localStateProvider);
     m_bridge->SetRemotePlayers(&m_remotePlayers);
 
+    // Host configuration: optional authorization, slot cap (+1 for the host's
+    // own loopback client), and the server-side economy rules.
+    m_session->SetHostPassword(m_hostPassword[0] != '\0' ? m_hostPassword : nullptr);
+    m_session->SetMaxPeers(m_hostMaxPlayers ? static_cast<size_t>(m_hostMaxPlayers) + 1 : 0);
+    m_session->ConfigureCounter(economy::COUNTER_COINS, economy::MakeCoinConfig(m_allowEconomyCheats));
+
     // Session-scoped world seed: randomized per match so every host differs, and
     // broadcast to clients in WELCOME so all peers seed their world RNG
     // identically. Steady clock is a good entropy source (differs between
@@ -102,12 +131,8 @@ bool NetworkMatchManager::StartHost(unsigned short port)
         m_bridge.reset();
         return false;
     }
-m_hostPort = port;
-
-    // Bridge the world views to the session sinks.
-    m_bridge->AttachToSession(m_session.get());
-    AttachMissionChannel();
-    ReattachWorldEventSink();
+    m_hostPort = port;
+    AttachSession();
     return true;
 }
 
@@ -121,6 +146,7 @@ bool NetworkMatchManager::JoinHost(const char* serverIp, unsigned short port)
 
     m_bridge->SetTypedLocalProvider(m_localStateProvider);
     m_bridge->SetRemotePlayers(&m_remotePlayers);
+    m_session->SetPassword(m_clientPassword[0] != '\0' ? m_clientPassword : nullptr);
 
     bool ok = m_session->Join(serverIp, port);
     if (!ok)
@@ -129,10 +155,57 @@ bool NetworkMatchManager::JoinHost(const char* serverIp, unsigned short port)
         return false;
     }
     m_hostPort = port;
-    m_bridge->AttachToSession(m_session.get());
-    AttachMissionChannel();
-    ReattachWorldEventSink();
+    AttachSession();
     return true;
+}
+
+void NetworkMatchManager::AttachSession()
+{
+    net::Session* s = m_session.get();
+
+    // Bridge the world views to the session sinks, then chain our own
+    // join/leave bookkeeping behind the bridge's (it cleans the remote shadow).
+    m_bridge->AttachToSession(s);
+    net::GamePlayerBridge* bridge = m_bridge.get();
+    s->SetJoinLeaveFn([this, bridge](net::PeerId peer, bool joined)
+    {
+        if (!joined) bridge->OnPeerLeft(peer);
+        JoinLeaveEvent ev;
+        ev.clientId = static_cast<unsigned short>(peer);
+        ev.joined = joined;
+        m_pendingEvents.push_back(ev);
+    });
+    AttachMissionChannel();
+
+    // Replicated world: every authoritative decision goes to both services
+    // (each ignores what is not its own: static ids vs. dynamic entities).
+    s->SetWorldStateSink([](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId)
+    {
+        WorldRegistry().OnAuthoritative(e, reason);
+        Entities().OnAuthoritative(e, reason);
+    });
+    s->SetEntityStateSink([](net::PeerId owner, const net::EntityStateRecord& rec)
+    {
+        Entities().OnEntityState(owner, rec);
+    });
+    s->SetLedgerSink([s](const net::LedgerOutcome& o)
+    {
+        Economy().OnOutcome(o, s->GetLedger().Pending());
+    });
+
+    WorldRegistry().SetSender([s](const net::WorldStateOp& op) { return s->RequestWorldState(op); });
+    Entities().SetSenders(
+        [s](const net::WorldStateOp& op) { return s->RequestWorldState(op); },
+        [s](const std::vector<net::EntityStateRecord>& recs) { return s->SendEntityStates(recs); });
+    Economy().SetSender([s](net::CounterId c, uint8_t reason, int32_t delta, uint64_t claim)
+    {
+        return s->RequestLedgerChange(c, reason, delta, claim);
+    });
+
+    // The opening balance is the first request in the (ordered) outbox, so the
+    // server knows it before any change.
+    Economy().OnMatchStart(economy::COUNTER_COINS);
+    m_entitiesWelcomed = false;
 }
 
 void NetworkMatchManager::Leave()
@@ -143,7 +216,14 @@ void NetworkMatchManager::Leave()
     m_remotePlayers.Clear();
     m_remoteMissionStates.clear();
     m_pendingEvents.clear();
-    m_pendingWorldEvents.clear();
+
+    WorldRegistry().SetSender(NetWorldRegistry::SendFn());
+    WorldRegistry().ClearState();
+    Entities().SetSenders(NetEntityManager::SendOpFn(), NetEntityManager::SendStatesFn());
+    Entities().OnMatchEnd();
+    Economy().SetSender(PlayerEconomy::SendFn());
+    Economy().OnMatchEnd();
+    m_entitiesWelcomed = false;
 }
 
 void NetworkMatchManager::AttachMissionChannel()
@@ -170,18 +250,6 @@ void NetworkMatchManager::HandleRemoteMissionState(int peerId, const MissionSync
     m_remoteMissionStates[peerId] = state;
 }
 
-void NetworkMatchManager::ReattachWorldEventSink()
-{
-    if (!m_session) return;
-    m_session->SetCustomEventSink(
-        [this](net::PeerId, const uint8_t* data, uint16_t size)
-        {
-            if (!m_worldEventSink) return;
-            auto d = net::WorldEventCodec::Decode(data, size);
-            if (d.valid) m_worldEventSink(&d);
-        });
-}
-
 void NetworkMatchManager::SetLocalStateProvider(LocalStateProvider provider)
 {
     m_localStateProvider = provider;
@@ -203,15 +271,23 @@ void NetworkMatchManager::SetHostConfig(const char* password, unsigned short max
 {
     m_hostPassword[0] = '\0';
     if (password != nullptr && password[0] != '\0')
+    {
         strncpy(m_hostPassword, password, sizeof(m_hostPassword) - 1);
+        m_hostPassword[sizeof(m_hostPassword) - 1] = '\0';
+    }
     m_hostMaxPlayers = maxPlayers;
 }
 
 void NetworkMatchManager::SetClientPassword(const char* password)
 {
-    // The engine Session does not enforce a password gate in this pass; the
-    // legacy auth path is being phased out. Kept for API compatibility.
-    (void)password;
+    m_clientPassword[0] = '\0';
+    if (password != nullptr && password[0] != '\0')
+    {
+        strncpy(m_clientPassword, password, sizeof(m_clientPassword) - 1);
+        m_clientPassword[sizeof(m_clientPassword) - 1] = '\0';
+    }
+    // Applies to an existing client too: it answers the host's PID_AUTH gate.
+    if (m_session) m_session->SetPassword(m_clientPassword[0] != '\0' ? m_clientPassword : nullptr);
 }
 
 void NetworkMatchManager::DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out)
@@ -220,23 +296,25 @@ void NetworkMatchManager::DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out)
     m_pendingEvents.clear();
 }
 
-void NetworkMatchManager::Update()
+void NetworkMatchManager::Update(float dtSeconds)
 {
-    if (m_session)
+    if (!m_session) return;
+    m_session->Update();
+
+    // Keep the bridge's notion of "who am I" in sync with the session. The
+    // local peer id is resolved by WELCOME (0 before, then the server-assigned
+    // slot >= 1). Without this, GamePlayerBridge would filter relayed state
+    // against a stale id. See docs/MULTIPLAYER_SYNC_MANIFEST.ru.md.
+    if (m_bridge)
+        m_bridge->SetLocalPeerId(static_cast<net::PeerId>(GetLocalClientId()));
+
+    // Owned entities can only be announced once our peer id is final.
+    if (!m_entitiesWelcomed && m_session->IsWelcomed())
     {
-        m_session->Update();
-        // Keep the bridge's notion of "who am I" in sync with the session.
-        // The local peer id is not resolved until the server sends WELCOME
-        // after we connect/join (0 before, then the server-assigned slot, which
-        // for the host is 0 and for clients is 1,2,3...). If we did not push it
-        // into the bridge, GamePlayerBridge would keep its default m_selfId==0
-        // on every client and wrongly filter the HOST's relayed state (whose
-        // peer id IS 0), silently dropping the one remote player a client should
-        // see. See docs/MULTIPLAYER_SYNC_MANIFEST.ru.md, "Индекс аватара vs
-        // сетевой peer-id".
-        if (m_bridge)
-            m_bridge->SetLocalPeerId( static_cast<net::PeerId>(GetLocalClientId()) );
-        // World events raised during the join handshake go out now.
-        FlushPendingWorldEvents();
+        Entities().OnWelcomed(m_session->GetLocalPeerId());
+        m_entitiesWelcomed = true;
     }
+
+    WorldRegistry().Pump();
+    Entities().Update(dtSeconds);
 }

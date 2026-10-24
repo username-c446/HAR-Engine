@@ -26,7 +26,6 @@
 #include <mission/gameplaymanager.h>
 #include <camera/supercammanager.h>
 #include <radtime.hpp>
-#include <network/WorldEventApply.h>
 
 //===========================================================================
 // Local Constants, Typedefs, and Macros
@@ -330,62 +329,6 @@ void AnimEntityDSGManager::Remove( StatePropDSG* pProp )
             break;
         }
     }
-}
-
-//===========================================================================
-// AnimEntityDSGManager::FindStateProp / FindStatePropByPersistentId /
-// FindNearestStateProp / FindCollEntity
-//===========================================================================
-StatePropDSG* AnimEntityDSGManager::FindStateProp( unsigned int statePropUid, const rmt::Vector& pos, float maxDist )
-{
-    int i = net::FindNearestWorldObject( mStatePropList.mUseSize, true, statePropUid,
-        pos.x, pos.y, pos.z, maxDist,
-        [this]( int k ) { return static_cast<uint32_t>( mStatePropList[ k ]->GetStatePropUID() ); },
-        [this]( int k, float& x, float& y, float& z )
-        {
-            const rmt::Vector& p = mStatePropList[ k ]->rPosition();
-            x = p.x; y = p.y; z = p.z;
-        } );
-    return i >= 0 ? mStatePropList[ i ] : NULL;
-}
-
-StatePropDSG* AnimEntityDSGManager::FindStatePropByPersistentId( short persistentId )
-{
-    if ( persistentId < 0 ) return NULL;
-    for ( int i = 0 ; i < mStatePropList.mUseSize ; i++ )
-    {
-        if ( mStatePropList[ i ]->mPersistentObjectID == persistentId )
-        {
-            return mStatePropList[ i ];
-        }
-    }
-    return NULL;
-}
-
-StatePropDSG* AnimEntityDSGManager::FindNearestStateProp( const rmt::Vector& pos, float maxDist )
-{
-    int i = net::FindNearestWorldObject( mStatePropList.mUseSize, false, 0u,
-        pos.x, pos.y, pos.z, maxDist,
-        []( int ) { return 0u; },
-        [this]( int k, float& x, float& y, float& z )
-        {
-            const rmt::Vector& p = mStatePropList[ k ]->rPosition();
-            x = p.x; y = p.y; z = p.z;
-        } );
-    return i >= 0 ? mStatePropList[ i ] : NULL;
-}
-
-AnimCollisionEntityDSG* AnimEntityDSGManager::FindCollEntity( unsigned int uid, const rmt::Vector& pos, float maxDist )
-{
-    int i = net::FindNearestWorldObject( mCollEntityList.mUseSize, true, uid,
-        pos.x, pos.y, pos.z, maxDist,
-        [this]( int k ) { return static_cast<uint32_t>( mCollEntityList[ k ]->GetUID() ); },
-        [this]( int k, float& x, float& y, float& z )
-        {
-            const rmt::Matrix& m = mCollEntityList[ k ]->GetTransformRef();
-            x = m.m[3][0]; y = m.m[3][1]; z = m.m[3][2];
-        } );
-    return i >= 0 ? mCollEntityList[ i ] : NULL;
 }
 
 //===========================================================================

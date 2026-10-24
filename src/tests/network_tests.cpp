@@ -7,13 +7,11 @@
 #include "ServerModManager.h"
 #include "ClientModManager.h"
 #include "MissionSyncState.h"
-#include "WorldEvent.h"
-#include "CoinWorldEventEmitter.h"
-#include "BreakableWorldEventEmitter.h"
-#include "PlatformDirWorldEventEmitter.h"
-#include "StatePropWorldEventEmitter.h"
-#include "WorldEventApply.h"
 #include "LocalActionLatch.h"
+#include "EconomyConfig.h"
+#include "NetWorldRegistry.h"
+#include "NetEntityManager.h"
+#include "PlayerEconomy.h"
 #include "MissionSyncManager.h"
 #include "../game/netengine/Packet.h"
 #include "../game/netengine/PacketRegistry.h"
@@ -25,6 +23,8 @@
 
 #include <winsock2.h>
 #include <functional>
+#include <initializer_list>
+#include <limits>
 #include <stdlib.h>
 #include <string>
 #include <windows.h>
@@ -703,70 +703,6 @@ namespace NetworkTests
             for (int i = 0; i < 10; ++i) mgr->Update();
             mgr->Leave();
             Assert::IsFalse(mgr->IsInMatch());
-        }
-
-        TEST_METHOD(WorldEventBeforeWelcomeIsQueuedThenDelivered)
-        {
-            // A world event raised while the join handshake is in flight (coin
-            // picked up on the spawn point) must not be lost: it is queued until
-            // WELCOME and then delivered with the final origin peer id.
-            unsigned short port = PickFreePort();
-            net::Session host;
-            Assert::IsTrue(host.StartHost(port, 0xAA57));
-            // A bare host relays to OTHER peers only, so observe from a second joiner.
-            net::Session observer;
-            Assert::IsTrue(observer.Join("127.0.0.1", port));
-            Assert::IsTrue(PumpToWelcome(host, observer), L"Observer did not get WELCOME.");
-
-            int got = 0;
-            uint16_t gotOrigin = 0xFFFF;
-            net::CoinCollectedPayload gotCoin;
-            observer.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
-                auto e = net::WorldEventCodec::Decode(data, size);
-                if (!e.valid || e.type != net::WE_COIN_COLLECTED) return;
-                if (net::CoinCollectedPayload::Decode(e.payload, e.payloadSize, gotCoin)) { ++got; gotOrigin = e.originPeer; }
-            });
-
-            NetworkMatchManager* mgr = NetworkMatchManager::CreateInstance();
-            Assert::IsTrue(mgr->JoinHost("127.0.0.1", port));
-
-            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
-            net::CoinCollectedPayload::Encode(coin, 1799, 1.0f, 2.0f, 3.0f);
-            Assert::IsTrue(mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin)),
-                L"Send before WELCOME must be accepted (queued).");
-            Assert::AreEqual((size_t)1, mgr->GetPendingWorldEventCount(), L"Event must wait for WELCOME.");
-
-            for (int i = 0; i < 500 && got == 0; ++i) { host.Update(); mgr->Update(); observer.Update(); }
-            Assert::AreEqual(1, got, L"Queued event must be delivered after WELCOME.");
-            Assert::AreEqual(1799, (int)gotCoin.persistentId);
-            Assert::AreEqual((int)mgr->GetLocalClientId(), (int)gotOrigin,
-                L"Queued event must carry the final (welcomed) origin id.");
-            Assert::IsTrue(mgr->GetLocalClientId() != 0, L"Joiner must have a real peer id.");
-            Assert::AreEqual((size_t)0, mgr->GetPendingWorldEventCount(), L"Queue must drain.");
-
-            mgr->Leave();
-            observer.Leave();
-            host.Leave();
-        }
-
-        TEST_METHOD(PendingWorldEventsAreBoundedAndClearedOnLeave)
-        {
-            // Joining a host that never answers: the queue keeps only the newest
-            // kMaxPendingWorldEvents and Leave() discards it.
-            NetworkMatchManager* mgr = NetworkMatchManager::CreateInstance();
-            unsigned short port = PickFreePort();
-            Assert::IsTrue(mgr->JoinHost("127.0.0.1", port));
-            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
-            for (int i = 0; i < 100; ++i)
-            {
-                net::CoinCollectedPayload::Encode(coin, i, 0, 0, 0);
-                mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin));
-            }
-            Assert::AreEqual((size_t)64, mgr->GetPendingWorldEventCount(), L"Queue must be bounded.");
-            mgr->Leave();
-            Assert::AreEqual((size_t)0, mgr->GetPendingWorldEventCount(), L"Leave must clear the queue.");
-            Assert::IsFalse(mgr->SendWorldEvent(net::WE_COIN_COLLECTED, coin, sizeof(coin)),
-                L"No match: send must be refused.");
         }
 
         TEST_METHOD(HostAndJoinAreMutuallyExclusive)
@@ -2574,418 +2510,697 @@ namespace NetworkTests
         }
     };
 
-    TEST_CLASS(WorldEventTests)
+    // ------------------------------------------------------------------
+    // Helpers for the replicated-world tests.
+    // ------------------------------------------------------------------
+    net::WorldStateOp MakeOp(uint64_t obj, uint8_t ch, uint8_t policy, uint8_t value,
+                             uint8_t kind = net::WSO_SET, uint8_t flags = net::WSF_NONE)
+    {
+        net::WorldStateOp op;
+        op.key.object = obj;
+        op.key.channel = ch;
+        op.kind = kind;
+        op.policy = policy;
+        op.flags = flags;
+        if (kind == net::WSO_SET) op.value.Set(&value, 1);
+        return op;
+    }
+
+    // Pumps a host and any number of joiners.
+    void PumpAll(net::Session& host, std::initializer_list<net::Session*> joiners, int frames)
+    {
+        for (int i = 0; i < frames; ++i)
+        {
+            host.Update();
+            for (net::Session* j : joiners) j->Update();
+        }
+    }
+
+    TEST_CLASS(WorldStateTableTests)
     {
     public:
-        TEST_METHOD(WorldEventCodecRoundTripsPayload)
+        TEST_METHOD(LastWritePolicyAcceptsChangesAndReportsUnchanged)
         {
-            // The codec wraps a type + origin + opaque payload in the PID_USER
-            // channel envelope. Verify encode->decode round-trips the fields.
-            const uint8_t payload[5] = { 1, 2, 3, 4, 5 };
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_STATEPROP, 0x2A, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should write header+payload.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_STATEPROP, L"Type must round-trip.");
-            Assert::IsTrue(d.originPeer == 0x2A, L"Origin peer must round-trip.");
-            Assert::IsTrue(d.payloadSize == sizeof(payload), L"Payload size must round-trip.");
-            for (uint16_t i = 0; i < sizeof(payload); ++i)
-                Assert::IsTrue(d.payload[i] == payload[i], L"Payload bytes must round-trip.");
+            net::WorldStateTable t;
+            net::WorldStateEntry out;
+            bool exists = false;
+            Assert::IsTrue(t.Apply(1, MakeOp(10, 1, net::WSP_LAST_WRITE, 3), out, exists) == net::WorldStateTable::ACCEPTED);
+            Assert::AreEqual(1u, out.version);
+            Assert::AreEqual(1, (int)out.owner, L"Creator recorded as owner.");
+            Assert::IsTrue(t.Apply(2, MakeOp(10, 1, net::WSP_LAST_WRITE, 3), out, exists) == net::WorldStateTable::UNCHANGED);
+            Assert::IsTrue(t.Apply(2, MakeOp(10, 1, net::WSP_LAST_WRITE, 4), out, exists) == net::WorldStateTable::ACCEPTED,
+                L"Any peer may overwrite a last-write entry.");
+            Assert::AreEqual(2u, out.version, L"Version bumps on every accepted change.");
+            Assert::AreEqual(4, (int)out.value.bytes[0]);
         }
 
-        TEST_METHOD(WorldEventRejectsTruncatedOrOversize)
+        TEST_METHOD(FirstWritePolicyIsImmutable)
         {
-            // Truncated (header only, missing payload) must decode as invalid.
-            const uint8_t payload[3] = { 9, 8, 7 };
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_BREAKABLE, 1, payload, sizeof(payload));
-            auto trunc = net::WorldEventCodec::Decode(buf, net::WORLD_EVENT_HEADER_SIZE + 1);
-            Assert::IsFalse(trunc.valid, L"Truncated event must decode invalid.");
-
-            // Oversize payload (over MAX_PACKET_PAYLOAD) must be refused at encode.
-            uint8_t big[net::MAX_PACKET_PAYLOAD];
-            uint16_t m = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_COIN_COLLECTED, 1,
-                                                      big, net::MAX_PACKET_PAYLOAD);
-            Assert::IsTrue(n > 0, L"First encode should have succeeded (3-byte payload).");
-            Assert::IsTrue(m == 0, L"Oversize encode must return 0.");
+            net::WorldStateTable t;
+            net::WorldStateEntry out;
+            bool exists = false;
+            Assert::IsTrue(t.Apply(1, MakeOp(20, 2, net::WSP_FIRST_WRITE, 1), out, exists) == net::WorldStateTable::ACCEPTED);
+            Assert::IsTrue(t.Apply(2, MakeOp(20, 2, net::WSP_FIRST_WRITE, 1), out, exists) == net::WorldStateTable::UNCHANGED,
+                L"The same value (both peers broke it) is not a conflict.");
+            Assert::IsTrue(t.Apply(2, MakeOp(20, 2, net::WSP_LAST_WRITE, 0), out, exists) == net::WorldStateTable::REJECTED,
+                L"A later request cannot downgrade the policy and overwrite.");
+            Assert::IsTrue(t.Apply(1, MakeOp(20, 2, net::WSP_FIRST_WRITE, 0, net::WSO_ERASE), out, exists) == net::WorldStateTable::REJECTED,
+                L"First-write entries cannot be erased by peers.");
+            Assert::AreEqual(1, (int)out.value.bytes[0], L"Reject reports the current value.");
         }
 
-        TEST_METHOD(WorldEventRelaysBetweenSessionsThroughOpenChannel)
+        TEST_METHOD(OwnerPolicyOnlyOwnerWritesAndLeaveErases)
         {
-            // End-to-end: a world event encoded via NetworkMatchManager's
-            // SendWorldEvent must reach the other session's sink through the
-            // open PID_USER relay (host->joiner and joiner->host).
-            unsigned short port = PickFreePort();
-            net::Session host;
-            Assert::IsTrue(host.StartHost(port, 0xAA55));
-            net::Session joiner;
-            Assert::IsTrue(joiner.Join("127.0.0.1", port));
-            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
+            net::WorldStateTable t;
+            net::WorldStateEntry out;
+            bool exists = false;
+            uint64_t ent = net::MakeDynamicEntityId(1, 1);
+            Assert::IsTrue(t.Apply(1, MakeOp(ent, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 7, net::WSO_SET,
+                                             net::WSF_ERASE_ON_OWNER_LEAVE), out, exists) == net::WorldStateTable::ACCEPTED);
+            Assert::IsTrue(t.Apply(2, MakeOp(ent, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 8), out, exists) == net::WorldStateTable::REJECTED,
+                L"A non-owner may not write.");
+            Assert::IsTrue(t.Apply(2, MakeOp(ent, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 0, net::WSO_ERASE), out, exists) == net::WorldStateTable::REJECTED,
+                L"A non-owner may not erase.");
 
-            // Host -> joiner: register sink on joiner, send from host.
-            int joinerGot = 0;
-            uint8_t joinerType = 0;
-            joiner.SetCustomEventSink([&](net::PeerId from, const uint8_t* data, uint16_t size) {
-                auto d = net::WorldEventCodec::Decode(data, size);
-                if (!d.valid) return;
-                joinerGot++;
-                joinerType = static_cast<uint8_t>(d.type);
-            });
+            uint64_t kept = net::MakeDynamicEntityId(1, 2);
+            t.Apply(1, MakeOp(kept, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 9), out, exists); // no erase flag
 
-            uint8_t payload[2] = { 0xEE, 0x01 };
+            std::vector<net::WorldStateKey> erased;
+            t.OnPeerLeft(1, erased);
+            Assert::AreEqual((size_t)1, erased.size(), L"Only flagged owned entries are erased.");
+            Assert::IsTrue(erased[0].object == ent);
+            net::WorldStateEntry e;
+            Assert::IsTrue(t.Find({ kept, net::WS_CHANNEL_ENTITY }, e));
+            Assert::AreEqual(0, (int)e.owner, L"Unflagged owned entries are orphaned (read-only).");
+        }
+
+        TEST_METHOD(MalformedRequestsAreRejected)
+        {
+            net::WorldStateTable t;
+            net::WorldStateEntry out;
+            bool exists = true;
+            net::WorldStateOp bad = MakeOp(30, 1, net::WSP_COUNT, 1);
+            Assert::IsTrue(t.Apply(1, bad, out, exists) == net::WorldStateTable::REJECTED, L"Unknown policy.");
+            Assert::IsTrue(t.Apply(1, MakeOp(31, 1, net::WSP_LAST_WRITE, 0, net::WSO_ERASE), out, exists) == net::WorldStateTable::UNCHANGED,
+                L"Erasing nothing is a no-op.");
+            Assert::IsFalse(exists);
+        }
+
+        TEST_METHOD(CodecRoundTripsAndRejectsTruncation)
+        {
             uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_VEHICLE_DESTROYED,
-                                                      static_cast<uint16_t>(host.GetLocalPeerId()),
-                                                      payload, sizeof(payload));
+            net::WorldStateOp op = MakeOp(0x0102030405060708ull, 5, net::WSP_FIRST_WRITE, 42);
+            uint16_t n = net::WorldStateCodec::EncodeRequest(buf, sizeof(buf), 77, op);
             Assert::IsTrue(n > 0);
-            Assert::IsTrue(host.SendCustomEvent(buf, n), L"Host SendCustomEvent failed.");
+            uint32_t seq = 0;
+            net::WorldStateOp back;
+            Assert::IsTrue(net::WorldStateCodec::DecodeRequest(buf, n, seq, back));
+            Assert::AreEqual(77u, seq);
+            Assert::IsTrue(back.key == op.key && back.value == op.value && back.policy == op.policy);
+            Assert::IsFalse(net::WorldStateCodec::DecodeRequest(buf, static_cast<uint16_t>(n - 1), seq, back),
+                L"Truncated request must be rejected.");
 
-            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
-            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the host's world event.");
-            Assert::IsTrue(joinerType == static_cast<uint8_t>(net::WE_VEHICLE_DESTROYED),
-                           L"Joiner should see WE_VEHICLE_DESTROYED type.");
+            net::WorldStateEntry e;
+            e.key = op.key; e.value = op.value; e.version = 9; e.owner = 3; e.policy = net::WSP_OWNER;
+            n = net::WorldStateCodec::EncodeUpdate(buf, sizeof(buf), 3, 77, e);
+            net::PeerId origin = 0;
+            net::WorldStateEntry eb;
+            Assert::IsTrue(net::WorldStateCodec::DecodeUpdate(buf, n, origin, seq, eb));
+            Assert::IsTrue(eb.key == e.key && eb.value == e.value && eb.version == 9 && eb.owner == 3 && origin == 3);
 
-            joiner.Leave();
-            host.Leave();
+            // A value length beyond WS_MAX_VALUE in the wire must not be accepted.
+            buf[n - e.value.len - 1] = net::WS_MAX_VALUE + 1;
+            Assert::IsFalse(net::WorldStateCodec::DecodeUpdate(buf, n, origin, seq, eb), L"Oversized length must be rejected.");
         }
 
-        TEST_METHOD(VehicleDestroyedWorldEventRoundTripsCodecAndRelay)
+        TEST_METHOD(SnapshotSplitsIntoChunksAndDecodesEveryEntry)
         {
-            // Codec + payload round-trip: a WE_VEHICLE_DESTROYED with a known
-            // netVehicleId and x,y,z payload must encode/decode losslessly.
-            const int32_t kId = 12;
-            const float kX = 101.0f, kY = -3.5f, kZ = 77.25f;
-            uint8_t payload[net::VehicleDestroyedPayload::SERIALIZED_SIZE];
-            net::VehicleDestroyedPayload::Encode(payload, kId, kX, kY, kZ);
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_VEHICLE_DESTROYED, 0x33, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_VEHICLE_DESTROYED, L"Type must round-trip.");
-            net::VehicleDestroyedPayload out;
-            Assert::IsTrue(net::VehicleDestroyedPayload::Decode(d.payload, d.payloadSize, out),
-                           L"Payload decode should succeed.");
-            Assert::AreEqual((int)kId, (int)out.netVehicleId, L"netVehicleId must round-trip.");
-            Assert::AreEqual(kX, out.x, L"x must round-trip.");
-            Assert::AreEqual(kY, out.y, L"y must round-trip.");
-            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
-
-            // Relay: the encoded event travels host -> joiner through the open
-            // channel and the joiner's sink decodes the exact vehicle payload.
-            unsigned short port = PickFreePort();
-            net::Session host;
-            Assert::IsTrue(host.StartHost(port, 0xAA56));
-            net::Session joiner;
-            Assert::IsTrue(joiner.Join("127.0.0.1", port));
-            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
-
-            int joinerGot = 0;
-            net::VehicleDestroyedPayload joinerPayload;
-            joiner.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
-                auto e = net::WorldEventCodec::Decode(data, size);
-                if (!e.valid || e.type != net::WE_VEHICLE_DESTROYED) return;
-                net::VehicleDestroyedPayload p;
-                if (!net::VehicleDestroyedPayload::Decode(e.payload, e.payloadSize, p)) return;
-                joinerPayload = p;
-                joinerGot++;
-            });
-
-            uint8_t b2[net::MAX_PACKET_PAYLOAD];
-            uint16_t m = net::WorldEventCodec::Encode(
-                b2, sizeof(b2), net::WE_VEHICLE_DESTROYED,
-                static_cast<uint16_t>(host.GetLocalPeerId()), payload, sizeof(payload));
-            Assert::IsTrue(m > 0);
-            Assert::IsTrue(host.SendCustomEvent(b2, m), L"Host SendCustomEvent failed.");
-
-            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
-            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the vehicle event.");
-            Assert::AreEqual((int)kId, (int)joinerPayload.netVehicleId,
-                             L"Relayed netVehicleId must match.");
-            Assert::AreEqual(kX, joinerPayload.x, L"Relayed x must match.");
-            Assert::AreEqual(kY, joinerPayload.y, L"Relayed y must match.");
-            Assert::AreEqual(kZ, joinerPayload.z, L"Relayed z must match.");
-
-            joiner.Leave();
-            host.Leave();
-        }
-
-        TEST_METHOD(CoinCollectedPayloadRoundTrips)
-        {
-            // Codec + payload round-trip: a WE_COIN_COLLECTED with a known
-            // persistentId and x,y,z payload must encode/decode losslessly.
-            const int32_t kId = 55;
-            const float kX = 1.0f, kY = 2.5f, kZ = -9.75f;
-            uint8_t payload[net::CoinCollectedPayload::SERIALIZED_SIZE];
-            net::CoinCollectedPayload::Encode(payload, kId, kX, kY, kZ);
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_COIN_COLLECTED, 0x44, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_COIN_COLLECTED, L"Type must round-trip.");
-            net::CoinCollectedPayload out;
-            Assert::IsTrue(net::CoinCollectedPayload::Decode(d.payload, d.payloadSize, out),
-                           L"Payload decode should succeed.");
-            Assert::AreEqual((int)kId, (int)out.persistentId, L"persistentId must round-trip.");
-            Assert::AreEqual(kX, out.x, L"x must round-trip.");
-            Assert::AreEqual(kY, out.y, L"y must round-trip.");
-            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
-
-            // Relay: the encoded event travels host -> joiner through the open
-            // channel and the joiner's sink decodes the exact coin payload.
-            unsigned short port = PickFreePort();
-            net::Session host;
-            Assert::IsTrue(host.StartHost(port, 0xAA57));
-            net::Session joiner;
-            Assert::IsTrue(joiner.Join("127.0.0.1", port));
-            Assert::IsTrue(PumpToWelcome(host, joiner), L"Joiner did not get WELCOME.");
-
-            int joinerGot = 0;
-            net::CoinCollectedPayload joinerPayload;
-            joiner.SetCustomEventSink([&](net::PeerId, const uint8_t* data, uint16_t size) {
-                auto e = net::WorldEventCodec::Decode(data, size);
-                if (!e.valid || e.type != net::WE_COIN_COLLECTED) return;
-                net::CoinCollectedPayload p;
-                if (!net::CoinCollectedPayload::Decode(e.payload, e.payloadSize, p)) return;
-                joinerPayload = p;
-                joinerGot++;
-            });
-
-            uint8_t b2[net::MAX_PACKET_PAYLOAD];
-            uint16_t m = net::WorldEventCodec::Encode(
-                b2, sizeof(b2), net::WE_COIN_COLLECTED,
-                static_cast<uint16_t>(host.GetLocalPeerId()), payload, sizeof(payload));
-            Assert::IsTrue(m > 0);
-            Assert::IsTrue(host.SendCustomEvent(b2, m), L"Host SendCustomEvent failed.");
-
-            for (int i = 0; i < 200 && joinerGot == 0; ++i) { host.Update(); joiner.Update(); }
-            Assert::AreEqual(1, joinerGot, L"Joiner did not receive the coin event.");
-            Assert::AreEqual((int)kId, (int)joinerPayload.persistentId,
-                             L"Relayed persistentId must match.");
-            Assert::AreEqual(kX, joinerPayload.x, L"Relayed x must match.");
-            Assert::AreEqual(kY, joinerPayload.y, L"Relayed y must match.");
-            Assert::AreEqual(kZ, joinerPayload.z, L"Relayed z must match.");
-
-            joiner.Leave();
-            host.Leave();
-        }
-
-        TEST_METHOD(BreakablePayloadRoundTrips)
-        {
-            const int32_t kId = 1024;
-            const float kX = 12.0f, kY = -4.25f, kZ = 88.5f;
-            uint8_t payload[net::BreakablePayload::SERIALIZED_SIZE];
-            net::BreakablePayload::Encode(payload, kId, kX, kY, kZ);
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_BREAKABLE, 0x55, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_BREAKABLE, L"Type must round-trip.");
-            net::BreakablePayload out;
-            Assert::IsTrue(net::BreakablePayload::Decode(d.payload, d.payloadSize, out),
-                           L"Payload decode should succeed.");
-            Assert::AreEqual((int)kId, (int)out.persistentId, L"persistentId must round-trip.");
-            Assert::AreEqual(kX, out.x, L"x must round-trip.");
-            Assert::AreEqual(kY, out.y, L"y must round-trip.");
-            Assert::AreEqual(kZ, out.z, L"z must round-trip.");
-        }
-
-        TEST_METHOD(PlatformDirPayloadRoundTrips)
-        {
-            const uint32_t kUid = 0xDEADBEEF;
-            const int32_t kDir = -1;
-            uint8_t payload[net::PlatformDirPayload::SERIALIZED_SIZE];
-            net::PlatformDirPayload::Encode(payload, kUid, static_cast<int8_t>(kDir));
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_PLATFORM_DIR, 0x66, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_PLATFORM_DIR, L"Type must round-trip.");
-            net::PlatformDirPayload out;
-            Assert::IsTrue(net::PlatformDirPayload::Decode(d.payload, d.payloadSize, out),
-                           L"Payload decode should succeed.");
-            Assert::IsTrue(out.objectUID == kUid, L"objectUID must round-trip.");
-            Assert::AreEqual((int)kDir, (int)out.dir, L"dir must round-trip.");
-
-            // Reversed direction also round-trips (forward is 0, reverse is -1).
-            net::PlatformDirPayload::Encode(payload, kUid, static_cast<int8_t>(1));
-            Assert::IsTrue(net::PlatformDirPayload::Decode(
-                payload, net::PlatformDirPayload::SERIALIZED_SIZE, out), L"Decode dir=1 should succeed.");
-            Assert::AreEqual(1, (int)out.dir, L"dir=1 must round-trip.");
-        }
-
-        TEST_METHOD(StatePropPayloadRoundTrips)
-        {
-            const uint32_t kUid = 0x1234ABCD;
-            const uint8_t kState = 3;
-            uint8_t payload[net::StatePropPayload::SERIALIZED_SIZE];
-            net::StatePropPayload::Encode(payload, kUid, kState);
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint16_t n = net::WorldEventCodec::Encode(
-                buf, sizeof(buf), net::WE_STATEPROP, 0x77, payload, sizeof(payload));
-            Assert::IsTrue(n > net::WORLD_EVENT_HEADER_SIZE, L"Encode should succeed.");
-
-            auto d = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsTrue(d.valid, L"Decode should succeed.");
-            Assert::IsTrue(d.type == net::WE_STATEPROP, L"Type must round-trip.");
-            net::StatePropPayload out;
-            Assert::IsTrue(net::StatePropPayload::Decode(d.payload, d.payloadSize, out),
-                           L"Payload decode should succeed.");
-            Assert::IsTrue(out.objectUID == kUid, L"objectUID must round-trip.");
-            Assert::AreEqual((int)kState, (int)out.state, L"state must round-trip.");
-        }
-
-        TEST_METHOD(StatePropAndPlatformPayloadsCarryInstancePosition)
-        {
-            uint8_t sp[net::StatePropPayload::SERIALIZED_SIZE];
-            net::StatePropPayload::Encode(sp, 0xABCD0001u, 2, 10.5f, -3.0f, 77.25f);
-            net::StatePropPayload spOut;
-            Assert::IsTrue(net::StatePropPayload::Decode(sp, sizeof(sp), spOut));
-            Assert::AreEqual(10.5f, spOut.x); Assert::AreEqual(-3.0f, spOut.y); Assert::AreEqual(77.25f, spOut.z);
-            Assert::IsFalse(net::StatePropPayload::Decode(sp, sizeof(sp) - 1, spOut),
-                L"Truncated stateprop payload must be rejected.");
-
-            uint8_t pd[net::PlatformDirPayload::SERIALIZED_SIZE];
-            net::PlatformDirPayload::Encode(pd, 0x55u, -1, 1.0f, 2.0f, 3.0f);
-            net::PlatformDirPayload pdOut;
-            Assert::IsTrue(net::PlatformDirPayload::Decode(pd, sizeof(pd), pdOut));
-            Assert::AreEqual(-1, (int)pdOut.dir);
-            Assert::AreEqual(1.0f, pdOut.x); Assert::AreEqual(2.0f, pdOut.y); Assert::AreEqual(3.0f, pdOut.z);
-        }
-
-        TEST_METHOD(WorldEventDispatchRoutesEveryTypeInsideEchoScope)
-        {
-            // Each inbound type reaches its typed handler with decoded fields,
-            // and runs with the echo guard raised (so emitters stay silent).
-            int calls = 0;
-            bool guardSeen = true;
-            net::WorldEventHandlers h;
-            h.stateProp = [&](uint16_t origin, const net::StatePropPayload& p) {
-                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
-                Assert::AreEqual(7, (int)origin); Assert::AreEqual(4, (int)p.state); };
-            h.breakable = [&](uint16_t, const net::BreakablePayload& p) {
-                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
-                Assert::AreEqual(321, (int)p.persistentId); };
-            h.vehicleDestroyed = [&](uint16_t, const net::VehicleDestroyedPayload& p) {
-                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
-                Assert::AreEqual(5.0f, p.x); };
-            h.coinCollected = [&](uint16_t, const net::CoinCollectedPayload& p) {
-                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
-                Assert::AreEqual(99, (int)p.persistentId); };
-            h.platformDir = [&](uint16_t, const net::PlatformDirPayload& p) {
-                ++calls; guardSeen = guardSeen && net::IsApplyingRemoteWorldEvent();
-                Assert::AreEqual(1, (int)p.dir); };
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            auto send = [&](net::WorldEventType t, const uint8_t* pl, uint16_t n) {
-                uint16_t len = net::WorldEventCodec::Encode(buf, sizeof(buf), t, 7, pl, n);
-                auto d = net::WorldEventCodec::Decode(buf, len);
-                return net::DispatchWorldEvent(&d, h);
-            };
-
-            uint8_t a[net::StatePropPayload::SERIALIZED_SIZE];
-            net::StatePropPayload::Encode(a, 1u, 4, 0, 0, 0);
-            Assert::IsTrue(send(net::WE_STATEPROP, a, sizeof(a)));
-            uint8_t b[net::BreakablePayload::SERIALIZED_SIZE];
-            net::BreakablePayload::Encode(b, 321, 0, 0, 0);
-            Assert::IsTrue(send(net::WE_BREAKABLE, b, sizeof(b)));
-            uint8_t c[net::VehicleDestroyedPayload::SERIALIZED_SIZE];
-            net::VehicleDestroyedPayload::Encode(c, 3, 5.0f, 0, 0);
-            Assert::IsTrue(send(net::WE_VEHICLE_DESTROYED, c, sizeof(c)));
-            uint8_t d[net::CoinCollectedPayload::SERIALIZED_SIZE];
-            net::CoinCollectedPayload::Encode(d, 99, 0, 0, 0);
-            Assert::IsTrue(send(net::WE_COIN_COLLECTED, d, sizeof(d)));
-            uint8_t e[net::PlatformDirPayload::SERIALIZED_SIZE];
-            net::PlatformDirPayload::Encode(e, 2u, 1, 0, 0, 0);
-            Assert::IsTrue(send(net::WE_PLATFORM_DIR, e, sizeof(e)));
-
-            Assert::AreEqual(5, calls, L"Every world event type must reach its handler.");
-            Assert::IsTrue(guardSeen, L"Handlers must run inside the echo-suppression scope.");
-            Assert::IsFalse(net::IsApplyingRemoteWorldEvent(), L"Echo guard must drop after dispatch.");
-        }
-
-        TEST_METHOD(WorldEventDispatchSkipsTruncatedUnknownAndUnhandled)
-        {
-            int calls = 0;
-            net::WorldEventHandlers h;
-            h.coinCollected = [&](uint16_t, const net::CoinCollectedPayload&) { ++calls; };
-
-            uint8_t buf[net::MAX_PACKET_PAYLOAD];
-            uint8_t coin[net::CoinCollectedPayload::SERIALIZED_SIZE];
-            net::CoinCollectedPayload::Encode(coin, 1, 0, 0, 0);
-
-            // Truncated payload: header claims fewer bytes than the struct needs.
-            uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_COIN_COLLECTED, 1, coin, 4);
-            auto d1 = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsFalse(net::DispatchWorldEvent(&d1, h), L"Truncated payload must be skipped.");
-
-            // Unknown type from a newer peer.
-            n = net::WorldEventCodec::Encode(buf, sizeof(buf), static_cast<net::WorldEventType>(0x7E), 1, coin, sizeof(coin));
-            auto d2 = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsFalse(net::DispatchWorldEvent(&d2, h), L"Unknown type must be skipped.");
-
-            // Known type without a handler bound.
-            uint8_t sp[net::StatePropPayload::SERIALIZED_SIZE];
-            net::StatePropPayload::Encode(sp, 1u, 1, 0, 0, 0);
-            n = net::WorldEventCodec::Encode(buf, sizeof(buf), net::WE_STATEPROP, 1, sp, sizeof(sp));
-            auto d3 = net::WorldEventCodec::Decode(buf, n);
-            Assert::IsFalse(net::DispatchWorldEvent(&d3, h), L"Unhandled type must be skipped.");
-
-            Assert::IsFalse(net::DispatchWorldEvent(nullptr, h), L"Null event must be skipped.");
-            Assert::AreEqual(0, calls);
-            Assert::IsFalse(net::IsApplyingRemoteWorldEvent(), L"Guard must not leak on skipped events.");
-        }
-
-        TEST_METHOD(EchoScopeNestsAndUnwinds)
-        {
-            Assert::IsFalse(net::IsApplyingRemoteWorldEvent());
+            std::vector<net::WorldStateEntry> entries;
+            for (uint64_t i = 1; i <= 200; ++i)
             {
-                net::RemoteWorldEventScope outer;
-                {
-                    net::RemoteWorldEventScope inner; // stateprop -> break cascade
-                    Assert::IsTrue(net::IsApplyingRemoteWorldEvent());
-                }
-                Assert::IsTrue(net::IsApplyingRemoteWorldEvent(), L"Outer scope still applies.");
+                net::WorldStateEntry e;
+                e.key.object = i; e.key.channel = 1;
+                uint8_t v[20]; memset(v, static_cast<int>(i), sizeof(v));
+                e.value.Set(v, sizeof(v));
+                entries.push_back(e);
             }
-            Assert::IsFalse(net::IsApplyingRemoteWorldEvent());
+            std::vector<std::vector<uint8_t>> chunks;
+            net::WorldStateCodec::EncodeSnapshot(entries, net::MAX_PACKET_PAYLOAD, chunks);
+            Assert::IsTrue(chunks.size() > 1, L"200 entries must not fit one packet.");
+            std::vector<net::WorldStateEntry> back;
+            for (const auto& c : chunks)
+            {
+                Assert::IsTrue(c.size() <= net::MAX_PACKET_PAYLOAD, L"Chunk exceeds packet size.");
+                Assert::IsTrue(net::WorldStateCodec::DecodeSnapshot(c.data(), static_cast<uint16_t>(c.size()), back));
+            }
+            Assert::AreEqual(entries.size(), back.size(), L"Every entry must survive chunking.");
+            Assert::IsTrue(back[199].key.object == 200 && back[199].value.bytes[0] == 200);
         }
 
-        TEST_METHOD(FindNearestWorldObjectMatchesUidThenDistance)
+        TEST_METHOD(MirrorTracksPredictionsConfirmationsAndRejections)
         {
-            // Three instances of the same prop type + one other type right on
-            // the target: the nearest SAME-type instance within range wins.
-            const uint32_t uids[] = { 10u, 10u, 20u, 10u };
-            const float xs[] = { 50.0f, 0.4f, 0.0f, 3.0f };
-            auto getUid = [&](int i) { return uids[i]; };
-            auto getPos = [&](int i, float& x, float& y, float& z) { x = xs[i]; y = 0.0f; z = 0.0f; };
+            net::WorldStateMirror m;
+            net::WorldStateKey k{ 50, 1 };
+            uint32_t seq = m.Predict(k);
+            Assert::IsTrue(m.IsPending(k));
+            net::WorldStateEntry e; e.key = k; uint8_t v = 1; e.value.Set(&v, 1);
+            Assert::IsTrue(m.OnUpdate(e, 4, seq, 4) == net::WSR_CONFIRM, L"Own seq + own origin = confirmation.");
+            Assert::IsFalse(m.IsPending(k));
 
-            Assert::AreEqual(1, net::FindNearestWorldObject(4, true, 10u, 0.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
-                L"Nearest instance of the matching uid must be chosen.");
-            Assert::AreEqual(2, net::FindNearestWorldObject(4, false, 0u, 0.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
-                L"Without uid matching the closest object wins.");
-            Assert::AreEqual(-1, net::FindNearestWorldObject(4, true, 10u, 20.0f, 0.0f, 0.0f, 1.0f, getUid, getPos),
-                L"Nothing within range -> -1 (do not touch an unrelated object).");
-            Assert::AreEqual(-1, net::FindNearestWorldObject(4, true, 30u, 0.0f, 0.0f, 0.0f, 100.0f, getUid, getPos),
-                L"Unknown uid -> -1.");
+            seq = m.Predict(k);
+            Assert::IsTrue(m.OnUpdate(e, 5, 99, 4) == net::WSR_REMOTE, L"Another peer's change.");
+            Assert::IsTrue(m.IsPending(k), L"A remote change does not resolve our prediction.");
+            Assert::IsTrue(m.OnReject(k, true, e, seq) == net::WSR_REJECT);
+            Assert::IsFalse(m.IsPending(k));
+            net::WorldStateEntry f;
+            Assert::IsTrue(m.Find(k, f) && f.value == e.value, L"Reject installs the authoritative value.");
+            m.OnErase(k);
+            Assert::IsFalse(m.Find(k, f));
+        }
+    };
+
+    TEST_CLASS(LedgerTests)
+    {
+    public:
+        net::CounterConfig Coins()
+        {
+            return economy::MakeCoinConfig(false);
+        }
+
+        TEST_METHOD(OpeningIsAcceptedOnceAndBounded)
+        {
+            net::LedgerServer s;
+            s.Configure(economy::COUNTER_COINS, Coins());
+            int64_t b = 0;
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_OPENING, 500, 0, b) == net::LedgerServer::ACCEPTED);
+            Assert::AreEqual((int64_t)500, b);
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_OPENING, 500, 0, b) == net::LedgerServer::REJECTED,
+                L"Opening balance can be declared only once.");
+            Assert::IsTrue(s.Apply(2, economy::COUNTER_COINS, net::LR_OPENING, economy::kMaxOpeningCoins + 1, 0, b) == net::LedgerServer::REJECTED,
+                L"Opening over the cap is refused.");
+        }
+
+        TEST_METHOD(ClaimedPickupRedeemsOncePerPlayer)
+        {
+            net::LedgerServer s;
+            s.Configure(economy::COUNTER_COINS, Coins());
+            int64_t b = 0;
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0xC0FFEE, b) == net::LedgerServer::ACCEPTED);
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0xC0FFEE, b) == net::LedgerServer::REJECTED,
+                L"The same world coin cannot be redeemed twice by one player.");
+            Assert::IsTrue(s.Apply(2, economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0xC0FFEE, b) == net::LedgerServer::ACCEPTED,
+                L"Coins are per player: another player may redeem the same coin.");
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0, b) == net::LedgerServer::REJECTED,
+                L"A claimed pickup needs a claim.");
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 2, 0xBEEF, b) == net::LedgerServer::REJECTED,
+                L"A world coin is worth exactly one.");
+        }
+
+        TEST_METHOD(SpendCannotGoBelowZeroAndUnknownsAreRefused)
+        {
+            net::LedgerServer s;
+            s.Configure(economy::COUNTER_COINS, Coins());
+            int64_t b = 0;
+            s.Apply(1, economy::COUNTER_COINS, net::LR_OPENING, 10, 0, b);
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_SPEND, -11, 0, b) == net::LedgerServer::REJECTED,
+                L"Balance may not go negative.");
+            Assert::AreEqual((int64_t)10, b, L"A refused change leaves the balance.");
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_SPEND, -10, 0, b) == net::LedgerServer::ACCEPTED);
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_SPEND, +5, 0, b) == net::LedgerServer::REJECTED,
+                L"A spend must be negative.");
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_CHEAT, 100, 0, b) == net::LedgerServer::REJECTED,
+                L"Cheats are refused unless the session allows them.");
+            Assert::IsTrue(s.Apply(1, 999, net::LR_REWARD, 1, 0, b) == net::LedgerServer::REJECTED,
+                L"Unknown counters are refused (secure default).");
+            Assert::IsTrue(s.Apply(1, economy::COUNTER_COINS, net::LR_COUNT, 1, 0, b) == net::LedgerServer::REJECTED,
+                L"Unknown reasons are refused.");
+            s.OnPeerLeft(1);
+            Assert::AreEqual((int64_t)0, s.Balance(1, economy::COUNTER_COINS), L"Session balances drop with the peer.");
+        }
+
+        TEST_METHOD(CodecAndClientOutcomeRoundTrip)
+        {
+            uint8_t buf[net::LedgerCodec::REQUEST_SIZE];
+            uint16_t n = net::LedgerCodec::EncodeRequest(buf, sizeof(buf), 5, 1, net::LR_SPEND, -42, 0x1122334455667788ull);
+            Assert::AreEqual((int)net::LedgerCodec::REQUEST_SIZE, (int)n);
+            uint32_t seq; net::CounterId c; uint8_t r; int32_t d; uint64_t claim;
+            Assert::IsTrue(net::LedgerCodec::DecodeRequest(buf, n, seq, c, r, d, claim));
+            Assert::IsTrue(seq == 5 && c == 1 && r == net::LR_SPEND && d == -42 && claim == 0x1122334455667788ull);
+            Assert::IsFalse(net::LedgerCodec::DecodeRequest(buf, static_cast<uint16_t>(n - 1), seq, c, r, d, claim));
+
+            net::LedgerClient cl;
+            uint32_t s1 = cl.Predict(1, net::LR_PICKUP, 3);
+            Assert::AreEqual((size_t)1, cl.Pending());
+            net::LedgerOutcome o = cl.OnResult(s1, 1, false, 7);
+            Assert::IsTrue(o.known && !o.accepted && o.delta == 3 && o.balance == 7);
+            Assert::AreEqual((size_t)0, cl.Pending());
+            Assert::IsFalse(cl.OnResult(12345, 1, true, 8).known, L"Unknown seq is reported as such.");
+        }
+    };
+
+    // The economy gateway converges the local bank to the server's balance.
+    static int64_t g_localBank = 0;
+    static int64_t TestGetBank(net::CounterId) { return g_localBank; }
+    static void TestSetBank(net::CounterId, int64_t v) { g_localBank = v; }
+
+    TEST_CLASS(PlayerEconomyTests)
+    {
+    public:
+        TEST_METHOD(OpeningReportAndConvergence)
+        {
+            PlayerEconomy eco;
+            std::vector<std::pair<uint8_t, int32_t>> sent;
+            eco.SetSender([&](net::CounterId, uint8_t reason, int32_t delta, uint64_t) {
+                sent.push_back(std::make_pair(reason, delta)); return true; });
+            eco.SetBalanceAccess(&TestGetBank, &TestSetBank);
+            g_localBank = 120;
+            eco.OnMatchStart(economy::COUNTER_COINS);
+            Assert::AreEqual((size_t)1, sent.size());
+            Assert::AreEqual((int)net::LR_OPENING, (int)sent[0].first);
+            Assert::AreEqual(120, (int)sent[0].second, L"The current bank is declared as opening balance.");
+
+            g_localBank += 5; // local pickup (prediction)
+            Assert::IsTrue(eco.Report(economy::COUNTER_COINS, net::LR_PICKUP, 5));
+
+            // Server refused the pickup: once idle, the bank converges to 120.
+            net::LedgerOutcome o; o.known = true; o.counter = economy::COUNTER_COINS;
+            o.reason = net::LR_PICKUP; o.delta = 5; o.accepted = false; o.balance = 120;
+            net::LedgerOutcome other = o; other.accepted = true; other.delta = 0; // another of our requests
+            eco.OnOutcome(other, 1);
+            Assert::AreEqual((int64_t)125, g_localBank, L"No convergence while our requests are in flight.");
+            eco.OnOutcome(o, 0);
+            Assert::AreEqual((int64_t)120, g_localBank, L"Refused change rolled back by convergence.");
+            Assert::AreEqual(1u, eco.Refused());
+            Assert::IsFalse(eco.Report(economy::COUNTER_COINS, net::LR_PICKUP, 0), L"Zero deltas are not sent.");
+        }
+
+        TEST_METHOD(RefusedOpeningStopsSyncInsteadOfZeroing)
+        {
+            PlayerEconomy eco;
+            eco.SetSender([&](net::CounterId, uint8_t, int32_t, uint64_t) { return true; });
+            eco.SetBalanceAccess(&TestGetBank, &TestSetBank);
+            g_localBank = 5000000;
+            eco.OnMatchStart(economy::COUNTER_COINS);
+            net::LedgerOutcome o; o.known = true; o.counter = economy::COUNTER_COINS;
+            o.reason = net::LR_OPENING; o.delta = 5000000; o.accepted = false; o.balance = 0;
+            eco.OnOutcome(o, 0);
+            Assert::AreEqual((int64_t)5000000, g_localBank, L"A real balance must never be zeroed.");
+            Assert::IsFalse(eco.IsActive(), L"Economy sync stops for this player.");
+        }
+    };
+
+    // ---- NetWorldRegistry ----------------------------------------------------
+    static std::vector<std::pair<void*, uint8_t>> g_applied;
+    static NetWorldRegistry* g_reg = nullptr;
+    static bool g_requestInsideApply = false;
+    static void TestApply(void* h, uint8_t ch, const net::WorldStateValue& v, bool erased)
+    {
+        (void)v;
+        g_applied.push_back(std::make_pair(h, erased ? (uint8_t)0xEE : ch));
+        if (g_reg) { uint8_t x = 1; g_requestInsideApply = g_reg->Request(h, ch, net::WSP_LAST_WRITE, &x, 1); }
+    }
+
+    TEST_CLASS(NetWorldRegistryTests)
+    {
+    public:
+        TEST_METHOD(IdsAreDeterministicAndStableAcrossReload)
+        {
+            NetWorldRegistry a, b;
+            int o1, o2, o3;
+            uint64_t a1 = a.Register(net::WOK_STATEPROP, 100, 7, &o1, &TestApply);
+            uint64_t a2 = a.Register(net::WOK_STATEPROP, 100, 7, &o2, &TestApply); // same name: ordinal 1
+            uint64_t b1 = b.Register(net::WOK_STATEPROP, 100, 7, &o3, &TestApply);
+            Assert::IsTrue(a1 != 0 && a2 != 0 && a1 != a2, L"Same-named instances get distinct ids.");
+            Assert::IsTrue(a1 == b1, L"Two clients loading the same data agree on the id.");
+            Assert::IsFalse(net::IsDynamicEntityId(a1), L"Static ids never use the dynamic namespace.");
+
+            a.Unregister(&o1);
+            a.Unregister(&o2);
+            uint64_t r1 = a.Register(net::WOK_STATEPROP, 100, 7, &o1, &TestApply);
+            uint64_t r2 = a.Register(net::WOK_STATEPROP, 100, 7, &o2, &TestApply);
+            Assert::IsTrue(r1 == a1 && r2 == a2, L"A reloaded source gets the same ids again.");
+            Assert::IsTrue(a.Register(net::WOK_ANIMCOLL, 100, 7, &o3, &TestApply) != a1,
+                L"Kind is part of the identity.");
+        }
+
+        TEST_METHOD(KnownStateAppliesOnRegisterDeferredAndWithoutEcho)
+        {
+            NetWorldRegistry r;
+            std::vector<net::WorldStateOp> sent;
+            r.SetSender([&](const net::WorldStateOp& op) { sent.push_back(op); return true; });
+            g_applied.clear();
+            g_reg = &r;
+            g_requestInsideApply = true;
+
+            // The server reports a state for an object that is not loaded yet.
+            int obj;
+            uint64_t id = net::MakeWorldObjectId(net::WOK_STATEPROP, 5, 6, 0);
+            net::WorldStateEntry e; e.key.object = id; e.key.channel = net::WOC_BROKEN;
+            uint8_t one = 1; e.value.Set(&one, 1);
+            r.OnAuthoritative(e, net::WSR_SNAPSHOT);
+            r.Pump();
+            Assert::AreEqual((size_t)0, g_applied.size(), L"Nothing to apply until it loads.");
+
+            Assert::IsTrue(r.Register(net::WOK_STATEPROP, 5, 6, &obj, &TestApply) == id);
+            Assert::AreEqual((size_t)0, g_applied.size(), L"Never applied inside Register (loader context).");
+            r.Pump();
+            Assert::AreEqual((size_t)1, g_applied.size(), L"Applied on the next Pump.");
+            Assert::IsTrue(g_applied[0].second == net::WOC_BROKEN);
+            Assert::IsFalse(g_requestInsideApply, L"A mirrored change must not be re-sent.");
+            Assert::AreEqual((size_t)0, sent.size());
+
+            uint8_t st = 2;
+            Assert::IsTrue(r.Request(&obj, net::WOC_STATE, net::WSP_LAST_WRITE, &st, 1), L"Local change is sent.");
+            Assert::AreEqual((size_t)1, sent.size());
+            Assert::IsTrue(sent[0].key.object == id && sent[0].key.channel == net::WOC_STATE);
+
+            int stranger;
+            Assert::IsFalse(r.Request(&stranger, net::WOC_STATE, net::WSP_LAST_WRITE, &st, 1), L"Unregistered objects are not networked.");
+            g_reg = nullptr;
+        }
+
+        TEST_METHOD(EntityRecordsAreIgnoredByTheRegistry)
+        {
+            NetWorldRegistry r;
+            g_applied.clear();
+            net::WorldStateEntry e; e.key.object = net::MakeDynamicEntityId(2, 1); e.key.channel = net::WS_CHANNEL_ENTITY;
+            r.OnAuthoritative(e, net::WSR_REMOTE);
+            r.Pump();
+            Assert::AreEqual((size_t)0, g_applied.size());
+        }
+    };
+
+    // ---- NetEntityManager ----------------------------------------------------
+    struct FakeGhost { uint64_t id; net::NetEntitySpawn spawn; net::NetEntityMotion last; int moves; };
+    static std::vector<FakeGhost*> g_ghosts;
+    static int g_ghostDespawns = 0;
+    static void* GhostSpawn(uint64_t id, const net::NetEntitySpawn& s)
+    {
+        FakeGhost* g = new FakeGhost(); g->id = id; g->spawn = s; g->moves = 0;
+        g_ghosts.push_back(g); return g;
+    }
+    static void GhostMove(void* h, const net::NetEntityMotion& m) { FakeGhost* g = (FakeGhost*)h; g->last = m; ++g->moves; }
+    static void GhostDespawn(void* h)
+    {
+        ++g_ghostDespawns;
+        for (size_t i = 0; i < g_ghosts.size(); ++i) if (g_ghosts[i] == h) { delete g_ghosts[i]; g_ghosts.erase(g_ghosts.begin() + i); break; }
+    }
+    static bool SampleCar(void* h, net::NetEntityMotion& m) { (void)h; m.x = 1.0f; m.z = 2.0f; m.speedKmh = 30; return true; }
+
+    TEST_CLASS(NetEntityManagerTests)
+    {
+    public:
+        TEST_METHOD(LocalEntityIsAnnouncedAfterWelcomeAndStreamed)
+        {
+            NetEntityManager m;
+            std::vector<net::WorldStateOp> ops;
+            std::vector<net::EntityStateRecord> streamed;
+            m.SetSenders([&](const net::WorldStateOp& op) { ops.push_back(op); return true; },
+                         [&](const std::vector<net::EntityStateRecord>& r) { streamed.insert(streamed.end(), r.begin(), r.end()); return true; });
+            m.SetSampler(&SampleCar);
+            m.SetSendEvery(1);
+
+            int car;
+            net::NetEntitySpawn sp; sp.kind = net::NEK_TRAFFIC_CAR; strcpy(sp.model, "compactA");
+            m.AddLocal(&car, sp);
+            Assert::AreEqual((size_t)0, ops.size(), L"No id before our peer id is known.");
+            m.OnWelcomed(3);
+            Assert::AreEqual((size_t)1, ops.size(), L"Announced once welcomed.");
+            Assert::IsTrue(ops[0].policy == net::WSP_OWNER && (ops[0].flags & net::WSF_ERASE_ON_OWNER_LEAVE));
+            Assert::IsTrue(net::IsDynamicEntityId(ops[0].key.object) && ops[0].key.channel == net::WS_CHANNEL_ENTITY);
+            Assert::IsTrue(m.LocalId(&car) == ops[0].key.object);
+
+            m.Update(0.016f);
+            Assert::AreEqual((size_t)1, streamed.size(), L"Owned motion is streamed.");
+            net::NetEntityMotion back;
+            Assert::IsTrue(back.Decode(streamed[0]) && back.x == 1.0f && back.speedKmh == 30);
+
+            m.RemoveLocal(&car);
+            Assert::AreEqual((size_t)2, ops.size());
+            Assert::IsTrue(ops[1].kind == net::WSO_ERASE, L"Removing a local entity erases it on the server.");
+        }
+
+        TEST_METHOD(RemoteEntityGhostLifecycleAndOwnerCheck)
+        {
+            NetEntityManager m;
+            NetEntityManager::Sink s = { &GhostSpawn, &GhostMove, &GhostDespawn };
+            m.SetSink(s);
+            m.OnWelcomed(1);
+            g_ghostDespawns = 0;
+
+            net::NetEntitySpawn sp; sp.kind = net::NEK_TRAFFIC_CAR; strcpy(sp.model, "sedanB"); sp.x = 10.0f;
+            net::WorldStateEntry e; e.key.object = net::MakeDynamicEntityId(2, 9); e.key.channel = net::WS_CHANNEL_ENTITY;
+            e.owner = 2; e.policy = net::WSP_OWNER;
+            Assert::IsTrue(sp.Encode(e.value));
+            m.OnAuthoritative(e, net::WSR_SNAPSHOT);
+            Assert::AreEqual((size_t)1, m.RemoteCount(), L"Snapshot entity spawns a ghost.");
+            Assert::AreEqual(std::string("sedanB"), std::string(g_ghosts.back()->spawn.model));
+            m.OnAuthoritative(e, net::WSR_REMOTE);
+            Assert::AreEqual((size_t)1, m.RemoteCount(), L"No duplicate ghost.");
+
+            net::NetEntityMotion mo; mo.x = 20.0f;
+            net::EntityStateRecord rec; mo.Encode(rec, e.key.object);
+            m.OnEntityState(5, rec); // spoofed owner
+            Assert::AreEqual(10.0f, g_ghosts.back()->last.x, L"Motion from a non-owner is ignored.");
+            m.OnEntityState(2, rec);
+            m.Update(0.016f);
+            Assert::AreEqual(20.0f, g_ghosts.back()->last.x, L"First owner sample snaps (no slide from spawn).");
+            Assert::AreEqual(1, m.CountRemoteNear(19.0f, 0.0f, 5.0f));
+            Assert::AreEqual(0, m.CountRemoteNear(100.0f, 0.0f, 5.0f));
+
+            net::WorldStateEntry own = e; own.key.object = net::MakeDynamicEntityId(1, 1); own.owner = 1;
+            m.OnAuthoritative(own, net::WSR_CONFIRM);
+            Assert::AreEqual((size_t)1, m.RemoteCount(), L"Our own entities never become ghosts.");
+
+            m.OnAuthoritative(e, net::WSR_ERASED);
+            Assert::AreEqual((size_t)0, m.RemoteCount());
+            Assert::AreEqual(1, g_ghostDespawns);
+        }
+
+        TEST_METHOD(SpawnRecordRejectsGarbage)
+        {
+            net::NetEntitySpawn sp;
+            net::WorldStateValue v; v.len = 3;
+            Assert::IsFalse(sp.Decode(v), L"Short spawn record rejected.");
+            net::NetEntityMotion mo;
+            net::EntityStateRecord rec; rec.len = 4;
+            Assert::IsFalse(mo.Decode(rec), L"Short motion record rejected.");
+            float nanv = std::numeric_limits<float>::quiet_NaN();
+            net::NetEntityMotion bad; bad.x = nanv;
+            bad.Encode(rec, 1);
+            Assert::IsFalse(mo.Decode(rec), L"Non-finite positions rejected.");
+        }
+    };
+
+    // ---- Session-level replicated world (real loopback sockets) -------------
+    TEST_CLASS(SessionWorldStateTests)
+    {
+    public:
+        TEST_METHOD(ChangeReplicatesToPeersAndLateJoinerGetsSnapshot)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xA1));
+            net::Session a, b;
+            Assert::IsTrue(a.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, a));
+            Assert::IsTrue(b.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, b));
+
+            int bGot = 0;
+            b.SetWorldStateSink([&](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId origin) {
+                if (reason == net::WSR_REMOTE && e.key.object == 1234 && origin == a.GetLocalPeerId()) ++bGot; });
+            int aConfirm = 0;
+            a.SetWorldStateSink([&](const net::WorldStateEntry&, net::WorldStateReason reason, net::PeerId) {
+                if (reason == net::WSR_CONFIRM) ++aConfirm; });
+
+            Assert::IsTrue(a.RequestWorldState(MakeOp(1234, net::WOC_BROKEN, net::WSP_FIRST_WRITE, 1)));
+            Assert::IsTrue(a.RequestWorldState(MakeOp(1235, net::WOC_STATE, net::WSP_LAST_WRITE, 3)));
+            for (int i = 0; i < 300 && (bGot == 0 || aConfirm < 2); ++i) PumpAll(host, { &a, &b }, 1);
+            Assert::AreEqual(1, bGot, L"Other peers receive the change.");
+            Assert::AreEqual(2, aConfirm, L"The requester gets its confirmations.");
+            Assert::AreEqual((size_t)2, host.GetWorldStateTable().Size());
+
+            // Late joiner: the whole world arrives before it is 'synced'.
+            net::Session late;
+            size_t snap = 0;
+            bool synced = false;
+            late.SetWorldStateSink([&](const net::WorldStateEntry&, net::WorldStateReason reason, net::PeerId) {
+                if (reason == net::WSR_SNAPSHOT) ++snap; });
+            late.SetWorldSyncedFn([&]() { synced = true; });
+            Assert::IsTrue(late.Join("127.0.0.1", port));
+            for (int i = 0; i < 500 && !synced; ++i) PumpAll(host, { &a, &b, &late }, 1);
+            Assert::IsTrue(synced, L"Late joiner must finish the snapshot.");
+            Assert::AreEqual((size_t)2, snap, L"Snapshot carries every entry.");
+            net::WorldStateEntry e;
+            Assert::IsTrue(late.GetWorldStateMirror().Find({ 1234, net::WOC_BROKEN }, e) && e.value.bytes[0] == 1);
+
+            late.Leave(); b.Leave(); a.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(ConflictingFirstWriteIsRejectedToTheLoser)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xA2));
+            net::Session a, b;
+            Assert::IsTrue(a.Join("127.0.0.1", port)); Assert::IsTrue(PumpToWelcome(host, a));
+            Assert::IsTrue(b.Join("127.0.0.1", port)); Assert::IsTrue(PumpToWelcome(host, b));
+
+            int rejects = 0;
+            uint8_t rejectedTo = 0;
+            auto sink = [&](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId) {
+                if (reason == net::WSR_REJECT) { ++rejects; rejectedTo = e.value.bytes[0]; } };
+            a.SetWorldStateSink(sink);
+            b.SetWorldStateSink(sink);
+
+            Assert::IsTrue(a.RequestWorldState(MakeOp(77, 9, net::WSP_FIRST_WRITE, 1)));
+            PumpAll(host, { &a, &b }, 50);
+            Assert::IsTrue(b.RequestWorldState(MakeOp(77, 9, net::WSP_FIRST_WRITE, 2)));
+            for (int i = 0; i < 300 && rejects == 0; ++i) PumpAll(host, { &a, &b }, 1);
+            Assert::AreEqual(1, rejects, L"The second, different write is refused.");
+            Assert::AreEqual(1, (int)rejectedTo, L"The loser is told the winning value to roll back to.");
+            b.Leave(); a.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(OwnerLeaveErasesEntitiesAndStreamIsOwnerChecked)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsTrue(host.StartHost(port, 0xA3));
+            net::Session owner, viewer;
+            Assert::IsTrue(owner.Join("127.0.0.1", port)); Assert::IsTrue(PumpToWelcome(host, owner));
+            Assert::IsTrue(viewer.Join("127.0.0.1", port)); Assert::IsTrue(PumpToWelcome(host, viewer));
+
+            uint64_t ent = net::MakeDynamicEntityId(owner.GetLocalPeerId(), 1);
+            int spawned = 0, erased = 0, streamed = 0;
+            viewer.SetWorldStateSink([&](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId) {
+                if (e.key.object != ent) return;
+                if (reason == net::WSR_ERASED) ++erased; else ++spawned; });
+            viewer.SetEntityStateSink([&](net::PeerId from, const net::EntityStateRecord& rec) {
+                if (rec.entity == ent && from == owner.GetLocalPeerId()) ++streamed; });
+
+            Assert::IsTrue(owner.RequestWorldState(MakeOp(ent, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 1, net::WSO_SET,
+                                                          net::WSF_ERASE_ON_OWNER_LEAVE)));
+            for (int i = 0; i < 300 && spawned == 0; ++i) PumpAll(host, { &owner, &viewer }, 1);
+            Assert::AreEqual(1, spawned);
+
+            net::EntityStateRecord rec; rec.entity = ent; rec.len = 4;
+            std::vector<net::EntityStateRecord> recs(1, rec);
+            Assert::IsTrue(viewer.SendEntityStates(recs), L"Spoofed stream is sent ...");
+            Assert::IsTrue(owner.SendEntityStates(recs));
+            for (int i = 0; i < 300 && streamed == 0; ++i) PumpAll(host, { &owner, &viewer }, 1);
+            PumpAll(host, { &owner, &viewer }, 30);
+            Assert::AreEqual(1, streamed, L"... but only the owner's record is relayed.");
+
+            owner.Leave();
+            for (int i = 0; i < 600 && erased == 0; ++i) PumpAll(host, { &viewer }, 1);
+            Assert::AreEqual(1, erased, L"Owner disconnect erases its entities for everyone.");
+            viewer.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(LedgerThroughSessionAcceptsAndRefuses)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            host.ConfigureCounter(economy::COUNTER_COINS, economy::MakeCoinConfig(false));
+            Assert::IsTrue(host.StartHost(port, 0xA4));
+            net::Session c;
+            std::vector<net::LedgerOutcome> outcomes;
+            c.SetLedgerSink([&](const net::LedgerOutcome& o) { outcomes.push_back(o); });
+            Assert::IsTrue(c.Join("127.0.0.1", port));
+            // Sent before WELCOME: queued and delivered in order.
+            Assert::IsTrue(c.RequestLedgerChange(economy::COUNTER_COINS, net::LR_OPENING, 10, 0));
+            Assert::IsTrue(c.RequestLedgerChange(economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0xAB));
+            Assert::IsTrue(c.RequestLedgerChange(economy::COUNTER_COINS, net::LR_PICKUP_CLAIMED, 1, 0xAB));
+            for (int i = 0; i < 500 && outcomes.size() < 3; ++i) PumpAll(host, { &c }, 1);
+            Assert::AreEqual((size_t)3, outcomes.size());
+            Assert::IsTrue(outcomes[0].accepted && outcomes[0].balance == 10);
+            Assert::IsTrue(outcomes[1].accepted && outcomes[1].balance == 11);
+            Assert::IsTrue(!outcomes[2].accepted && outcomes[2].balance == 11 && outcomes[2].delta == 1,
+                L"Double redemption refused with the authoritative balance.");
+            Assert::AreEqual((int64_t)11, host.GetLedgerServer().Balance(c.GetLocalPeerId(), economy::COUNTER_COINS));
+            c.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(UnauthenticatedPeerCannotInjectState)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            host.SetHostPassword("secret");
+            Assert::IsTrue(host.StartHost(port, 0xA5));
+            net::Session good;
+            good.SetPassword("secret");
+            Assert::IsTrue(good.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, good));
+
+            net::Session intruder; // no password: never admitted
+            Assert::IsTrue(intruder.Join("127.0.0.1", port));
+            int goodGotUser = 0;
+            good.SetCustomEventSink([&](net::PeerId, const uint8_t*, uint16_t) { ++goodGotUser; });
+            PumpAll(host, { &good, &intruder }, 50);
+            const uint8_t evil[2] = { 1, 2 };
+            intruder.SendCustomEvent(evil, sizeof(evil));
+            intruder.RequestWorldState(MakeOp(5, 1, net::WSP_LAST_WRITE, 1));
+            PumpAll(host, { &good, &intruder }, 100);
+            Assert::AreEqual(0, goodGotUser, L"Unadmitted peer's events are dropped.");
+            Assert::AreEqual((size_t)0, host.GetWorldStateTable().Size(), L"Unadmitted peer cannot write world state.");
+            Assert::IsFalse(intruder.IsWelcomed());
+            intruder.Leave(); good.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(OpenSessionNeedsNoAuthorization)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            Assert::IsFalse(host.HasHostPassword(), L"Authorization is off by default.");
+            Assert::IsTrue(host.StartHost(port, 0xA6));
+            net::Session c;
+            Assert::IsTrue(c.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, c), L"Open sessions admit on connect.");
+            c.Leave(); host.Leave();
+        }
+
+        TEST_METHOD(SlotCapIsApplied)
+        {
+            unsigned short port = PickFreePort();
+            net::Session host;
+            host.SetMaxPeers(2); // loopback + one remote
+            Assert::IsTrue(host.StartHost(port, 0xA7));
+            net::Session a, b;
+            Assert::IsTrue(a.Join("127.0.0.1", port));
+            Assert::IsTrue(PumpToWelcome(host, a));
+            Assert::IsTrue(b.Join("127.0.0.1", port));
+            PumpAll(host, { &a, &b }, 300);
+            Assert::IsFalse(b.IsWelcomed(), L"A peer over the slot cap is not admitted.");
+            b.Leave(); a.Leave(); host.Leave();
+        }
+    };
+
+    TEST_CLASS(MatchManagerWorldServicesTests)
+    {
+    public:
+        TEST_METHOD(JoinLeaveEventsReachTheGame)
+        {
+            unsigned short port = PickFreePort();
+            NetworkMatchManager* mgr = NetworkMatchManager::CreateInstance();
+            Assert::IsTrue(mgr->StartHost(port));
+            net::Session c;
+            Assert::IsTrue(c.Join("127.0.0.1", port));
+            std::vector<NetworkMatchManager::JoinLeaveEvent> ev;
+            for (int i = 0; i < 500; ++i)
+            {
+                mgr->Update(); c.Update();
+                mgr->DrainJoinLeaveEvents(ev);
+                bool remoteJoined = false;
+                for (const auto& e : ev) if (e.joined && e.clientId == c.GetLocalPeerId() && c.GetLocalPeerId() != 0) remoteJoined = true;
+                if (remoteJoined) break;
+            }
+            bool found = false;
+            for (const auto& e : ev) if (e.joined && e.clientId == c.GetLocalPeerId()) found = true;
+            Assert::IsTrue(found, L"Host must surface the remote player's join.");
+            c.Leave();
+            mgr->Leave();
         }
     };
 }

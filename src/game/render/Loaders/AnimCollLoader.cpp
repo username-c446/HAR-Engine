@@ -30,6 +30,7 @@
 #include <memory/srrmemory.h>
 
 #include <render/Loaders/AllWrappers.h>
+#include <network/NetWorldHooks.h>
 
 //************************************************************************
 //
@@ -121,6 +122,9 @@ tEntity* AnimCollLoader::LoadObject(tChunkFile* f, tEntityStore* store)
 
     AnimCollisionEntityDSG *pAnimCollDSG = new AnimCollisionEntityDSG;
     pAnimCollDSG->SetName(name);
+    // Deterministic network identity (file, instance name, load ordinal).
+    networld::RegisterObject( net::WOK_ANIMCOLL, tEntity::MakeUID( f->GetFilename() ),
+                              tEntity::MakeUID( name ), pAnimCollDSG, &AnimCollisionEntityDSG::NetApply );
 
     if(HasAlpha)
     {

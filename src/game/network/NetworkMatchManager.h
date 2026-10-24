@@ -3,7 +3,9 @@
 #include "PlayerNetworkState.h"
 #include "MissionSyncState.h"
 #include "RemotePlayerManager.h"   // placeholder; will be bridged from net::Session
-#include "WorldEvent.h"
+#include "NetWorldRegistry.h"
+#include "NetEntityManager.h"
+#include "PlayerEconomy.h"
 #include "../netengine/Session.h"
 #include "../netengine/GamePlayerBridge.h"
 
@@ -14,13 +16,14 @@
 // Singleton orchestrating an online match. This is a THIN BRIDGE: it keeps the
 // same public API the rest of the game already calls (StartHost/JoinHost/Leave/
 // IsInMatch/GetRemotePlayers), but its internals delegate to the reusable engine
-// layer (net::Session + net::GamePlayerBridge) instead of the old
-// NetworkServer/NetworkClient stack.
+// layer (net::Session + net::GamePlayerBridge).
 //
-// It stays as a process singleton so consumers (gameplay, console, main menu,
-// missions, vehicles) do not need to change while the bridge is being rolled
-// out. After the wiring is proven, this wrapper can be removed and consumers
-// switched to net::Session directly.
+// It also wires the game's replicated-world services to the session:
+//   * NetWorldRegistry  — static world objects  <-> server world state
+//   * NetEntityManager  — owner-simulated entities (traffic)
+//   * PlayerEconomy     — local coin bank        <-> server ledger
+// Those services are process singletons (objects register while a level loads,
+// before any match exists) and are reached through the static accessors below.
 class NetworkMatchManager
 {
 public:
@@ -43,6 +46,11 @@ public:
     static NetworkMatchManager* GetInstance();
     static void DestroyInstance();
 
+    // Replicated-world services (always available, match or not).
+    static NetWorldRegistry& WorldRegistry();
+    static NetEntityManager& Entities();
+    static PlayerEconomy&    Economy();
+
     bool StartHost(unsigned short port);
     bool JoinHost(const char* serverIp, unsigned short port);
     void Leave();
@@ -50,15 +58,21 @@ public:
     void SetLocalStateProvider(LocalStateProvider provider);
     void SetMissionStateProvider(MissionStateProvider provider);
 
-    // Host configuration: password and slot cap applied to the server when it is
-    // next (re)started via StartHost. Empty password / 0 slots = defaults.
+    // Host configuration applied by the next StartHost. Authorization is
+    // optional: an empty password hosts an open session (co-op / session
+    // games); a password turns the PID_AUTH gate on. 0 slots = engine default.
     void SetHostConfig(const char* password, unsigned short maxPlayers);
-    // Password for joining a protected host (applied to an existing client).
+    // Password presented to a protected host (before or after JoinHost).
     void SetClientPassword(const char* password);
+    // Whether the hosted economy accepts cheat credits (debug sessions).
+    void SetAllowEconomyCheats(bool allow) { m_allowEconomyCheats = allow; }
 
     bool IsHosting() const { return m_session && m_session->IsHost(); }
     bool IsJoined() const { return m_session && m_session->IsJoined(); }
     bool IsInMatch() const { return m_session && m_session->IsInMatch(); }
+    bool IsWelcomed() const { return m_session && m_session->IsWelcomed(); }
+    // True once the late-join world snapshot has been applied.
+    bool IsWorldSynced() const { return m_session && m_session->GetWorldStateMirror().IsSynced(); }
 
     // The authoritative remote-player registry the game reads each frame to
     // draw/interpolate remote players. Maintained by the bridge.
@@ -87,59 +101,15 @@ public:
     // Game::GetRandomSeed().
     unsigned int GetWorldSeed() const { return m_session ? m_session->GetWorldSeed() : 0; }
 
-    // ---- world event relay (over the open PID_USER channel) ----------------
+    // Engine session (custom events for mods, diagnostics). Null outside a match.
+    net::Session* GetSession() const { return m_session.get(); }
 
-    // Broadcasts a shared-world event to all other peers (relayed server-side).
-    // The engine treats the payload as opaque bytes; WorldEventCodec adds the
-    // type tag + origin. Returns false if not in a match or the payload is too
-    // large. This is the mechanism for replicating destructible world state
-    // (broken props, destroyed vehicles, state transitions, coins).
-    //
-    // Events raised before the server WELCOMEs us (a coin picked up on the
-    // spawn point while the join handshake is still in flight) are queued and
-    // flushed from Update() once our peer id is final, so they are neither lost
-    // nor stamped with a provisional origin. The queue is bounded
-    // (kMaxPendingWorldEvents, oldest dropped first).
-    bool SendWorldEvent(net::WorldEventType type, const uint8_t* payload, uint16_t payloadSize)
-    {
-        if (!m_session || !m_session->IsInMatch()) return false;
-        if (payloadSize > net::MAX_PACKET_PAYLOAD - net::WORLD_EVENT_HEADER_SIZE) return false;
-        if (!m_session->IsWelcomed() || !m_pendingWorldEvents.empty())
-        {
-            // Keep ordering: once anything is queued, later events queue too.
-            if (m_pendingWorldEvents.size() >= kMaxPendingWorldEvents)
-                m_pendingWorldEvents.erase(m_pendingWorldEvents.begin());
-            PendingWorldEvent pe;
-            pe.type = type;
-            pe.bytes.assign(payload, payload + payloadSize);
-            m_pendingWorldEvents.push_back(pe);
-            FlushPendingWorldEvents();
-            return true;
-        }
-        return SendWorldEventNow(type, payload, payloadSize);
-    }
-
-    // Number of world events waiting for WELCOME (diagnostics/tests).
-    size_t GetPendingWorldEventCount() const { return m_pendingWorldEvents.size(); }
-
-    // Registers the callback for inbound world events. Receives the decoded
-    // event (type + origin + payload). Self-echo is already filtered by the
-    // session's transport. If the session does not exist yet (e.g. called before
-    // StartHost/JoinHost), the sink is bound once the session is created.
-    void SetWorldEventSink(net::WorldEventCodec::InboundFn fn)
-    {
-        m_worldEventSink = std::move(fn);
-        if (m_session) ReattachWorldEventSink();
-    }
-
-    // Drains the client's pending join/leave notifications. Empty unless we are
-    // a joined client. Lets the UI print "Player connected/disconnected".
+    // Drains pending join/leave notifications (host and joiner) for the UI.
     void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);
 
-    // Drives the network layer + world bridge. Call once per game frame from
-    // the playing context. (World-view interpolation is done by the caller
-    // from GetRemotePlayers(), kept as before for the bridge rollout.)
-    void Update();
+    // Drives the network layer, the world services and the bridge. Call once
+    // per game frame (also while paused, so the connection stays alive).
+    void Update(float dtSeconds = 1.0f / 60.0f);
 
 private:
     NetworkMatchManager();
@@ -148,11 +118,9 @@ private:
     NetworkMatchManager(const NetworkMatchManager&);
     NetworkMatchManager& operator=(const NetworkMatchManager&);
 
-    // Re-binds the (decoded) world-event sink to the session's custom-event
-    // channel. Called after the session is created in StartHost/JoinHost so the
-    // sink works even if SetWorldEventSink() was called before the session
-    // existed.
-    void ReattachWorldEventSink();
+    // Session created: attach the world views, mission channel, replicated
+    // world services and join/leave notifications.
+    void AttachSession();
 
     // Wire the dedicated mission-progress channel (PID_MISSION_STATE):
     // attach the adapter as the session's IMissionStateProvider and register the
@@ -176,50 +144,15 @@ private:
     LocalStateProvider m_localStateProvider;
     MissionStateProvider m_missionStateProvider;
     char m_hostPassword[65];
+    char m_clientPassword[65];
     unsigned short m_hostMaxPlayers;
+    bool m_allowEconomyCheats;
+    bool m_entitiesWelcomed;
 
     // Game-side authoritative remote set, fed by the bridge.
     RemotePlayerManager m_remotePlayers;
-    mutable std::vector<JoinLeaveEvent> m_pendingEvents;
+    std::vector<JoinLeaveEvent> m_pendingEvents;
 
     // Remote players' mission progress, keyed by peer id (PID_MISSION_STATE).
     std::map<int, MissionSyncState> m_remoteMissionStates;
-
-    // Decoded world-event sink (see SetWorldEventSink).
-    net::WorldEventCodec::InboundFn m_worldEventSink;
-
-    // World events raised before WELCOME (see SendWorldEvent).
-    struct PendingWorldEvent
-    {
-        net::WorldEventType  type;
-        std::vector<uint8_t> bytes;
-    };
-    static constexpr const size_t kMaxPendingWorldEvents = 64;
-    std::vector<PendingWorldEvent> m_pendingWorldEvents;
-
-    bool SendWorldEventNow(net::WorldEventType type, const uint8_t* payload, uint16_t payloadSize)
-    {
-        uint8_t buf[net::MAX_PACKET_PAYLOAD];
-        uint16_t n = net::WorldEventCodec::Encode(buf, sizeof(buf), type,
-                                                  static_cast<uint16_t>(GetLocalClientId()),
-                                                  payload, payloadSize);
-        if (n == 0) return false;
-        return m_session->SendCustomEvent(buf, n);
-    }
-
-    // Ships queued events in order once welcomed; stops at the first send
-    // failure so nothing is reordered or lost.
-    void FlushPendingWorldEvents()
-    {
-        if (!m_session || !m_session->IsWelcomed()) return;
-        size_t sent = 0;
-        while (sent < m_pendingWorldEvents.size())
-        {
-            const PendingWorldEvent& pe = m_pendingWorldEvents[sent];
-            const uint8_t* data = pe.bytes.empty() ? nullptr : &pe.bytes[0];
-            if (!SendWorldEventNow(pe.type, data, static_cast<uint16_t>(pe.bytes.size()))) break;
-            ++sent;
-        }
-        m_pendingWorldEvents.erase(m_pendingWorldEvents.begin(), m_pendingWorldEvents.begin() + sent);
-    }
 };

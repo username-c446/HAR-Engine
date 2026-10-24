@@ -55,8 +55,14 @@ public:
     void HUDRender( void ); // Draw any HUD animations.
 
     int GetBankValue( void ) const; // How much is in the bank.
-    void AdjustBankValue( int DeltaCoins ); // Adjust the bank value without any visual SFX.
-    void CollectCoins( int Count ); // Collect coins with sound SFX.
+    // Adjust the bank value without any visual SFX. The applied change is
+    // reported to the server ledger with `netReason` (net::LedgerReason;
+    // kNetReasonBySign = reward if positive, spend if negative) and an optional
+    // claim (unique pickup id).
+    enum { kNetReasonBySign = 0xFF };
+    void AdjustBankValue( int DeltaCoins, unsigned char netReason = kNetReasonBySign, unsigned long long netClaim = 0 );
+    // Collect coins with sound SFX. A permanent world coin passes its claim.
+    void CollectCoins( int Count, unsigned long long netClaim = 0 );
     void LoseCoins( int Count, const rmt::Vector* Position = 0 ); // decrease bank value with visual SFX.
     // spawn coins from this position. If in car, the coin actually just go to the player, unless the Force
     //parameter is true.
@@ -100,13 +106,6 @@ protected:
 	CoinManager& operator=( const CoinManager& That );
 
     void OnVehicleDestroyed( Vehicle* DestroyedVehicle );
-public:
-    // Network mirror of a peer picking up a permanent world coin
-    // (WE_COIN_COLLECTED): marks it collected in the persistent world so it never
-    // respawns here, and makes a currently resting copy spin away. No bank credit
-    // (coins are per player). Returns true if a live coin was removed.
-    bool ApplyRemoteCoinCollected( short persistentId );
-protected:
     struct ActiveCoin;
     void SpawnCoin( ActiveCoin& Coin, const rmt::Vector& Start, float Ground, const rmt::Vector* Direction = 0, bool InstaCollect = false );
     void CheckCollection( ActiveCoin& Coin, const rmt::Vector& AvatarPos, float RangeMultiplier = 1.0f );
@@ -132,6 +131,10 @@ protected:
         };
         
         short PersistentObjectID;
+        // Server ledger claim for a permanent world coin: deterministic id from
+        // its sector and locator position (identical on every client). 0 for
+        // dynamic coins (crates, cars), which are credited without a claim.
+        unsigned long long NetClaim;
         rmt::Vector Position;
         float HeadingCos;
         float HeadingSin;

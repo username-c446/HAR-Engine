@@ -26,6 +26,7 @@
 #include <mission/missionscriptloader.h>
 
 #include <string.h>
+#include <network/NetWorldHooks.h>
 
 //******************************************************************************
 //
@@ -564,7 +565,14 @@ bool RewardsManager::BuyMerchandise(int level,const char* name)
     else
     {
         pMerchandise->UnlockReward();
+        int before = GetCharacterSheetManager()->GetNumberOfTokens((RenderEnums::LevelEnum) level);
         GetCharacterSheetManager()->SubtractTokens((RenderEnums::LevelEnum) level,pMerchandise->GetCost());
+        // Purchases bypass CoinManager: report the spend to the server ledger.
+        int applied = GetCharacterSheetManager()->GetNumberOfTokens((RenderEnums::LevelEnum) level) - before;
+        if (applied != 0)
+        {
+            networld::ReportCoins(net::LR_SPEND, applied);
+        }
         GetCharacterSheetManager()->SetPurchasedRewards( (RenderEnums::LevelEnum) level,index);
         return true;
     }

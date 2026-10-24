@@ -48,6 +48,11 @@
     <ClCompile Include="..\game\netengine\ServerEndpoint.cpp" />
     <ClCompile Include="..\game\netengine\ClientEndpoint.cpp" />
     <ClCompile Include="..\game\netengine\Session.cpp" />
+    <ClCompile Include="..\game\netengine\WorldState.cpp" />
+    <ClCompile Include="..\game\netengine\Ledger.cpp" />
+    <ClCompile Include="..\game\network\NetWorldRegistry.cpp" />
+    <ClCompile Include="..\game\network\NetEntityManager.cpp" />
+    <ClCompile Include="..\game\network\PlayerEconomy.cpp" />
     <ClCompile Include="..\game\netengine\GamePlayerBridge.cpp" />
     <ClCompile Include="..\game\netengine\ENetInit.cpp" />
   </ItemGroup>

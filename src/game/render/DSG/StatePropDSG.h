@@ -57,6 +57,7 @@ class tEntityStore;
 //
 //===========================================================================
 class StatePropDSGProcAnimator;
+namespace net { struct WorldStateValue; }
 
 class StatePropDSG : public DynaPhysDSG, public CStatePropListener 
 {
@@ -139,10 +140,12 @@ class StatePropDSG : public DynaPhysDSG, public CStatePropListener
 
 
         void SetState( int state );
-        // Network mirror of a peer breaking this prop (WE_BREAKABLE): removes it
-        // from the world exactly like the eRemoveFromWorld callback, without
-        // re-broadcasting (the caller holds a net::RemoteWorldEventScope).
+        // Network mirror of a peer breaking this prop (server world state
+        // WOC_BROKEN): removes it from the world exactly like the
+        // eRemoveFromWorld callback. Idempotent.
         void ApplyRemoteBreak();
+        // NetWorldRegistry apply callback (authoritative state -> this prop).
+        static void NetApply( void* handle, unsigned char channel, const net::WorldStateValue& value, bool erased );
         bool HandleEvent( Event );
         unsigned int GetState()const;
         tUID GetStatePropUID()const { return mpStateProp->GetUID(); }
@@ -181,6 +184,9 @@ class StatePropDSG : public DynaPhysDSG, public CStatePropListener
 
         sim::PhysicsObject* mpPhysObj;
         bool m_IsDynaLoaded;
+        // Already removed from the world (locally or by the network); guards
+        // against a second RemoveBrokenObjectFromWorld.
+        bool mNetRemoved;
         // The drawable element index
         StatePropDSGProcAnimator* mpProcAnimator;
         int m_ShadowElement;

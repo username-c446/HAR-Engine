@@ -57,7 +57,6 @@
 #include <worldsim/avatar.h>
 #include <worldsim/character/character.h>
 #include <network/NetworkMatchManager.h>
-#include <network/VehicleWorldEventEmitter.h>
 
 
 #include <choreo/puppet.hpp>
@@ -2699,7 +2698,6 @@ void Vehicle::PostSubstepUpdate(float dt)
                     {
                         // appropriate manager should catch this and swap in husk
                         GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED, (void*)this);
-                        net::EmitVehicleDestroyedWorldEvent(this);
                     }
                 }
                 
@@ -2722,7 +2720,6 @@ void Vehicle::PostSubstepUpdate(float dt)
                     {
                         // appropriate manager should catch this and swap in husk
                         GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED, (void*)this);
-                        net::EmitVehicleDestroyedWorldEvent(this);
                         if(mWasHitByVehicleType != VT_AI)
                         {
                             GetEventManager()->TriggerEvent(EVENT_VEHICLE_DESTROYED_BY_USER, (void*)this);
