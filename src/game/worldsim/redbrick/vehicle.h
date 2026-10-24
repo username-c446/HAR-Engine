@@ -795,6 +795,19 @@ public:
 
     //void TriggerDamage(float amount, int hitJoint);
     float TriggerDamage(float amount, bool clamp = true);  // returns new percentage
+
+    // ---- networked match ----
+    // This machine mirrors another player's car or entity (a kinematic ghost):
+    // its owner simulates and damages it; locally it is never damaged, and a
+    // hit our own vehicle deals to it is forwarded to the owner instead.
+    bool mNetworkGhost;
+    // Owner side: a hit computed by another player's physics against our car
+    // (velocity change from the impulse + damage, normalized like collisions).
+    void ApplyNetworkHit(const rmt::Vector& impulse, float normalizedDamage);
+    // Ghost side: show the owner's damage level (health 1 = intact, 0 = wrecked).
+    void ApplyNetworkDamage(float health);
+    // 1 = intact .. 0 = wrecked.
+    float GetHealthFraction() const;
     bool IsVehicleDestroyed()const { return mVehicleDestroyed; }
 
     bool mVehicleDestroyed;

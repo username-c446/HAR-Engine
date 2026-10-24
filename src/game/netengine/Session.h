@@ -5,37 +5,34 @@
 #endif
 
 #include "Packet.h"
-#include "PacketRegistry.h"
-#include "ServerEndpoint.h"
 #include "ClientEndpoint.h"
+#include "ServerCore.h"
 #include "WorldInterfaces.h"
 #include "WorldState.h"
 #include "Ledger.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
-#include <vector>
 #include <set>
-#include <limits>
+#include <vector>
 
 namespace net
 {
     // net::Session
     // ------------
-    // The match orchestrator. It owns the transport endpoints and a packet
-    // registry, and exposes the match lifecycle (host/join/leave). Crucially it
-    // does NOT know about Avatar / Character / world objects — the world is
-    // attached from outside through small interfaces. That is what makes the
-    // network layer reusable as a standalone engine subsystem.
+    // A participant in a match. It is always a CLIENT of a server; a hosting
+    // session additionally runs the server in-process (an embedded ServerCore,
+    // the very same server the dedicated server product runs) and joins it
+    // through a loopback client like any other peer. So host and joiner share
+    // one client code path, and a hosted match behaves exactly like one on a
+    // dedicated server.
     //
-    // A session is either a Host (owns a ServerEndpoint + its own loopback
-    // client) or a Joiner (one ClientEndpoint). It cannot switch modes without
-    // Leave() first.
+    // It knows nothing about Avatar / Character / world objects: the world is
+    // attached from outside through small interfaces and sinks.
     //
-    // Server-side admission: until a peer is admitted (immediately on an open
-    // host, after a matching PID_AUTH on a protected one) every packet from it
-    // except PID_AUTH is dropped — an unauthenticated client can neither inject
-    // state nor read the world.
+    // Connection: PID_HELLO (protocol + game version + optional password) ->
+    // WELCOME (peer id, server clock, session options) or PID_REFUSE (reason).
     class Session
     {
     public:
@@ -45,108 +42,105 @@ namespace net
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
 
-        // Unity access for the host process. A single session object lives for
-        // the lifetime of the game (mirrors the old NetworkMatchManager
-        // singleton so consumers can ask `Session::Get()->IsInMatch()` without
-        // owning a pointer). Not part of the reusable engine API itself; the
-        // engine works with a constructed Session instance.
-        static Session* Create();
-        static Session* Get();
-        static void     Destroy();
-
         // ---- lifecycle -----------------------------------------------------
 
-        // Bring up a host on `port`. The host also creates a loopback client so
-        // the local player participates like any other peer. Returns false if a
-        // match is already active or the port is taken.
+        // Hosts on `port`: starts the embedded server, then joins it through a
+        // loopback client. False if a match is active or the port is taken.
         bool StartHost(uint16_t port, uint32_t worldSeed);
 
-        // Join an existing host. Returns false if a match is already active.
+        // Joins a server (a hosting game or a dedicated server).
         bool Join(const char* serverIp, uint16_t port);
 
-        // Leave any active match (host or join). Idempotent.
+        // Leaves any active match (stops the embedded server). Idempotent.
         void Leave();
 
-        // Pump both endpoints and deliver inbound packets to their handlers.
-        // Call once per game frame.
+        // Pumps the server (when hosting) and the client. Once per frame.
         void Update();
 
         // ---- match state ---------------------------------------------------
 
-        bool IsInMatch() const { return m_server != nullptr || m_client != nullptr; }
-        bool IsHost()   const { return m_server != nullptr; }
+        bool IsInMatch() const { return m_core.IsRunning() || m_client != nullptr; }
+        bool IsHost()   const { return m_core.IsRunning(); }
         bool IsJoined() const { return m_client != nullptr && m_client->IsConnected(); }
         PeerId GetLocalPeerId() const { return m_selfId; }
         // True once the server has welcomed our client (our peer id is final).
-        // Before that, reliable requests (world state, ledger) are queued.
+        // Before that, reliable requests (world state, ledger, events) queue.
         bool IsWelcomed() const { return m_welcomed; }
         uint32_t GetWorldSeed() const { return m_worldSeed; }
 
-        // Blood metro config: the set of peers currently in the match, NOT
-        // including ourselves (the server-authoritative roster). Host and
-        // joiner both keep it.
+        // The other peers in the match (server-authoritative roster).
         const std::set<PeerId>& GetPeerRoster() const { return m_peerRoster; }
 
-        // ---- authentication / protection ------------------------------------
+        // Why the server refused us (REFUSE_NONE if it did not). A refused
+        // session has left the match.
+        RefuseReason GetRefusal() const { return m_refusal; }
+        // True when an established connection dropped (server gone / kicked
+        // without a reason). The caller should Leave().
+        bool IsConnectionLost() const { return m_connectionLost; }
 
-        // Password-protected host: clients must present the matching password
-        // (PID_AUTH) before the host welcomes them. A host with a password does
-        // NOT send WELCOME/WORLD_SEED until the client authenticates. Joiner
-        // side must call SetPassword() with the host's password before/after
-        // Join(), and presents it automatically once the host asks for it.
-        // Authorization is OPTIONAL and off by default: with no password the
-        // session is open (co-op / session games) and peers are admitted on
-        // connect without any extra round trip. Setting a password turns the
-        // PID_AUTH gate on for the next StartHost().
-        void SetHostPassword(const char* password);
-        bool HasHostPassword() const { return m_hostPassword[0] != '\0'; }
+        // ---- time ------------------------------------------------------------
 
-        // Client-side password presented to the host on request. Set before the
-        // host requires it; the session stores it and answers PID_AUTH demands.
-        void SetPassword(const char* password) { SetClientPassword(password); }
+        // Server clock estimate (ms), seeded by WELCOME, refined by PING/PONG.
+        bool     IsClockSynced() const { return m_client && m_client->IsClockSynced(); }
+        uint32_t ServerTimeMs() const { return m_client ? m_client->ServerTimeMs() : 0; }
+        uint32_t GetRttMs() const { return m_client ? m_client->GetRttMs() : 0; }
 
-        // Slot cap applied by the next StartHost() (the host's own loopback
-        // client takes one slot). 0 = default (kDefaultMaxPeers).
-        static constexpr const size_t kDefaultMaxPeers = 32;
-        void SetMaxPeers(size_t n) { m_maxPeers = n ? n : kDefaultMaxPeers; }
+        // ---- admission / server configuration ----------------------------------
 
-        // Server-authoritative validation hook for relayed state. If set, every
-        // inbound player state from a remote peer is passed through the
-        // validator BEFORE being broadcast; a rejected state is dropped (the
-        // last accepted state stays authoritative). Usable to implement
-        // anti-teleport / plausibility checks without coupling the session to
-        // the game's world types.
-        void SetStateValidator(IStateValidator* v) { m_validator = v; }
+        // Optional authorization (off by default): with no password a hosted
+        // session is open (co-op / session games). Applies to the next StartHost.
+        void SetHostPassword(const char* password) { m_core.SetPassword(password); }
+        bool HasHostPassword() const { return m_core.HasPassword(); }
 
-        // Session-level lifecycle events surfaced to the game, so the caller
-        // :=ws without reaching into ENet or the registry.
+        // Password presented in PID_HELLO when joining a protected server.
+        void SetPassword(const char* password);
+
+        // Game content version: presented when joining and, when hosting,
+        // required from joiners (0 = not checked).
+        void SetGameVersion(uint32_t v) { m_gameVersion = v; m_core.SetGameVersion(v); }
+
+        // Slot cap of a hosted session (the host's own loopback takes one slot).
+        static constexpr const size_t kDefaultMaxPeers = ServerCore::kDefaultMaxPeers;
+        void SetMaxPeers(size_t n) { m_core.SetMaxPeers(n); }
+
+        // Server-side plausibility gate for relayed player state (hosting).
+        void SetStateValidator(IStateValidator* v) { m_core.SetStateValidator(v); }
+
+        // The embedded server (hosting): configure counters, rate limits,
+        // admission filter, options... Not running while joined elsewhere.
+        ServerCore&       GetServerCore() { return m_core; }
+        const ServerCore& GetServerCore() const { return m_core; }
+
+        // Peers joining / leaving, as seen by THIS client (from the server's
+        // player list; same on host and joiner). Our own id is never reported.
         using JoinLeaveFn = std::function<void(PeerId, bool /*joined*/)>;
         void SetJoinLeaveFn(JoinLeaveFn fn) { m_joinLeave = std::move(fn); }
 
-        // ---- world attachment (keeps the session world-agnostic) ----------
+        // Session options announced by the server (SessionOption bits).
+        uint32_t GetSessionOptions() const { return m_sessionOptions; }
+        // Hosting: changes the options for everybody.
+        void SetSessionOptions(uint32_t options) { m_core.SetSessionOptions(options); }
+        using SessionOptionsFn = std::function<void(uint32_t options)>;
+        void SetSessionOptionsFn(SessionOptionsFn fn) { m_sessionOptionsFn = std::move(fn); }
 
-        // The session asks this provider for the local player's current state
-        // every broadcast tick and ships it to peers. May be null (idle).
+        // ---- player state stream (PID_PLAYER_STATE) -----------------------------
+
         void SetLocalStateProvider(ILocalStateProvider* p) { m_localState = p; }
-        // The session delivers every remote player's state blob to this sink.
         void SetRemoteStateSink(IRemoteStateSink* s) { m_remoteSink = s; }
+        // Send period of the local state (default 100 ms; 0 = every Update).
+        void SetStateSendIntervalMs(uint32_t ms) { m_stateIntervalMs = ms; }
+        // The server's validator refused our state: snap the local player to
+        // this blob (same format as the state stream).
+        using StateCorrectionFn = std::function<void(const uint8_t* data, uint16_t size)>;
+        void SetStateCorrectionSink(StateCorrectionFn fn) { m_correctionSink = std::move(fn); }
 
-        // Broadcast cadence for local state. Default every 6th Update (~10 Hz).
-        void SetStateSendEvery(unsigned n) { m_stateSendEvery = (n > 0) ? n : 1; }
+        // ---- mission progress stream (PID_MISSION_STATE) -------------------------
 
-        // ---- dedicated mission-progress channel (PID_MISSION_STATE) -------
-
-        // The session asks this provider for the local mission-progress blob and
-        // ships it to peers on its own (slower) cadence. May be null (idle).
         void SetMissionStateProvider(IMissionStateProvider* p) { m_missionState = p; }
-        // The session delivers remote mission-progress blobs to this sink.
         using MissionStateFn = std::function<void(PeerId from, const uint8_t* data, uint16_t size)>;
         void SetMissionStateSink(MissionStateFn fn) { m_missionSink = std::move(fn); }
-
-        // Broadcast cadence for mission progress, in Update frames: mission is sent
-        // every m_missionSendEvery frames. Default 18 (≈ every 3rd player-state
-        // send at the default 6-frame state cadence, ~3.3 Hz at 60 fps).
-        void SetMissionSendEvery(unsigned n) { m_missionSendEvery = (n > 0) ? n : 1; }
+        // Send period of the mission progress (default 300 ms; 0 = every Update).
+        void SetMissionSendIntervalMs(uint32_t ms) { m_missionIntervalMs = ms; }
 
         // ---- replicated world state (WorldState.h) -------------------------
 
@@ -163,131 +157,119 @@ namespace net
         // until WELCOME. Returns false outside a match or for a malformed op.
         bool RequestWorldState(const WorldStateOp& op);
         const WorldStateMirror& GetWorldStateMirror() const { return m_worldMirror; }
-        const WorldStateTable&  GetWorldStateTable()  const { return m_worldTable; } // server side
+        const WorldStateTable&  GetWorldStateTable()  const { return m_core.GetWorldStateTable(); } // hosting
 
         // ---- server-authoritative counters (Ledger.h) ----------------------
 
-        // Server-side counter rules (host or dedicated server). Kept across
-        // matches; configure before or after StartHost.
-        void ConfigureCounter(CounterId counter, const CounterConfig& cfg) { m_ledgerServer.Configure(counter, cfg); }
+        // Server-side counter rules of a hosted session (kept across matches).
+        void ConfigureCounter(CounterId counter, const CounterConfig& cfg) { m_core.ConfigureCounter(counter, cfg); }
         // Outcome of each of our own requests (roll back !accepted deltas).
         using LedgerFn = std::function<void(const LedgerOutcome&)>;
         void SetLedgerSink(LedgerFn fn) { m_ledgerSink = std::move(fn); }
         // Requests a predicted change. Queued until WELCOME.
         bool RequestLedgerChange(CounterId counter, uint8_t reason, int32_t delta, uint64_t claim);
         const LedgerClient& GetLedger() const { return m_ledgerClient; }
-        const LedgerServer& GetLedgerServer() const { return m_ledgerServer; }
+        const LedgerServer& GetLedgerServer() const { return m_core.GetLedgerServer(); }
 
         // ---- owner-streamed dynamic entities (PID_ENTITY_STATE) ------------
 
         // Streams state for entities we own (their WS_CHANNEL_ENTITY record must
-        // be ours; the server drops other records). Batched into packets.
+        // be ours; the server drops other records). Batched, timestamped.
         bool SendEntityStates(const std::vector<EntityStateRecord>& records);
-        using EntityStateFn = std::function<void(PeerId owner, const EntityStateRecord& rec)>;
+        using EntityStateFn = std::function<void(PeerId owner, const EntityStateRecord& rec, uint32_t serverTimeMs)>;
         void SetEntityStateSink(EntityStateFn fn) { m_entitySink = std::move(fn); }
+
+        // ---- events aimed at an entity / another player ------------------------
+
+        // A hit / impulse / damage on an entity someone else owns. The server
+        // delivers it to the owner only. Payload <= kMaxEventPayload.
+        static constexpr const uint16_t kMaxEventPayload = 64;
+        bool SendEntityEvent(uint64_t entity, uint8_t kind, const uint8_t* data, uint16_t size);
+        using EntityEventFn = std::function<void(PeerId from, uint64_t entity, uint8_t kind,
+                                                 const uint8_t* data, uint16_t size)>;
+        void SetEntityEventSink(EntityEventFn fn) { m_entityEventSink = std::move(fn); }
+
+        // A hit on another player (relayed only with SO_PVP).
+        bool SendPlayerEvent(PeerId target, uint8_t kind, const uint8_t* data, uint16_t size);
+        using PlayerEventFn = std::function<void(PeerId from, uint8_t kind, const uint8_t* data, uint16_t size)>;
+        void SetPlayerEventSink(PlayerEventFn fn) { m_playerEventSink = std::move(fn); }
 
         // ---- open user-data channel (0x8000+) -------------------------------
 
-        // Callback for inbound custom events. `from` is the originating peer;
-        // on a host session the event is relayed from a remote client, on a
-        // joiner it comes straight from the server. Self-echo is filtered.
+        // Inbound user packets from other peers (both PID_USER and PID_USER_STREAM).
         using CustomEventFn = std::function<void(PeerId from, const uint8_t* data, uint16_t size)>;
         void SetCustomEventSink(CustomEventFn fn) { m_customEvent = std::move(fn); }
 
-        // Ships an opaque payload to all other peers in the match (relayed
-        // server-side). The engine never interprets the bytes. Returns false if
-        // not in a match or the payload exceeds MAX_PACKET_PAYLOAD.
-        bool SendCustomEvent(const uint8_t* data, uint16_t size);
+        // Ships an opaque payload to all other peers. `stream` = unreliable-
+        // sequenced (only the newest matters), otherwise reliable-ordered.
+        bool SendCustomEvent(const uint8_t* data, uint16_t size, bool stream = false);
 
     private:
-        // Server-side packet / peer handling (shared by every host session).
-        void OnServerPacket(const ServerEndpoint::RawPacket& rp);
-        void OnServerPeerEvent(const PeerEvent& e);
-        bool IsAdmitted(PeerId peer) const { return m_admitted.count(peer) != 0; }
-        void AdmitPeer(PeerId peer);
-        void SendWorldSnapshot(PeerId peer);
-        void HandleWorldStateRequest(PeerId from, const uint8_t* data, uint16_t size);
-        void HandleLedgerRequest(PeerId from, const uint8_t* data, uint16_t size);
-        void RelayEntityStates(PeerId from, const uint8_t* data, uint16_t size);
-        void Relay(PacketId id, PeerId from, const uint8_t* data, uint16_t size);
-
-        // Client-side packet handling (host loopback and joiner alike).
         void OnClientPacket(const ClientEndpoint::RawPacket& rp);
+        void ApplyPlayerList(const uint8_t* data, uint16_t size);
+        void ResetClientState();
+        void EndMatch(bool notify = true);
 
+        void SendHelloIfDue();
         // Reliable client->server requests queued until WELCOME (bounded).
         void SendToServerWhenWelcomed(PacketId id, const uint8_t* data, uint16_t size);
         void FlushOutbox();
-
-        // Sends the local player's state (from m_localState) to all peers.
+        // Stream packets: [u32 server time][payload].
+        bool SendStream(PacketId id, const uint8_t* data, uint16_t size);
         void SendLocalStateIfDue();
-        // Delivers an inbound state packet to m_remoteSink.
-        void HandleRemoteState(PeerId from, const uint8_t* data, uint16_t size);
-        // Sends the local mission-progress blob (from m_missionState) to all
-        // peers, on the slower frame-based mission cadence.
         void SendMissionStateIfDue();
-        // Delivers an inbound mission-state packet to m_missionSink.
-        void HandleRemoteMissionState(PeerId from, const uint8_t* data, uint16_t size);
-        // Presents the client-side password to the host once the ENet peer is
-        // up (and only once). No-op when absent or already sent.
-        void SendAuthIfDue();
-        // Transport instances (composed). A host holds a server + loopback client.
-        std::unique_ptr<ServerEndpoint> m_server;
+
+        ServerCore                      m_core;   // running only while hosting
         std::unique_ptr<ClientEndpoint> m_client;
-        PacketRegistry                  m_registry;
 
         PeerId       m_selfId   = 0;
-        bool         m_welcomed = false; // WELCOME received on the client side
+        bool         m_welcomed = false;
+        bool         m_helloSent = false;
+        bool         m_wasReady = false;
+        bool         m_connectionLost = false;
+        RefuseReason m_refusal = REFUSE_NONE;
+        RefuseReason m_pendingRefusal = REFUSE_NONE; // seen in the packet handler
         uint32_t     m_worldSeed = 0;
-        uint16_t     m_port     = 0;
-        size_t       m_maxPeers = kDefaultMaxPeers;
-        JoinLeaveFn  m_joinLeave;
-        // Kept apart on purpose: a host is both server and (loopback) client, and
-        // the client view excludes itself, so one shared set would "un-admit"
-        // the host's own loopback peer on every PLAYER_LIST.
-        std::set<PeerId> m_admitted;    // server: peers allowed in
-        std::set<PeerId> m_peerRoster;  // client: the other peers in the match
+        uint32_t     m_sessionOptions = SO_NONE;
+        uint32_t     m_gameVersion = 0;
+        char         m_password[HandshakeCodec::kMaxPassword + 1] = { 0 };
+        std::set<PeerId> m_peerRoster;
 
-        // Authentication / validation state.
-        char         m_hostPassword[65] = { 0 };   // host-side required password ("" = open)
-        char         m_clientPassword[65] = { 0 }; // client-side presented password
-        bool         m_authSent = false;           // client-side PID_AUTH already delivered
-        IStateValidator* m_validator = nullptr;    // optional state plausibility hook
+        JoinLeaveFn      m_joinLeave;
+        SessionOptionsFn m_sessionOptionsFn;
 
-        // World attachment (may be null when world not wired, e.g. dedicated relay).
-        ILocalStateProvider* m_localState = nullptr;
-        IRemoteStateSink*    m_remoteSink = nullptr;
-        CustomEventFn        m_customEvent;   // open user-data channel sink
-        unsigned             m_stateSendEvery = 6;
-        unsigned             m_stateTick     = 0;
-        uint8_t              m_stateScratch[MAX_PACKET_PAYLOAD];
-
-        // Dedicated mission-progress channel (PID_MISSION_STATE).
+        // Player / mission streams.
+        ILocalStateProvider*   m_localState = nullptr;
+        IRemoteStateSink*      m_remoteSink = nullptr;
+        StateCorrectionFn      m_correctionSink;
+        uint32_t               m_stateIntervalMs = 100;
+        uint32_t               m_lastStateSendMs = 0;
+        bool                   m_stateSentOnce = false;
         IMissionStateProvider* m_missionState = nullptr;
-        MissionStateFn         m_missionSink;  // inbound mission-progress sink
-        unsigned               m_missionSendEvery = 18; // update frames between mission sends
-        unsigned               m_missionTick = 0;
-        uint8_t                m_missionScratch[MAX_PACKET_PAYLOAD];
+        MissionStateFn         m_missionSink;
+        uint32_t               m_missionIntervalMs = 300;
+        uint32_t               m_lastMissionSendMs = 0;
+        bool                   m_missionSentOnce = false;
+        uint8_t                m_scratch[MAX_PACKET_PAYLOAD];
 
-        // Replicated world state.
-        WorldStateTable  m_worldTable;   // server: authoritative
-        WorldStateMirror m_worldMirror;  // client: confirmed mirror + predictions
+        // Replicated world state (client mirror).
+        WorldStateMirror m_worldMirror;
         WorldStateFn     m_worldSink;
         WorldSyncedFn    m_worldSynced;
 
-        // Counters / economy.
-        LedgerServer m_ledgerServer;
+        // Counters.
         LedgerClient m_ledgerClient;
         LedgerFn     m_ledgerSink;
 
-        // Owner-streamed entities.
+        // Entities / events / user data.
         EntityStateFn m_entitySink;
+        EntityEventFn m_entityEventSink;
+        PlayerEventFn m_playerEventSink;
+        CustomEventFn m_customEvent;
 
         // Client->server reliable requests waiting for WELCOME.
         struct Outgoing { PacketId id; std::vector<uint8_t> bytes; };
         static constexpr const size_t kMaxOutbox = 256;
         std::vector<Outgoing> m_outbox;
-
-        // Client-side password setter (no-op on a host).
-        void SetClientPassword(const char* password);
     };
 }

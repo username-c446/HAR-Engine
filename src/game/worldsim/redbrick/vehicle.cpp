@@ -106,6 +106,7 @@
 #include <camera/supercamcentral.h>
 
 #include <presentation/gui/guisystem.h>
+#include <network/NetWorldHooks.h>
 
 using namespace sim;
 
@@ -4639,6 +4640,38 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
         rAssert(0);
     }
 
+    // Networked match: a ghost is simulated by its owner. A hit OUR vehicle
+    // deals to it goes to the owner (who applies it to the real car, and the
+    // result streams back); ghosts colliding with each other are the owners'
+    // business. Either way nothing is damaged here.
+    if( mNetworkGhost )
+    {
+        if( simStateA->mAIRefIndex == PhysicsAIRef::redBrickVehicle &&
+            simStateB->mAIRefIndex == PhysicsAIRef::redBrickVehicle )
+        {
+            Vehicle* other = ( simStateA->mAIRefPointer == this ) ? (Vehicle*)simStateB->mAIRefPointer
+                                                                  : (Vehicle*)simStateA->mAIRefPointer;
+            if( other != NULL && other != this && !other->mNetworkGhost )
+            {
+                // Impulse on this ghost: away from the other car.
+                rmt::Vector away = GetPosition() - other->GetPosition();
+                rmt::Vector applied = impulse;
+                if( applied.Dot( away ) < 0.0f )
+                {
+                    applied.Scale( -1.0f );
+                }
+                net::NetEntityHit hit;
+                hit.ix = applied.x; hit.iy = applied.y; hit.iz = applied.z;
+                const rmt::Vector& p = inCollision.GetPositionA();
+                hit.px = p.x; hit.py = p.y; hit.pz = p.z;
+                float dmg = normalizedMagnitude * 255.0f;
+                hit.damage = static_cast<unsigned char>( dmg > 255.0f ? 255.0f : dmg );
+                networld::ReportGhostHit( this, hit );
+            }
+        }
+        return sim::Solving_Continue;
+    }
+
 
 	if(mVehicleID == VehicleEnum::HUSKA)
     {
@@ -5060,6 +5093,63 @@ sim::Solving_Answer Vehicle::PostReactToCollision(rmt::Vector& impulse, sim::Col
     
     return sim::Solving_Continue;   
     
+}
+
+//=============================================================================
+// Vehicle::ApplyNetworkHit / ApplyNetworkDamage / GetHealthFraction
+//=============================================================================
+void Vehicle::ApplyNetworkHit(const rmt::Vector& impulse, float normalizedDamage)
+{
+    if( mNetworkGhost || mVehicleDestroyed )
+    {
+        return;
+    }
+    float mass = GetMass();
+    if( mass > 0.0f && mSimStateArticulated != NULL )
+    {
+        rmt::Vector dv = impulse;
+        dv.Scale( 1.0f / mass );
+        rmt::Vector& linearVel = mSimStateArticulated->GetLinearVelocity();
+        linearVel.Add( dv );
+    }
+    if( normalizedDamage <= 0.0f || !mVehicleCanSustainDamage )
+    {
+        return;
+    }
+    if( normalizedDamage > 1.0f )
+    {
+        normalizedDamage = 1.0f;
+    }
+    float perc = TriggerDamage( normalizedDamage );
+    switch( mDamageType )
+    {
+        case VDT_USER:    VisualDamageType1( 1.0f - perc, dl_hood ); break;
+        case VDT_AI:      VisualDamageType2( 1.0f - perc, dl_hood ); break;
+        case VDT_TRAFFIC: VisualDamageType3( 1.0f - perc ); break;
+        default: break;
+    }
+}
+
+void Vehicle::ApplyNetworkDamage(float health)
+{
+    // Only ever more damage (repairs come with a respawned machine); the
+    // destroyed state itself rides the explosion flag.
+    if( health <= 0.0f || health >= GetHealthFraction() )
+    {
+        return;
+    }
+    mHitPoints = health * mDesignerParams.mHitPoints;
+    SyncVisualDamage( health );
+}
+
+float Vehicle::GetHealthFraction() const
+{
+    if( mDesignerParams.mHitPoints <= 0.0f )
+    {
+        return 1.0f;
+    }
+    float h = mHitPoints / mDesignerParams.mHitPoints;
+    return h < 0.0f ? 0.0f : ( h > 1.0f ? 1.0f : h );
 }
 
 //=============================================================================

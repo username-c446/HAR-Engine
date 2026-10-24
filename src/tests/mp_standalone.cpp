@@ -1,23 +1,18 @@
-// Standalone multiplayer headless test stand / dedicated server.
+// Headless multiplayer test client.
 //
-// Runs the engine network layer (net::Session / GamePlayerBridge, ENet, no game
-// data needed) between two live processes, so the network layer is exercised
-// over actual sockets — the thing the in-process unit tests cannot cover.
+// Runs the engine client (net::Session / GamePlayerBridge, ENet, no game data)
+// against a real server over sockets: a hosting game or the dedicated server
+// (src/server, har_server). The in-process unit tests cannot cover that.
 //
 // Usage:
-//   mp_standalone server [port] [--mod <lua-path>]
-//   mp_standalone host [port]
-//   mp_standalone join <hostIp> [port]
+//   mp_standalone join <hostIp> [port] [--password <pw>]
+//   mp_standalone genui [out.p3d]
 //
-//   server -> pure console dedicated server (no window, no gameplay). Loads a
-//             server-side Lua mod if --mod is given. Prints connect/disconnect.
-//   host   -> starts a server, prints each connected client, and waits forever.
-//   join   -> connects to the host, sends a fake moving state ~10/s, and applies
-//             the server-authoritative player list.
+//   join  -> connects, sends a fake moving state ~10/s, prints the remote
+//            players and the late-join world snapshot it receives.
+//   genui -> writes a Scrooby lobby screen with P3DWriter.
 //
-// The mock in mp_network_fakes.h supplies the world hooks the engine normally
-// wires up (local state provider + remote player world sink), so this builds
-// and runs standalone.
+// The dedicated server itself is the har_server product (no fakes).
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -25,8 +20,6 @@
 #include "p3d/p3dwriter.h"
 
 #include "mp_network_fakes.h"
-#include "ServerModManager.h"   // live server-side Lua event bus (--mod)
-#include "EconomyConfig.h"      // server-side counter rules shared with the game
 
 // Simple game-side typed local provider: a slowly-advancing fake position.
 static struct {
@@ -44,125 +37,27 @@ static bool FakeLocalState(PlayerNetworkState& out)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        printf("usage:\n  mp_standalone server [port] [--mod <lua>] [--password <pw>] [--max <slots>] [--log <file>]\n"
-               "  mp_standalone host [port] [--password <pw>] [--max <slots>] [--log <file>]\n"
-               "  mp_standalone join <hostIp> [port] [--password <pw>]\n"
+        printf("usage:\n  mp_standalone join <hostIp> [port] [--password <pw>]\n"
                "  mp_standalone genui [out.p3d]\n"
-               "  (default port 3737)\n");
+               "  (default port 3737; the dedicated server is har_server)\n");
         return 1;
     }
 
     const char* mode = argv[1];
     unsigned short port = 3737;
-    const char* modPath = NULL;
     const char* password = NULL;
-    unsigned short maxPlayers = 0;
-    const char* logPath = NULL;
 
-    // Parse [port] [--mod path] [--password pw] [--max n] [--log path]
-    // generically for server/host modes.
-    for (int i = 2; i < argc; ++i) {
-        if (strcmp(argv[i], "--mod") == 0 && i + 1 < argc) {
-            modPath = argv[i + 1];
-            ++i;
-        } else if (strcmp(argv[i], "--password") == 0 && i + 1 < argc) {
+    // Parse [port] [--password pw].
+    for (int i = 3; i < argc; ++i) {
+        if (strcmp(argv[i], "--password") == 0 && i + 1 < argc) {
             password = argv[i + 1];
-            ++i;
-        } else if (strcmp(argv[i], "--max") == 0 && i + 1 < argc) {
-            maxPlayers = static_cast<unsigned short>(atoi(argv[i + 1]));
-            ++i;
-        } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
-            logPath = argv[i + 1];
             ++i;
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             port = static_cast<unsigned short>(atoi(argv[i]));
         }
     }
 
-    if (strcmp(mode, "server") == 0 || strcmp(mode, "host") == 0) {
-        net::Session server;
-        if (password != NULL && password[0] != '\0') server.SetHostPassword(password);
-        // Slots for remote players; the server's own loopback client takes one more.
-        if (maxPlayers > 0) server.SetMaxPeers(static_cast<size_t>(maxPlayers) + 1);
-        // Same economy rules as a hosting game (EconomyConfig.h).
-        server.ConfigureCounter(economy::COUNTER_COINS, economy::MakeCoinConfig(false));
-        // Log authoritative world-state traffic (seen through the loopback client)
-        // so cross-process tests can verify replication and late-join snapshots.
-        server.SetWorldStateSink([](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId origin) {
-            printf("[host] world-state %s obj=%016llx ch=%u owner=%u origin=%u len=%u\n",
-                   reason == net::WSR_ERASED ? "erase" : "set",
-                   (unsigned long long)e.key.object, (unsigned)e.key.channel,
-                   (unsigned)e.owner, (unsigned)origin, (unsigned)e.value.len);
-            fflush(stdout);
-        });
-        // Log inbound user-data events (PID_USER) so we can verify the open
-        // custom-event channel over real sockets between two processes.
-        server.SetCustomEventSink([](net::PeerId from, const uint8_t* d, uint16_t size) {
-            printf("[%s] custom-event from peer %u, %u bytes, first=0x%02x\n",
-                   (const char*) ( "host" ), (unsigned)from, (unsigned)size,
-                   size ? d[0] : 0);
-            fflush(stdout);
-        });
-        if (!server.StartHost(port, 0x5EED0000u | static_cast<uint32_t>(port))) {
-            printf("[%s] failed to start on port %u\n", mode, port);
-            return 2;
-        }
-        if (modPath != NULL) {
-            // Live server-side Lua mod: load it into ServerModManager and, once
-            // a client connects, emit a real event through the session loop so
-            // the event bus is exercised in a running process (not just tests).
-            ServerModManager liveMod;
-            if (liveMod.LoadScript(modPath)) {
-                printf("[%s] loaded Lua mod: %s\n", mode, modPath);
-                fflush(stdout);
-                server.SetJoinLeaveFn([&liveMod](net::PeerId p, bool joined) {
-                    if (joined) {
-                        int ev = static_cast<int>(p);
-                        liveMod.Emit("player.joined", &ev, 1);
-                    }
-                });
-            } else {
-                printf("[%s] WARNING: failed to load Lua mod: %s\n", mode, modPath);
-                fflush(stdout);
-            }
-        }
-        else if (strcmp(mode, "server") != 0) { (void)0; }
-        fflush(stdout);
-        printf("[%s] listening on %u. connect with mp_standalone join ...\n", mode, port);
-        fflush(stdout);
-
-        // Optional file log: write one line per notable server event.
-        FILE* logfile = NULL;
-        if (logPath != NULL && logPath[0] != '\0') {
-            logfile = fopen(logPath, "a");
-            if (logfile != NULL) {
-                fprintf(logfile, "=== mp dedicated server started on port %u%s%s ===\n",
-                        port,
-                        password != NULL && password[0] != '\0' ? " (password protected)" : "",
-                        maxPlayers > 0 ? " (slots configured)" : "");
-                fflush(logfile);
-            } else {
-                printf("[%s] WARNING: cannot open log file: %s\n", mode, logPath);
-            }
-        }
-
-        int lastCount = 0;
-        for (;;) {
-            server.Update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // do not spin a core
-            int count = server.GetPeerRoster().size();
-            if (count != lastCount) {
-                printf("[%s] clients in world: %d\n", mode, count);
-                fflush(stdout);
-                if (logfile != NULL) {
-                    fprintf(logfile, "clients:%d\n", count);
-                    fflush(logfile);
-                }
-                lastCount = count;
-            }
-        }
-    }
-    else if (strcmp(mode, "join") == 0) {
+    if (strcmp(mode, "join") == 0) {
         const char* ip = argv[2];
         net::Session client;
         if (password != NULL && password[0] != '\0') client.SetPassword(password);

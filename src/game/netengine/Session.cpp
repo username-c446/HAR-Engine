@@ -1,96 +1,68 @@
 #include "Session.h"
 
+#include <cstring>
+
 namespace net
 {
-    // One process-level Session instance for the game (see Session.h).
-    static Session* s_session = nullptr;
-
-    Session* Session::Create()
-    {
-        if (s_session == nullptr)
-            s_session = new Session();
-        return s_session;
-    }
-    Session* Session::Get()
-    {
-        return s_session;
-    }
-    void Session::Destroy()
-    {
-        delete s_session;
-        s_session = nullptr;
-    }
-
-    Session::Session() = default;
-    Session::~Session() { Leave(); }
-
     namespace
     {
-        // Pack/unpack helpers use the reserved-range ids defined in Packet.h.
-        constexpr const PacketId kIdWelcome    = PID_WELCOME;
-        constexpr const PacketId kIdSeed       = PID_WORLD_SEED;
-        constexpr const PacketId kIdPlayerList = PID_PLAYER_LIST;
-        constexpr const PacketId kIdState      = PID_PLAYER_STATE;
-        constexpr const PacketId kIdMission    = PID_MISSION_STATE;
-        constexpr const PacketId kIdEntity     = PID_ENTITY_STATE;
-        constexpr const PacketId kIdAuth       = PID_AUTH;
-        constexpr const PacketId kIdUser       = PID_USER;
-
-        inline void WriteU16Le(uint8_t* d, uint16_t v)
-        {
-            d[0] = static_cast<uint8_t>(v & 0xFF);
-            d[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-        }
         inline uint16_t ReadU16Le(const uint8_t* d)
         {
             return static_cast<uint16_t>(d[0]) | static_cast<uint16_t>(d[1]) << 8;
         }
+        inline uint32_t ReadU32Le(const uint8_t* d)
+        {
+            return static_cast<uint32_t>(d[0]) | static_cast<uint32_t>(d[1]) << 8
+                 | static_cast<uint32_t>(d[2]) << 16 | static_cast<uint32_t>(d[3]) << 24;
+        }
+        // Relayed stream framing (ServerCore): [u16 from][u32 time][payload].
+        constexpr const uint16_t kRelayHeader = ServerCore::kStreamRelayHeader;
     }
+
+    Session::Session() = default;
+    // Silent teardown: the sinks the game attached may already be gone, so a
+    // destroyed session reports nothing (Leave() does, explicitly).
+    Session::~Session() { EndMatch(false); }
 
     // =====================================================================
     // lifecycle
     // =====================================================================
 
+    void Session::ResetClientState()
+    {
+        m_selfId = 0;
+        m_welcomed = false;
+        m_helloSent = false;
+        m_wasReady = false;
+        m_connectionLost = false;
+        m_refusal = REFUSE_NONE;
+        m_pendingRefusal = REFUSE_NONE;
+        m_worldSeed = 0;
+        m_sessionOptions = SO_NONE;
+        m_peerRoster.clear();
+        m_worldMirror.Clear();
+        m_ledgerClient.Clear();
+        m_outbox.clear();
+        m_stateSentOnce = false;
+        m_missionSentOnce = false;
+    }
+
     bool Session::StartHost(uint16_t port, uint32_t worldSeed)
     {
         if (IsInMatch()) return false;
+        if (!m_core.Start(port, worldSeed)) return false;
 
-        auto server = std::make_unique<ServerEndpoint>();
-        if (!server->Start(port, static_cast<uint16_t>(m_maxPeers))) return false;
-
+        // The host is a client of its own server: same handshake (the host's
+        // password, if any, is presented like any joiner's).
         auto client = std::make_unique<ClientEndpoint>();
         if (!client->Connect("127.0.0.1", port))
         {
-            server->Stop();
+            m_core.Stop();
             return false;
         }
-
-        m_server    = std::move(server);
-        m_client    = std::move(client);
+        ResetClientState();
+        m_client = std::move(client);
         m_worldSeed = worldSeed;
-        m_port      = port;
-        m_selfId    = 0; // resolved on WELCOME
-        m_welcomed  = false;
-        m_peerRoster.clear();
-        m_admitted.clear();
-        m_worldTable.Clear();
-        m_worldMirror.Clear();
-        m_ledgerServer.Clear();
-        m_ledgerClient.Clear();
-        m_outbox.clear();
-
-        // A password-protected host's own loopback client must authenticate to
-        // its own server like any other peer. Seed the client-side password
-        // with the host password so the host can actually participate; the
-        // actual PID_AUTH is delivered by SendAuthIfDue() once the loopback
-        // connection is up (sending it here, before the handshake, could drop
-        // the payload and strand the host).
-        m_authSent = false;
-        if (m_hostPassword[0] != '\0')
-            SetClientPassword(m_hostPassword);
-
-        m_server->SetPacketSink([this](const ServerEndpoint::RawPacket& rp) { OnServerPacket(rp); });
-        m_server->SetPeerEventFn([this](const PeerEvent& e) { OnServerPeerEvent(e); });
         m_client->SetPacketSink([this](const ClientEndpoint::RawPacket& rp) { OnClientPacket(rp); });
         return true;
     }
@@ -98,353 +70,165 @@ namespace net
     bool Session::Join(const char* serverIp, uint16_t port)
     {
         if (IsInMatch()) return false;
-
         auto client = std::make_unique<ClientEndpoint>();
         if (!client->Connect(serverIp, port)) return false;
-
+        ResetClientState();
         m_client = std::move(client);
-        m_port = port;
-        m_worldSeed = 0;
-        m_selfId = 0;
-        m_welcomed = false;
-        m_peerRoster.clear();
-        m_worldMirror.Clear();
-        m_ledgerClient.Clear();
-        m_outbox.clear();
-        m_authSent = false;
-
-        // The client-side password (SetPassword) is presented the moment the
-        // ENet connection is up. We do NOT send it here: SendTo before the
-        // handshake completes can drop the payload, leaving a protected host
-        // unable to admit us. Delivery is deferred to Update() via
-        // SendAuthIfDue(), which fires once IsPeerReady() is true.
         m_client->SetPacketSink([this](const ClientEndpoint::RawPacket& rp) { OnClientPacket(rp); });
         return true;
     }
 
+    void Session::EndMatch(bool notify)
+    {
+        // Tell the game every remote player is gone (a uniform cleanup path for
+        // Leave, refusal and connection loss).
+        std::set<PeerId> gone;
+        gone.swap(m_peerRoster);
+        for (PeerId p : gone)
+        {
+            if (!notify) break;
+            if (m_remoteSink) m_remoteSink->OnPeerLeft(p);
+            if (m_joinLeave) m_joinLeave(p, false);
+        }
+        if (m_client) m_client->Disconnect();
+        m_client.reset();
+        m_core.Stop();
+    }
+
     void Session::Leave()
     {
-        if (m_client) m_client->Disconnect();
-        if (m_server) m_server->Stop();
-        m_client.reset();
-        m_server.reset();
-        m_selfId = 0;
-        m_welcomed = false;
-        m_worldSeed = 0;
-        m_port = 0;
-        m_peerRoster.clear();
-        m_admitted.clear();
-        m_joinLeave = nullptr;
-        m_missionTick = 0;
-        m_worldTable.Clear();
-        m_worldMirror.Clear();
-        m_ledgerServer.Clear(); // balances only; counter rules survive
-        m_ledgerClient.Clear();
-        m_outbox.clear();
+        EndMatch();
+        ResetClientState();
     }
 
     void Session::Update()
     {
-        if (m_server) m_server->Update();
-        if (m_client) m_client->Update();
+        if (m_core.IsRunning()) m_core.Update();
+        if (!m_client) return;
+        m_client->Update();
 
-        SendAuthIfDue();
+        // A refusal arrives inside the transport's service loop; the endpoint
+        // is torn down only now that it has returned.
+        if (m_pendingRefusal != REFUSE_NONE)
+        {
+            RefuseReason reason = m_pendingRefusal;
+            EndMatch();
+            ResetClientState();
+            m_refusal = reason;
+            return;
+        }
+
+        if (m_client->IsPeerReady()) m_wasReady = true;
+        else if (m_wasReady && !m_connectionLost)
+        {
+            // An established connection went away without a PID_REFUSE.
+            m_connectionLost = true;
+            EndMatch();
+            return;
+        }
+
+        SendHelloIfDue();
         FlushOutbox();
         SendLocalStateIfDue();
         SendMissionStateIfDue();
     }
 
-    // =====================================================================
-    // server side
-    // =====================================================================
-
-    void Session::OnServerPeerEvent(const PeerEvent& e)
+    void Session::SetPassword(const char* password)
     {
-        if (!e.connected)
-        {
-            bool wasAdmitted = m_admitted.erase(e.peer) != 0;
-
-            // Its owner-bound world state goes with it (dynamic entities), and
-            // its session balances are dropped.
-            std::vector<WorldStateKey> erased;
-            m_worldTable.OnPeerLeft(e.peer, erased);
-            for (const WorldStateKey& key : erased)
-            {
-                uint8_t buf[MAX_PACKET_PAYLOAD];
-                uint16_t n = WorldStateCodec::EncodeErase(buf, sizeof(buf), 0, 0, key);
-                if (n) m_server->Broadcast(PID_WS_ERASE, buf, n, 0);
-            }
-            m_ledgerServer.OnPeerLeft(e.peer);
-
-            if (wasAdmitted && m_joinLeave) m_joinLeave(e.peer, false);
-            return;
-        }
-        // Open host: admit immediately. Protected host: wait for PID_AUTH.
-        if (m_hostPassword[0] == '\0')
-            AdmitPeer(e.peer);
+        std::memset(m_password, 0, sizeof(m_password));
+        if (password == nullptr) return;
+        size_t n = std::strlen(password);
+        if (n > HandshakeCodec::kMaxPassword) n = HandshakeCodec::kMaxPassword;
+        std::memcpy(m_password, password, n);
     }
 
-    void Session::AdmitPeer(PeerId peer)
+    void Session::SendHelloIfDue()
     {
-        if (IsAdmitted(peer)) return;
-
-        uint8_t welcome[2];
-        WriteU16Le(welcome, peer);
-        m_server->SendTo(peer, kIdWelcome, welcome, sizeof(welcome));
-
-        uint8_t seed[4];
-        seed[0] = static_cast<uint8_t>(m_worldSeed & 0xFF);
-        seed[1] = static_cast<uint8_t>((m_worldSeed >> 8) & 0xFF);
-        seed[2] = static_cast<uint8_t>((m_worldSeed >> 16) & 0xFF);
-        seed[3] = static_cast<uint8_t>((m_worldSeed >> 24) & 0xFF);
-        m_server->SendTo(peer, kIdSeed, seed, sizeof(seed));
-
-        m_admitted.insert(peer);
-        if (m_joinLeave) m_joinLeave(peer, true);
-
-        std::vector<uint8_t> list(2 + m_admitted.size() * 2, 0);
-        WriteU16Le(list.data(), static_cast<uint16_t>(m_admitted.size()));
-        uint16_t idx = 0;
-        for (PeerId id : m_admitted)
-        {
-            WriteU16Le(list.data() + 2 + idx * 2, id);
-            ++idx;
-        }
-        m_server->Broadcast(kIdPlayerList, list.data(), static_cast<uint16_t>(list.size()), 0);
-
-        // The reliable channel is ordered, so the joiner sees the whole world
-        // before any live change that follows.
-        SendWorldSnapshot(peer);
-    }
-
-    void Session::SendWorldSnapshot(PeerId peer)
-    {
-        std::vector<WorldStateEntry> entries;
-        entries.reserve(m_worldTable.Size());
-        m_worldTable.ForEach([&](const WorldStateEntry& e) { entries.push_back(e); });
-
-        std::vector<std::vector<uint8_t>> chunks;
-        WorldStateCodec::EncodeSnapshot(entries, MAX_PACKET_PAYLOAD, chunks);
-        for (const auto& c : chunks)
-            m_server->SendTo(peer, PID_WS_SNAPSHOT, c.data(), static_cast<uint16_t>(c.size()));
-
-        uint8_t end[4];
-        Writer w(end, sizeof(end));
-        w.WriteU32(static_cast<uint32_t>(entries.size()));
-        m_server->SendTo(peer, PID_WS_SNAPSHOT_END, end, sizeof(end));
-    }
-
-    void Session::OnServerPacket(const ServerEndpoint::RawPacket& rp)
-    {
-        if (rp.id == kIdAuth)
-        {
-            // Client presents a password. A host without a password accepts
-            // everyone implicitly; a protected host only admits a peer whose
-            // presented password matches. A bad/missing password drops the
-            // peer (disconnect), so an unauthenticated client is never admitted.
-            char candidate[65];
-            memset(candidate, 0, sizeof(candidate));
-            size_t copyLen = rp.size < sizeof(candidate) - 1 ? rp.size : sizeof(candidate) - 1;
-            if (copyLen) memcpy(candidate, rp.data, copyLen);
-            candidate[copyLen] = 0;
-
-            if (m_hostPassword[0] == '\0'
-                || (copyLen <= strlen(m_hostPassword) && strcmp(candidate, m_hostPassword) == 0))
-            {
-                AdmitPeer(rp.from);
-            }
-            else
-            {
-                m_server->KickPeer(rp.from);
-            }
-            return;
-        }
-
-        // Everything else requires an admitted peer.
-        if (!IsAdmitted(rp.from)) return;
-
-        switch (rp.id)
-        {
-        case kIdUser:
-            // Open user-data relay: the server does not interpret the bytes.
-            Relay(kIdUser, rp.from, rp.data, rp.size);
-            break;
-
-        case kIdState:
-            // Server-authoritative gate: a validator may reject the state
-            // (e.g. teleport detection). Unvalidated/simple relays pass all.
-            if (m_validator && !m_validator->ValidatePeerState(rp.from, rp.data, rp.size))
-                return; // drop this state; keep last accepted authoritative
-            // The host sees other players through its loopback client, which
-            // receives the relayed copy, so the sink is not fed directly.
-            Relay(kIdState, rp.from, rp.data, rp.size);
-            break;
-
-        case kIdMission:
-            Relay(kIdMission, rp.from, rp.data, rp.size);
-            break;
-
-        case kIdEntity:
-            RelayEntityStates(rp.from, rp.data, rp.size);
-            break;
-
-        case PID_WS_REQUEST:
-            HandleWorldStateRequest(rp.from, rp.data, rp.size);
-            break;
-
-        case PID_LEDGER_REQUEST:
-            HandleLedgerRequest(rp.from, rp.data, rp.size);
-            break;
-
-        default:
-            break;
-        }
-    }
-
-    void Session::Relay(PacketId id, PeerId from, const uint8_t* data, uint16_t size)
-    {
-        // [sender u16][payload], to every peer except the sender.
-        uint8_t framed[2 + MAX_PACKET_PAYLOAD];
-        if (size + 2 > sizeof(framed)) return;
-        WriteU16Le(framed, from);
-        std::memcpy(framed + 2, data, size);
-        m_server->Broadcast(id, framed, static_cast<uint16_t>(size + 2), from);
-    }
-
-    void Session::HandleWorldStateRequest(PeerId from, const uint8_t* data, uint16_t size)
-    {
-        uint32_t seq = 0;
-        WorldStateOp op;
-        if (!WorldStateCodec::DecodeRequest(data, size, seq, op)) return;
-
-        WorldStateEntry entry;
-        bool exists = false;
-        WorldStateTable::Result r = m_worldTable.Apply(from, op, entry, exists);
-
-        uint8_t buf[MAX_PACKET_PAYLOAD];
-        uint16_t n = 0;
-        switch (r)
-        {
-        case WorldStateTable::ACCEPTED:
-            if (op.kind == WSO_ERASE)
-            {
-                n = WorldStateCodec::EncodeErase(buf, sizeof(buf), from, seq, op.key);
-                if (n) m_server->Broadcast(PID_WS_ERASE, buf, n, 0);
-            }
-            else
-            {
-                n = WorldStateCodec::EncodeUpdate(buf, sizeof(buf), from, seq, entry);
-                if (n) m_server->Broadcast(PID_WS_UPDATE, buf, n, 0);
-            }
-            break;
-
-        case WorldStateTable::UNCHANGED:
-            // Valid but no change: confirm to the requester only.
-            if (exists)
-            {
-                n = WorldStateCodec::EncodeUpdate(buf, sizeof(buf), from, seq, entry);
-                if (n) m_server->SendTo(from, PID_WS_UPDATE, buf, n);
-            }
-            else
-            {
-                n = WorldStateCodec::EncodeErase(buf, sizeof(buf), from, seq, op.key);
-                if (n) m_server->SendTo(from, PID_WS_ERASE, buf, n);
-            }
-            break;
-
-        case WorldStateTable::REJECTED:
-            n = WorldStateCodec::EncodeReject(buf, sizeof(buf), seq, op.key, exists, entry);
-            if (n) m_server->SendTo(from, PID_WS_REJECT, buf, n);
-            break;
-        }
-    }
-
-    void Session::HandleLedgerRequest(PeerId from, const uint8_t* data, uint16_t size)
-    {
-        uint32_t seq = 0;
-        CounterId counter = 0;
-        uint8_t reason = 0;
-        int32_t delta = 0;
-        uint64_t claim = 0;
-        if (!LedgerCodec::DecodeRequest(data, size, seq, counter, reason, delta, claim)) return;
-
-        int64_t balance = 0;
-        bool accepted = m_ledgerServer.Apply(from, counter, reason, delta, claim, balance)
-                        == LedgerServer::ACCEPTED;
-        uint8_t buf[LedgerCodec::RESULT_SIZE];
-        uint16_t n = LedgerCodec::EncodeResult(buf, sizeof(buf), seq, counter, accepted, balance);
-        if (n) m_server->SendTo(from, PID_LEDGER_RESULT, buf, n);
-    }
-
-    void Session::RelayEntityStates(PeerId from, const uint8_t* data, uint16_t size)
-    {
-        std::vector<EntityStateRecord> in;
-        if (!EntityStreamCodec::Decode(data, size, in)) return;
-
-        // Keep only records for entities this peer owns.
-        std::vector<EntityStateRecord> owned;
-        owned.reserve(in.size());
-        for (const EntityStateRecord& rec : in)
-        {
-            WorldStateKey key;
-            key.object = rec.entity;
-            key.channel = WS_CHANNEL_ENTITY;
-            WorldStateEntry e;
-            if (m_worldTable.Find(key, e) && e.policy == WSP_OWNER && e.owner == from)
-                owned.push_back(rec);
-        }
-
-        size_t first = 0;
-        while (first < owned.size())
-        {
-            uint8_t batch[MAX_PACKET_PAYLOAD - 2];
-            uint16_t n = EntityStreamCodec::Encode(batch, sizeof(batch), owned, first);
-            if (n == 0) break;
-            Relay(kIdEntity, from, batch, n);
-        }
+        if (m_helloSent || !m_client || !m_client->IsPeerReady()) return;
+        // A hosting session presents its own server's password, so the host
+        // always passes its own gate; a joiner presents what it was given.
+        uint8_t buf[4 + 2 + 4 + 1 + HandshakeCodec::kMaxPassword];
+        uint16_t n = HandshakeCodec::EncodeHello(buf, sizeof(buf), m_gameVersion,
+                                                 IsHost() ? m_core.GetPassword() : m_password);
+        if (n && m_client->SendTo(PID_HELLO, buf, n)) m_helloSent = true;
     }
 
     // =====================================================================
-    // client side (host loopback and joiner)
+    // inbound
     // =====================================================================
+
+    void Session::ApplyPlayerList(const uint8_t* data, uint16_t size)
+    {
+        if (size < 2) return;
+        uint16_t count = ReadU16Le(data);
+        if (size < 2 + count * 2) return;
+        std::set<PeerId> now;
+        for (uint16_t k = 0; k < count; ++k)
+        {
+            PeerId id = ReadU16Le(data + 2 + k * 2);
+            if (id != m_selfId) now.insert(id);
+        }
+        // Diff against the previous roster: one join/leave per change.
+        std::set<PeerId> before;
+        before.swap(m_peerRoster);
+        m_peerRoster = now;
+        for (PeerId p : before)
+            if (!now.count(p))
+            {
+                if (m_remoteSink) m_remoteSink->OnPeerLeft(p);
+                if (m_joinLeave) m_joinLeave(p, false);
+            }
+        for (PeerId p : now)
+            if (!before.count(p) && m_joinLeave) m_joinLeave(p, true);
+    }
 
     void Session::OnClientPacket(const ClientEndpoint::RawPacket& rp)
     {
         switch (rp.id)
         {
-        case kIdWelcome:
-            if (rp.size >= 2)
+        case PID_WELCOME:
+        {
+            PeerId self = 0;
+            uint32_t serverTime = 0, options = 0;
+            if (!HandshakeCodec::DecodeWelcome(rp.data, rp.size, self, serverTime, options)) break;
+            m_selfId = self;
+            m_welcomed = true;
+            m_client->SeedServerClock(serverTime);
+            m_sessionOptions = options;
+            if (m_sessionOptionsFn) m_sessionOptionsFn(options);
+            break;
+        }
+
+        case PID_REFUSE:
+            if (rp.size >= 1)
             {
-                m_selfId = ReadU16Le(rp.data);
-                m_welcomed = true;
+                RefuseReason reason = static_cast<RefuseReason>(rp.data[0]);
+                m_pendingRefusal = reason == REFUSE_NONE ? REFUSE_DENIED : reason;
             }
             break;
 
-        case kIdSeed:
+        case PID_WORLD_SEED:
+            if (rp.size >= 4) m_worldSeed = ReadU32Le(rp.data);
+            break;
+
+        case PID_SESSION_INFO:
             if (rp.size >= 4)
-                m_worldSeed = static_cast<uint32_t>(rp.data[0])
-                            | static_cast<uint32_t>(rp.data[1]) << 8
-                            | static_cast<uint32_t>(rp.data[2]) << 16
-                            | static_cast<uint32_t>(rp.data[3]) << 24;
-            break;
-
-        case kIdPlayerList:
-            if (rp.size >= 2)
             {
-                uint16_t count = ReadU16Le(rp.data);
-                if (rp.size >= 2 + count * 2)
-                {
-                    m_peerRoster.clear();
-                    for (uint16_t k = 0; k < count; ++k)
-                    {
-                        PeerId id = ReadU16Le(rp.data + 2 + k * 2);
-                        if (id != m_selfId) m_peerRoster.insert(id);
-                    }
-                }
+                m_sessionOptions = ReadU32Le(rp.data);
+                if (m_sessionOptionsFn) m_sessionOptionsFn(m_sessionOptions);
             }
             break;
 
-        case kIdUser:
+        case PID_PLAYER_LIST:
+            ApplyPlayerList(rp.data, rp.size);
+            break;
+
+        case PID_STATE_CORRECTION:
+            if (m_correctionSink) m_correctionSink(rp.data, rp.size);
+            break;
+
+        case PID_USER:
+        case PID_USER_STREAM:
             if (rp.size >= 2)
             {
                 PeerId from = ReadU16Le(rp.data);
@@ -453,32 +237,55 @@ namespace net
             }
             break;
 
-        case kIdState:
-            if (rp.size >= 2 + 1)
+        case PID_PLAYER_STATE:
+            if (rp.size > kRelayHeader && m_remoteSink)
             {
                 PeerId from = ReadU16Le(rp.data);
                 if (from != m_selfId)
-                    HandleRemoteState(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
+                    m_remoteSink->ApplyRemoteState(from, rp.data + kRelayHeader,
+                                                   static_cast<uint16_t>(rp.size - kRelayHeader),
+                                                   ReadU32Le(rp.data + 2));
             }
             break;
 
-        case kIdMission:
-            if (rp.size >= 2 + 1)
+        case PID_MISSION_STATE:
+            if (rp.size > kRelayHeader && m_missionSink)
             {
                 PeerId from = ReadU16Le(rp.data);
                 if (from != m_selfId)
-                    HandleRemoteMissionState(from, rp.data + 2, static_cast<uint16_t>(rp.size - 2));
+                    m_missionSink(from, rp.data + kRelayHeader, static_cast<uint16_t>(rp.size - kRelayHeader));
             }
             break;
 
-        case kIdEntity:
-            if (rp.size >= 2 && m_entitySink)
+        case PID_ENTITY_STATE:
+            if (rp.size >= kRelayHeader && m_entitySink)
             {
                 PeerId owner = ReadU16Le(rp.data);
                 if (owner == m_selfId) break;
+                uint32_t t = ReadU32Le(rp.data + 2);
                 std::vector<EntityStateRecord> recs;
-                if (EntityStreamCodec::Decode(rp.data + 2, static_cast<uint16_t>(rp.size - 2), recs))
-                    for (const EntityStateRecord& rec : recs) m_entitySink(owner, rec);
+                if (EntityStreamCodec::Decode(rp.data + kRelayHeader, static_cast<uint16_t>(rp.size - kRelayHeader), recs))
+                    for (const EntityStateRecord& rec : recs) m_entitySink(owner, rec, t);
+            }
+            break;
+
+        case PID_ENTITY_EVENT:
+            // [u16 from][u64 entity][u8 kind][payload]
+            if (rp.size >= 2 + 8 + 1 && m_entityEventSink)
+            {
+                PeerId from = ReadU16Le(rp.data);
+                uint64_t entity = static_cast<uint64_t>(ReadU32Le(rp.data + 2))
+                                | static_cast<uint64_t>(ReadU32Le(rp.data + 6)) << 32;
+                m_entityEventSink(from, entity, rp.data[10], rp.data + 11, static_cast<uint16_t>(rp.size - 11));
+            }
+            break;
+
+        case PID_PLAYER_EVENT:
+            // [u16 from][u16 target][u8 kind][payload]
+            if (rp.size >= 2 + 2 + 1 && m_playerEventSink)
+            {
+                PeerId from = ReadU16Le(rp.data);
+                m_playerEventSink(from, rp.data[4], rp.data + 5, static_cast<uint16_t>(rp.size - 5));
             }
             break;
 
@@ -553,10 +360,14 @@ namespace net
         }
     }
 
+    // =====================================================================
+    // outbound
+    // =====================================================================
+
     bool Session::RequestWorldState(const WorldStateOp& op)
     {
         if (!m_client) return false;
-        if (op.kind > WSO_ERASE || op.policy >= WSP_COUNT || op.value.len > WS_MAX_VALUE) return false;
+        if (op.kind >= WSO_COUNT || op.policy >= WSP_COUNT || op.value.len > WS_MAX_VALUE) return false;
         uint32_t seq = m_worldMirror.Predict(op.key);
         uint8_t buf[MAX_PACKET_PAYLOAD];
         uint16_t n = WorldStateCodec::EncodeRequest(buf, sizeof(buf), seq, op);
@@ -576,6 +387,16 @@ namespace net
         return true;
     }
 
+    bool Session::SendStream(PacketId id, const uint8_t* data, uint16_t size)
+    {
+        if (!m_client || !m_welcomed) return false;
+        uint8_t buf[MAX_PACKET_PAYLOAD];
+        Writer w(buf, sizeof(buf));
+        w.WriteU32(m_client->ServerTimeMs());
+        w.WriteBytes(data, size);
+        return w.Ok() && m_client->SendTo(id, buf, w.Position());
+    }
+
     bool Session::SendEntityStates(const std::vector<EntityStateRecord>& records)
     {
         if (!m_client || !m_welcomed) return false;
@@ -583,12 +404,40 @@ namespace net
         bool ok = true;
         while (first < records.size())
         {
-            uint8_t buf[MAX_PACKET_PAYLOAD - 2];
-            uint16_t n = EntityStreamCodec::Encode(buf, sizeof(buf), records, first);
+            uint8_t buf[MAX_PACKET_PAYLOAD];
+            uint16_t n = EntityStreamCodec::Encode(buf, MAX_PACKET_PAYLOAD - ServerCore::kStreamRelayHeader,
+                                                   records, first);
             if (n == 0) break;
-            ok = m_client->SendTo(kIdEntity, buf, n) && ok;
+            ok = SendStream(PID_ENTITY_STATE, buf, n) && ok;
         }
         return ok;
+    }
+
+    bool Session::SendEntityEvent(uint64_t entity, uint8_t kind, const uint8_t* data, uint16_t size)
+    {
+        if (!m_client || size > kMaxEventPayload) return false;
+        uint8_t buf[8 + 1 + kMaxEventPayload];
+        Writer w(buf, sizeof(buf));
+        w.WriteU32(static_cast<uint32_t>(entity & 0xFFFFFFFFu));
+        w.WriteU32(static_cast<uint32_t>(entity >> 32));
+        w.WriteU8(kind);
+        if (size) w.WriteBytes(data, size);
+        if (!w.Ok()) return false;
+        SendToServerWhenWelcomed(PID_ENTITY_EVENT, buf, w.Position());
+        return true;
+    }
+
+    bool Session::SendPlayerEvent(PeerId target, uint8_t kind, const uint8_t* data, uint16_t size)
+    {
+        if (!m_client || size > kMaxEventPayload) return false;
+        uint8_t buf[2 + 1 + kMaxEventPayload];
+        Writer w(buf, sizeof(buf));
+        w.WriteU16(target);
+        w.WriteU8(kind);
+        if (size) w.WriteBytes(data, size);
+        if (!w.Ok()) return false;
+        SendToServerWhenWelcomed(PID_PLAYER_EVENT, buf, w.Position());
+        return true;
     }
 
     void Session::SendToServerWhenWelcomed(PacketId id, const uint8_t* data, uint16_t size)
@@ -615,103 +464,44 @@ namespace net
         m_outbox.erase(m_outbox.begin(), m_outbox.begin() + sent);
     }
 
-    // =====================================================================
-    // streams
-    // =====================================================================
-
-    void Session::SendAuthIfDue()
-    {
-        if (m_authSent) return;
-        if (!m_client || !m_client->IsPeerReady()) return; // connection not up yet
-        if (m_clientPassword[0] == '\0') { m_authSent = true; return; } // nothing to present
-
-        uint8_t payload[65];
-        size_t n = strlen(m_clientPassword);
-        if (n > sizeof(payload)) n = sizeof(payload);
-        memcpy(payload, m_clientPassword, n);
-        m_client->SendTo(kIdAuth, payload, static_cast<uint16_t>(n));
-        m_authSent = true;
-    }
-
     void Session::SendLocalStateIfDue()
     {
-        if (!m_localState) return;
-        if (!IsJoined() || !m_welcomed) return; // unadmitted peers are dropped server-side
-
-        if (++m_stateTick < m_stateSendEvery) return;
-        m_stateTick = 0;
+        if (!m_localState || !m_welcomed) return;
+        uint32_t now = m_client->ServerTimeMs();
+        if (m_stateSentOnce && TimeDiff(now, m_lastStateSendMs) < static_cast<int32_t>(m_stateIntervalMs)) return;
 
         uint16_t size = 0;
-        if (!m_localState->GetLocalState(m_stateScratch, sizeof(m_stateScratch), size))
-            return;
-        if (size == 0) return;
-
-        // Every session (host included, through its loopback client) ships its
-        // state to the server, which relays it to the other peers.
-        m_client->SendTo(kIdState, m_stateScratch, size);
+        if (!m_localState->GetLocalState(m_scratch, MAX_PACKET_PAYLOAD - ServerCore::kStreamRelayHeader, size)
+            || size == 0) return;
+        if (SendStream(PID_PLAYER_STATE, m_scratch, size))
+        {
+            m_lastStateSendMs = now;
+            m_stateSentOnce = true;
+        }
     }
 
     void Session::SendMissionStateIfDue()
     {
-        if (!m_missionState) return;
-        if (!IsJoined() || !m_welcomed) return;
-
-        // Slower, frame-based cadence: default ~every 18 Update frames (≈ every
-        // 3rd state send at the default 6-frame player-state cadence) so mission
-        // progress does not pile onto every transform snapshot.
-        if (++m_missionTick < m_missionSendEvery) return;
-        m_missionTick = 0;
+        if (!m_missionState || !m_welcomed) return;
+        uint32_t now = m_client->ServerTimeMs();
+        if (m_missionSentOnce && TimeDiff(now, m_lastMissionSendMs) < static_cast<int32_t>(m_missionIntervalMs)) return;
 
         uint16_t size = 0;
-        if (!m_missionState->GetMissionState(m_missionScratch, sizeof(m_missionScratch), size))
-            return;
-        if (size == 0) return;
-
-        m_client->SendTo(kIdMission, m_missionScratch, size);
-    }
-
-    bool Session::SendCustomEvent(const uint8_t* data, uint16_t size)
-    {
-        if (size > MAX_PACKET_PAYLOAD) return false;
-        // Every session (host included, via loopback) sends to the server,
-        // which relays to everyone else once we are admitted.
-        return m_client != nullptr && m_client->SendTo(kIdUser, data, size);
-    }
-
-    void Session::HandleRemoteState(PeerId from, const uint8_t* data, uint16_t size)
-    {
-        if (m_remoteSink) m_remoteSink->ApplyRemoteState(from, data, size);
-    }
-
-    void Session::HandleRemoteMissionState(PeerId from, const uint8_t* data, uint16_t size)
-    {
-        if (m_missionSink) m_missionSink(from, data, size);
-    }
-
-    void Session::SetHostPassword(const char* password)
-    {
-        memset(m_hostPassword, 0, sizeof(m_hostPassword));
-        if (password != nullptr)
+        if (!m_missionState->GetMissionState(m_scratch, MAX_PACKET_PAYLOAD - ServerCore::kStreamRelayHeader, size)
+            || size == 0) return;
+        if (SendStream(PID_MISSION_STATE, m_scratch, size))
         {
-            size_t n = strlen(password);
-            if (n > sizeof(m_hostPassword) - 1) n = sizeof(m_hostPassword) - 1;
-            memcpy(m_hostPassword, password, n);
-            m_hostPassword[n] = '\0';
+            m_lastMissionSendMs = now;
+            m_missionSentOnce = true;
         }
-        // A freshly configured password only applies to future matches; an
-        // active host keeps its current admission state (the roster is already
-        // built). Callers set this before StartHost().
     }
 
-    void Session::SetClientPassword(const char* password)
+    bool Session::SendCustomEvent(const uint8_t* data, uint16_t size, bool stream)
     {
-        memset(m_clientPassword, 0, sizeof(m_clientPassword));
-        if (password != nullptr)
-        {
-            size_t n = strlen(password);
-            if (n > sizeof(m_clientPassword) - 1) n = sizeof(m_clientPassword) - 1;
-            memcpy(m_clientPassword, password, n);
-            m_clientPassword[n] = '\0';
-        }
+        if (!m_client || size > MAX_PACKET_PAYLOAD - 2) return false;
+        PacketId id = stream ? PID_USER_STREAM : PID_USER;
+        if (stream) return m_welcomed && m_client->SendTo(id, data, size);
+        SendToServerWhenWelcomed(id, data, size);
+        return true;
     }
 }

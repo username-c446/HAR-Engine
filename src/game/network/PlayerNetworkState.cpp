@@ -26,6 +26,8 @@ void PlayerNetworkState::Serialize(char* buffer) const
     net::WriteU16(p, vehSpeedKmh);
     *p++ = vehState;
     *p++ = vehFlags;
+    *p++ = vehDamage;
+    *p++ = teleportSeq;
 }
 
 void PlayerNetworkState::Deserialize(const char* buffer)
@@ -53,4 +55,6 @@ void PlayerNetworkState::Deserialize(const char* buffer)
     vehSpeedKmh = net::ReadU16(p);
     vehState = static_cast<uint8_t>(*p++);
     vehFlags = static_cast<uint8_t>(*p++);
+    vehDamage = static_cast<uint8_t>(*p++);
+    teleportSeq = static_cast<uint8_t>(*p++);
 }

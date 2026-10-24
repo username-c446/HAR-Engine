@@ -6,6 +6,7 @@
 #include "NetWorldRegistry.h"
 #include "NetEntityManager.h"
 #include "PlayerEconomy.h"
+#include "GameServer.h"
 #include "../netengine/Session.h"
 #include "../netengine/GamePlayerBridge.h"
 
@@ -42,6 +43,23 @@ public:
     // Returns true and fills out with the local player's mission progress.
     typedef bool (*MissionStateProvider)(MissionSyncState& out);
 
+    // The server refused our last state (movement validator): move the local
+    // player back to this authoritative state.
+    typedef void (*StateCorrectionHandler)(const PlayerNetworkState& authoritative);
+
+    // Player-vs-player hits (PID_PLAYER_EVENT, relayed only with SO_PVP). The
+    // payload is a NetEntityHit: for PE_VEHICLE_HIT the impulse on the
+    // victim's car, for PE_KNOCKDOWN the knock velocity of the victim.
+    enum PlayerEventKind
+    {
+        PE_VEHICLE_HIT = 1,
+        PE_KNOCKDOWN   = 2,
+    };
+    typedef void (*PlayerHitHandler)(unsigned short fromPeer, unsigned char kind, const net::NetEntityHit& hit);
+    // Game-side lookups: which remote player a ghost machine / puppet belongs
+    // to (0 = none).
+    typedef int (*RemoteHandleLookup)(void* handle);
+
     static NetworkMatchManager* CreateInstance();
     static NetworkMatchManager* GetInstance();
     static void DestroyInstance();
@@ -57,6 +75,21 @@ public:
 
     void SetLocalStateProvider(LocalStateProvider provider);
     void SetMissionStateProvider(MissionStateProvider provider);
+    void SetStateCorrectionHandler(StateCorrectionHandler handler) { m_correctionHandler = handler; }
+    void SetPlayerHitHandler(PlayerHitHandler handler) { m_playerHitHandler = handler; }
+    void SetRemoteLookups(RemoteHandleLookup vehicleDriver, RemoteHandleLookup puppetPlayer)
+    {
+        m_vehicleDriverLookup = vehicleDriver;
+        m_puppetPlayerLookup = puppetPlayer;
+    }
+
+    // Our car hit a remote player's ghost machine: with PvP the hit goes to
+    // that player. True if `ghost` is a remote player's machine (whatever PvP).
+    bool ReportRemoteVehicleHit(void* ghost, const net::NetEntityHit& hit);
+    // Our attack hit a remote player's puppet: with PvP the knock goes to that
+    // player. True if `puppet` is a remote player (the caller must then not
+    // apply the hit to the puppet locally — its owner's stream shows it).
+    bool ReportRemotePlayerHit(void* puppet, const net::NetEntityHit& hit);
 
     // Host configuration applied by the next StartHost. Authorization is
     // optional: an empty password hosts an open session (co-op / session
@@ -65,7 +98,18 @@ public:
     // Password presented to a protected host (before or after JoinHost).
     void SetClientPassword(const char* password);
     // Whether the hosted economy accepts cheat credits (debug sessions).
-    void SetAllowEconomyCheats(bool allow) { m_allowEconomyCheats = allow; }
+    void SetAllowEconomyCheats(bool allow) { m_serverOptions.allowEconomyCheats = allow; }
+    // Server rules of a hosted match: PvP, server Lua mods (the same GameServer
+    // the dedicated server runs).
+    void SetHostPvp(bool pvp);
+    void SetHostMods(const std::vector<std::string>& scripts) { m_serverOptions.modScripts = scripts; }
+    // PvP as announced by the server of the current match.
+    bool IsPvpEnabled() const { return m_session && (m_session->GetSessionOptions() & net::SO_PVP) != 0; }
+
+    // Why the last match ended on its own (refused by the server / lost
+    // connection); REFUSE_NONE + !WasConnectionLost() after a normal Leave.
+    net::RefuseReason GetLastRefusal() const { return m_lastRefusal; }
+    bool WasConnectionLost() const { return m_lastLost; }
 
     bool IsHosting() const { return m_session && m_session->IsHost(); }
     bool IsJoined() const { return m_session && m_session->IsJoined(); }
@@ -104,6 +148,10 @@ public:
     // Engine session (custom events for mods, diagnostics). Null outside a match.
     net::Session* GetSession() const { return m_session.get(); }
 
+    // True if a remote player is within `radius` of (x,z) on the ground plane
+    // (entity hand-over decisions).
+    bool IsRemotePlayerNear(float x, float z, float radius) const;
+
     // Drains pending join/leave notifications (host and joiner) for the UI.
     void DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out);
 
@@ -121,6 +169,8 @@ private:
     // Session created: attach the world views, mission channel, replicated
     // world services and join/leave notifications.
     void AttachSession();
+    // Shared teardown of the game-side services.
+    void ResetServices();
 
     // Wire the dedicated mission-progress channel (PID_MISSION_STATE):
     // attach the adapter as the session's IMissionStateProvider and register the
@@ -143,11 +193,20 @@ private:
     unsigned short m_hostPort;
     LocalStateProvider m_localStateProvider;
     MissionStateProvider m_missionStateProvider;
+    StateCorrectionHandler m_correctionHandler;
+    PlayerHitHandler m_playerHitHandler;
+    RemoteHandleLookup m_vehicleDriverLookup;
+    RemoteHandleLookup m_puppetPlayerLookup;
     char m_hostPassword[65];
     char m_clientPassword[65];
     unsigned short m_hostMaxPlayers;
-    bool m_allowEconomyCheats;
     bool m_entitiesWelcomed;
+    net::RefuseReason m_lastRefusal;
+    bool m_lastLost;
+
+    // Server rules when hosting (shared with the dedicated server).
+    GameServer::Options m_serverOptions;
+    GameServer m_gameServer;
 
     // Game-side authoritative remote set, fed by the bridge.
     RemotePlayerManager m_remotePlayers;

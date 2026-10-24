@@ -1,7 +1,6 @@
 #include "RemotePlayerWorldView.h"
 
 RemotePlayerWorldView::RemotePlayerWorldView()
-    : m_smoothingSeconds(0.12f)
 {
     memset(&m_sink, 0, sizeof(m_sink));
 }
@@ -13,14 +12,15 @@ RemotePlayerWorldView::~RemotePlayerWorldView()
 
 void RemotePlayerWorldView::Sync(const RemotePlayerManager& players)
 {
+    struct Ctx { RemotePlayerWorldView* self; const RemotePlayerManager* players; } ctx = { this, &players };
     players.ForEachPlayer(
         [](int playerId, const PlayerNetworkState& state, void* userData) -> bool
         {
-            RemotePlayerWorldView* self = static_cast<RemotePlayerWorldView*>(userData);
-            self->SyncOne(playerId, state);
+            Ctx* c = static_cast<Ctx*>(userData);
+            c->self->SyncOne(playerId, state, c->players->GetPlayerTime(playerId));
             return true;
         },
-        this);
+        &ctx);
 
     // Despawn any remote player that is no longer reported by the network.
     for (auto it = m_entries.begin(); it != m_entries.end();)
@@ -37,131 +37,59 @@ void RemotePlayerWorldView::Sync(const RemotePlayerManager& players)
     }
 }
 
-void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& state)
+void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
+    const bool jumpingNow = (state.flags & (PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR)) != 0;
+
     auto it = m_entries.find(playerId);
     if (it == m_entries.end())
     {
-        // New remote player: spawn if we can, otherwise skip. If spawned, the
-        // visual position starts exactly at the reported position so there is
-        // no initial fly-in.
+        // New remote player: spawn exactly at the reported pose (no fly-in).
         void* handle = m_sink.spawn ? m_sink.spawn(playerId) : nullptr;
         if (handle == nullptr) return;
-        Entry entry;
+        Entry& entry = m_entries[playerId];
         entry.handle = handle;
-        entry.targetX = entry.visualX = state.x;
-        entry.targetY = entry.visualY = state.y;
-        entry.targetZ = entry.visualZ = state.z;
-        entry.targetFacing = entry.visualFacing = state.rotY;
-        entry.targetMotionAngle = state.motionAngle;
-        entry.targetFacingAngle = state.facingAngle;
-        entry.targetSpeedFactor = state.speedFactor;
-        entry.targetCharacterState = state.characterState;
-        entry.targetActionEvent = state.actionEvent;
-        entry.targetFlags = state.flags;
-        entry.smoothingApplied = false;
-        entry.jumping = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
-        m_entries[playerId] = entry;
+        entry.lastActionEvent = state.actionEvent; // a held action is not replayed
+        entry.jumping = jumpingNow;
+        entry.track.Push(serverTimeMs, state);
         if (m_sink.move) m_sink.move(playerId, handle, state);
         return;
     }
 
-    // Existing remote player: just update the target. The actual movement of
-    // the visual representation is driven by Update() so a packet with the same
-    // position does not produce stutter.
     Entry& entry = it->second;
-    bool jumpingNow = ( state.flags & ( PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR ) ) != 0;
-    // Rising edge of a jump: fire the animation callback once so the receiver
-    // can play the skeletal jump (not merely snap the height).
-    if ( jumpingNow && !entry.jumping && m_sink.jump )
-    {
-        m_sink.jump(playerId, entry.handle);
-    }
+    if (!entry.track.Push(serverTimeMs, state)) return; // the same packet again
+
+    // Rising edge of a jump: play the skeletal jump once.
+    if (jumpingNow && !entry.jumping && m_sink.jump) m_sink.jump(playerId, entry.handle);
+    entry.jumping = jumpingNow;
+
     // A changed one-shot action byte ([seq|id], held by the sender) is a new
-    // action: fire the general action channel once with the bare ACTION_* id.
-    // The same byte on later packets must not re-fire; a repeat of the same
-    // action differs by its sequence bits.
-    if ( state.actionEvent != entry.targetActionEvent && m_sink.action )
+    // action; a repeat of the same action differs by its sequence bits.
+    if (state.actionEvent != entry.lastActionEvent && m_sink.action)
     {
         uint8_t id = PlayerNetworkState::ActionId(state.actionEvent);
-        if ( id != PlayerNetworkState::ACTION_NONE )
-            m_sink.action(playerId, entry.handle, id);
+        if (id != PlayerNetworkState::ACTION_NONE) m_sink.action(playerId, entry.handle, id);
     }
-    entry.targetX = state.x;
-    entry.targetY = state.y;
-    entry.targetZ = state.z;
-    entry.targetFacing = state.rotY;
-    entry.targetMotionAngle = state.motionAngle;
-    entry.targetFacingAngle = state.facingAngle;
-    entry.targetSpeedFactor = state.speedFactor;
-    entry.targetCharacterState = state.characterState;
-    entry.targetActionEvent = state.actionEvent;
-    entry.targetFlags = state.flags;
-    entry.smoothingApplied = false;
-    entry.jumping = jumpingNow;
+    entry.lastActionEvent = state.actionEvent;
 }
 
 void RemotePlayerWorldView::Update(float dt)
 {
-    if (dt <= 0.0f) return;
-
-    // Frame-rate independent exponential smoothing. lambda is chosen so that
-    // m_smoothingSeconds reaches ~95% of the remaining distance.
-    const float lambda = 3.0f / (m_smoothingSeconds > 0.0f ? m_smoothingSeconds : 0.12f);
-    const float alpha = 1.0f - expf(-lambda * dt);
-
+    (void)dt; // poses come from the server clock, not from frame time
+    if (!m_sink.move) return;
     for (auto& kv : m_entries)
     {
-        Entry& entry = kv.second;
-        if (entry.smoothingApplied) continue;
-
-        // While the remote player is jumping / airborne, do NOT smooth the
-        // vertical axis: interpolation through the arc looks like rubber-banding.
-        // Snap the height instantly and only smooth the horizontal plane.
-        if (entry.jumping)
-        {
-            entry.visualY = entry.targetY;
-            entry.visualX += (entry.targetX - entry.visualX) * alpha;
-            entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
-        }
-        else
-        {
-            entry.visualX += (entry.targetX - entry.visualX) * alpha;
-            entry.visualY += (entry.targetY - entry.visualY) * alpha;
-            entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
-        }
-        entry.smoothingApplied = true;
-
-        // Deferred facing: rotate decrementally toward the target yaw, taking
-        // the shortest arc around the circle so a 350deg -> 10deg turn moves
-        // forward through 0 rather than backwards through 180.
-        static const float kPi = 3.14159265f;
-        float diff = entry.targetFacing - entry.visualFacing;
-        while (diff >  kPi) diff -= 2.0f * kPi;
-        while (diff < -kPi) diff += 2.0f * kPi;
-        if (diff != 0.0f) entry.visualFacing += diff * alpha;
-        // Normalize to [-PI, PI].
-        if (entry.visualFacing >  kPi) entry.visualFacing -= 2.0f * kPi;
-        if (entry.visualFacing < -kPi) entry.visualFacing += 2.0f * kPi;
-
-        if (m_sink.move)
-        {
-            PlayerNetworkState state;
-            state.x = entry.visualX;
-            state.y = entry.visualY;
-            state.z = entry.visualZ;
-            state.rotY = entry.visualFacing;
-            // Locomotion channels: pass the raw reported targets through — the
-            // LocomotionDriver on the game side does its own facing/speed
-            // smoothing, so we must not pre-smooth the angles here.
-            state.motionAngle = entry.targetMotionAngle;
-            state.facingAngle = entry.targetFacingAngle;
-            state.speedFactor = entry.targetSpeedFactor;
-            state.characterState = entry.targetCharacterState;
-            state.flags = entry.targetFlags;
-            m_sink.move(kv.first, entry.handle, state);
-        }
+        PlayerNetworkState s;
+        if (kv.second.track.Render(m_timing, s)) m_sink.move(kv.first, kv.second.handle, s);
     }
+}
+
+int RemotePlayerWorldView::FindPlayer(const void* handle) const
+{
+    if (handle == nullptr) return 0;
+    for (const auto& kv : m_entries)
+        if (kv.second.handle == handle) return kv.first;
+    return 0;
 }
 
 void RemotePlayerWorldView::Clear()

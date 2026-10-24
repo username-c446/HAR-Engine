@@ -17,7 +17,7 @@ namespace net
     {
         if (m_connected || m_host) return false;
 
-        m_host = enet_host_create(nullptr, 1, 1, 0, 0);
+        m_host = enet_host_create(nullptr, 1, CH_COUNT, 0, 0);
         if (!m_host) return false;
 
         m_serverIp = serverIp ? serverIp : "";
@@ -32,7 +32,7 @@ namespace net
         }
         addr.port = serverPort;
 
-        m_peer = enet_host_connect(m_host, &addr, 1, 0);
+        m_peer = enet_host_connect(m_host, &addr, CH_COUNT, 0);
         if (!m_peer)
         {
             enet_host_destroy(m_host);
@@ -42,6 +42,9 @@ namespace net
 
         m_connected = true;
         m_peerReady = false;
+        m_hasPing = false;
+        m_lastPingMs = 0;
+        m_clock.Reset();
         return true;
     }
 
@@ -65,14 +68,13 @@ namespace net
     {
         if (!m_host) return;
 
-        // Automatic heartbeat: every N Updates, originate a PING probe. This
-        // keeps the server's liveness window fresh (a responding client is
-        // never dropped) and measures RTT on each PONG. Guests that set a tiny
-        // interval (or 0) effectively heartbeat every frame.
-        if (m_peerReady && m_peer != nullptr && ++m_pingTick >= m_pingEvery)
+        // Heartbeat: keeps the server's liveness window fresh and samples the
+        // RTT / server clock.
+        if (m_peerReady && m_peer != nullptr)
         {
-            m_pingTick = 0;
-            SendPing();
+            enet_uint32 now = enet_time_get();
+            if (m_lastPingMs == 0 || now - m_lastPingMs >= m_pingIntervalMs)
+                SendPing();
         }
 
         ENetEvent ev;
@@ -93,38 +95,23 @@ namespace net
                                       | static_cast<uint16_t>(ev.packet->data[3]) << 8;
                         if (static_cast<uint32_t>(kHeaderBytes) + size <= ev.packet->dataLength)
                         {
-                            if (pid == PID_PING)
+                            const uint8_t* body = ev.packet->data + kHeaderBytes;
+                            if (pid == PID_PONG)
                             {
-                                // Server heartbeat probe: answer so the server
-                                // sees our liveness and we keep the channel warm.
-                                SendTo(PID_PONG, nullptr, 0);
-                            }
-                            else if (pid == PID_PONG)
-                            {
-                                // Round-trip complete: record the measured RTT.
-                                if (m_pingSentMs != 0)
+                                // {u32 our send time echoed, u32 server time}
+                                Reader r(body, size);
+                                uint32_t sent = 0, serverTime = 0;
+                                if (r.ReadU32(sent) && r.ReadU32(serverTime))
                                 {
-                                    enet_uint32 nowMs = enet_time_get();
-                                    m_pingMs   = static_cast<unsigned>(nowMs - m_pingSentMs);
-                                    m_hasPing  = true;
-                                    m_pingSentMs = 0;
-                                }
-                                // Also route to the packet sink so the session
-                                // layer can observe the PONG if it cares.
-                                if (m_packetSink)
-                                {
-                                    RawPacket rp;
-                                    rp.id   = pid;
-                                    rp.data = ev.packet->data + kHeaderBytes;
-                                    rp.size = size;
-                                    m_packetSink(rp);
+                                    m_clock.OnPong(sent, serverTime, enet_time_get());
+                                    m_hasPing = true;
                                 }
                             }
                             else if (m_packetSink)
                             {
                                 RawPacket rp;
                                 rp.id   = pid;
-                                rp.data = ev.packet->data + kHeaderBytes;
+                                rp.data = body;
                                 rp.size = size;
                                 m_packetSink(rp);
                             }
@@ -148,8 +135,11 @@ namespace net
     {
         if (!m_host || !m_peer || payloadSize > MAX_PACKET_PAYLOAD) return false;
 
+        // Delivery follows the packet id (Packet.h ChannelOf): reliable-ordered
+        // for commands and world state, unreliable-sequenced for streams.
+        Channel ch = ChannelOf(id);
         ENetPacket* pkt = enet_packet_create(nullptr, kHeaderBytes + payloadSize,
-                                             ENET_PACKET_FLAG_RELIABLE);
+                                             ch == CH_RELIABLE ? ENET_PACKET_FLAG_RELIABLE : 0);
         if (!pkt) return false;
         uint8_t* d = pkt->data;
         d[0] = static_cast<uint8_t>(id & 0xFF);
@@ -157,15 +147,23 @@ namespace net
         d[2] = static_cast<uint8_t>(payloadSize & 0xFF);
         d[3] = static_cast<uint8_t>((payloadSize >> 8) & 0xFF);
         if (payloadSize > 0) std::memcpy(d + kHeaderBytes, payload, payloadSize);
-        enet_peer_send(m_peer, 0, pkt);
+        if (enet_peer_send(m_peer, ch, pkt) != 0)
+        {
+            enet_packet_destroy(pkt);
+            return false;
+        }
         return true;
     }
 
     void ClientEndpoint::SendPing()
     {
         if (!m_host || !m_peer) return;
-        m_pingSentMs = enet_time_get();
-        SendTo(PID_PING, nullptr, 0);
+        m_lastPingMs = enet_time_get();
+        if (m_lastPingMs == 0) m_lastPingMs = 1; // 0 means "never pinged"
+        uint8_t buf[4];
+        Writer w(buf, sizeof(buf));
+        w.WriteU32(m_lastPingMs);
+        SendTo(PID_PING, buf, sizeof(buf));
         enet_host_flush(m_host);
     }
 }

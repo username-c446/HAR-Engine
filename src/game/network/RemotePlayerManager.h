@@ -2,6 +2,7 @@
 #include "PlayerNetworkState.h"
 #include <map>
 #include <vector>
+#include <cstdint>
 
 class RemotePlayerManager
 {
@@ -9,10 +10,13 @@ public:
     RemotePlayerManager();
     ~RemotePlayerManager();
 
-    void UpdatePlayer(int playerId, const PlayerNetworkState& state);
+    // `serverTimeMs`: server-clock time the sender sampled the state at.
+    void UpdatePlayer(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs = 0);
     void RemovePlayer(int playerId);
     void Clear();
     const PlayerNetworkState* GetPlayer(int playerId) const;
+    // Sample time of the player's latest state (0 if unknown).
+    uint32_t GetPlayerTime(int playerId) const;
 
     // Callback receives each remote player's id + state. Returns false to stop iteration.
     typedef bool (*PlayerVisitor)(int playerId, const PlayerNetworkState& state, void* userData);
@@ -28,4 +32,5 @@ public:
 
 private:
     std::map<int, PlayerNetworkState> m_players;
+    std::map<int, uint32_t> m_times;
 };

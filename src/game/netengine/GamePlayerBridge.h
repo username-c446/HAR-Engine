@@ -61,13 +61,12 @@ namespace net
 
         // ---- IRemoteStateSink ------------------------------------------------
 
-        void ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size) override;
+        void ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size, uint32_t serverTimeMs) override;
         void OnPeerLeft(PeerId peer) override;
 
-        // Wires this bridge into the engine session: the session will pull the
-        // local player state (via ILocalStateProvider) and deliver remote
-        // players to this bridge (via IRemoteStateSink), and surface
-        // join/leave so OnPeerLeft is reflected into the world.
+        // Wires this bridge into the engine session: the session pulls the
+        // local player state (ILocalStateProvider) and delivers remote players
+        // and their departures (IRemoteStateSink) to this bridge.
         void AttachToSession(Session* session);
 
     private:

@@ -90,6 +90,10 @@ class WorldPhysicsManager
 
         int GetCameraCollisionAreaIndex();  // return the next free one
         int GetVehicleCollisionAreaIndex();
+        // Collision areas reserved for networked-match ghost vehicles.
+        enum { NETWORK_GHOST_VEHICLES = 16 };
+        // A vehicle collision area is free (a ghost may be created).
+        bool HasFreeVehicleCollisionArea() const;
         int GetCharacterCollisionAreaIndex();
 
         void FreeCollisionAreaIndex(int index);

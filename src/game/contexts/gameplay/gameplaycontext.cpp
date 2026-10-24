@@ -158,6 +158,37 @@ namespace
     // Steer-angle wire scale: byte units per degree. -45..+45 deg ~ -128..127.
     const float kSteerUnitsPerDeg = 255.0f / 90.0f;
 
+    // Deliberate discontinuities of the local player's position (respawn,
+    // interior / mission teleports) are declared to the server's movement
+    // validator through PlayerNetworkState::teleportSeq. The game teleports the
+    // avatar from many places, so the provider detects it: a jump between two
+    // consecutive samples that no vehicle or runner can make. A server
+    // correction is not a teleport of ours (the server already knows the pose).
+    const float kTeleportJumpMeters = 25.0f;
+    struct LocalTeleportTracker
+    {
+        bool     hasLast;
+        float    x, y, z;
+        uint8_t  seq;
+        bool     skipNext;
+    } s_teleport = { false, 0.0f, 0.0f, 0.0f, 0, false };
+
+    void TrackLocalTeleport( float x, float y, float z, bool inVehicle, float dtSeconds )
+    {
+        if ( s_teleport.hasLast && !s_teleport.skipNext )
+        {
+            float dx = x - s_teleport.x, dy = y - s_teleport.y, dz = z - s_teleport.z;
+            float reach = ( inVehicle ? 110.0f : 20.0f ) * dtSeconds + kTeleportJumpMeters;
+            if ( dx * dx + dy * dy + dz * dz > reach * reach )
+            {
+                ++s_teleport.seq;
+            }
+        }
+        s_teleport.skipNext = false;
+        s_teleport.hasLast = true;
+        s_teleport.x = x; s_teleport.y = y; s_teleport.z = z;
+    }
+
     bool GameplayLocalStateProvider( PlayerNetworkState& outState )
     {
         AvatarManager* am = GetAvatarManager();
@@ -170,6 +201,9 @@ namespace
         outState.x = pos.x;
         outState.y = pos.y;
         outState.z = pos.z;
+        TrackLocalTeleport( pos.x, pos.y, pos.z, avatar->IsInCar(), 0.1f );
+        outState.teleportSeq = s_teleport.seq;
+        outState.vehDamage = 0;
 
         rmt::Vector heading;
         avatar->GetHeading( heading );
@@ -239,6 +273,8 @@ namespace
             if ( vehicle->mBrakeLightsOn )    outState.vehFlags |= PlayerNetworkState::VEH_FLAG_BRAKE;
             if ( vehicle->mReverseLightsOn )  outState.vehFlags |= PlayerNetworkState::VEH_FLAG_REVERSE;
             if ( vehicle->IsVehicleDestroyed() ) outState.vehFlags |= PlayerNetworkState::VEH_FLAG_DESTROYED;
+            float wreck = ( 1.0f - vehicle->GetHealthFraction() ) * 255.0f;
+            outState.vehDamage = static_cast<uint8_t>( wreck < 0.0f ? 0.0f : ( wreck > 255.0f ? 255.0f : wreck ) );
         }
         else
         {
@@ -567,6 +603,7 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
                               ( state.vehFlags & PlayerNetworkState::VEH_FLAG_BRAKE ) != 0,
                               ( state.vehFlags & PlayerNetworkState::VEH_FLAG_REVERSE ) != 0,
                               ( state.vehFlags & PlayerNetworkState::VEH_FLAG_DESTROYED ) != 0 );
+        v->ApplyNetworkDamage( 1.0f - state.vehDamage / 255.0f );
     }
 
     void RemoteVehicleDespawn( int playerId, void* handle )
@@ -614,15 +651,39 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
                               ( m.flags & net::NetEntityMotion::MF_BRAKE ) != 0,
                               ( m.flags & net::NetEntityMotion::MF_REVERSE ) != 0,
                               ( m.flags & net::NetEntityMotion::MF_DESTROYED ) != 0 );
+        v->ApplyNetworkDamage( 1.0f - m.damage / 255.0f );
     }
 
-    void NetEntityDespawnGhost( void* handle )
+    void NetEntityDespawnGhost( void* handle, uint8_t kind )
     {
+        (void)kind;
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
         s_explodedGhosts.erase( v );
         // See RemoteVehicleDespawn: the teardown releases (and frees) the ghost.
         GetVehicleCentral()->RemoveNetworkGhostVehicle( v );
+    }
+
+    // We won the claim on a traffic car another player released: drop the
+    // ghost and continue the car as our own traffic at the same pose / speed.
+    void* NetEntityAdoptGhost( uint64_t id, void* ghostHandle, const net::NetEntitySpawn& spawn,
+                               const net::NetEntityMotion& m )
+    {
+        (void)id;
+        if ( spawn.kind != net::NEK_TRAFFIC_CAR ) return NULL;
+        Vehicle* adopted = TrafficManager::GetInstance()->AdoptNetworkTraffic(
+            spawn.model, rmt::Vector( m.x, m.y, m.z ), m.yaw, m.speedKmh / 3.6f );
+        if ( adopted == NULL ) return NULL; // the ghost stays; the entity goes back up for grabs
+        NetEntityDespawnGhost( ghostHandle, spawn.kind );
+        return adopted;
+    }
+
+    // Another player's physics hit one of OUR traffic cars.
+    void NetEntityHitLocal( void* localHandle, const net::NetEntityHit& hit )
+    {
+        Vehicle* v = static_cast<Vehicle*>( localHandle );
+        if ( v == NULL ) return;
+        v->ApplyNetworkHit( rmt::Vector( hit.ix, hit.iy, hit.iz ), hit.damage / 255.0f );
     }
 
     // Samples one of OUR traffic cars for the entity stream.
@@ -643,6 +704,9 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
         if ( v->mBrakeLightsOn )       out.flags |= net::NetEntityMotion::MF_BRAKE;
         if ( v->mReverseLightsOn )     out.flags |= net::NetEntityMotion::MF_REVERSE;
         if ( v->IsVehicleDestroyed() ) out.flags |= net::NetEntityMotion::MF_DESTROYED;
+        float wreck = ( 1.0f - v->GetHealthFraction() ) * 255.0f;
+        out.damage = static_cast<uint8_t>( wreck < 0.0f ? 0.0f : ( wreck > 255.0f ? 255.0f : wreck ) );
+        out.state = 0;
         return true;
     }
 
@@ -675,6 +739,64 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
     {
         static RemoteVehicleWorldView sWorldView;
         return &sWorldView;
+    }
+
+    int RemoteDriverOfGhost( void* ghost )
+    {
+        return GetRemoteVehicleWorldView()->FindDriver( ghost );
+    }
+
+    int RemotePlayerOfPuppet( void* puppet )
+    {
+        return GetRemotePlayerWorldView()->FindPlayer( puppet );
+    }
+
+    // The server refused our movement: put the local player back where the
+    // server last accepted it.
+    void GameplayStateCorrection( const PlayerNetworkState& st )
+    {
+        AvatarManager* am = GetAvatarManager();
+        Avatar* avatar = am != NULL ? am->GetAvatarForPlayer( 0 ) : NULL;
+        if ( avatar == NULL ) return;
+        rmt::Vector pos( st.x, st.y, st.z );
+        Vehicle* v = avatar->GetVehicle();
+        if ( avatar->IsInCar() && v != NULL )
+        {
+            rmt::Matrix m;
+            m.Identity();
+            m.FillRotateXYZ( 0.0f, v->GetFacingInRadians(), 0.0f );
+            m.FillTranslate( pos );
+            v->SetTransform( m );
+        }
+        else if ( avatar->GetCharacter() != NULL )
+        {
+            avatar->GetCharacter()->SetPosition( pos );
+        }
+        s_teleport.skipNext = true; // not a teleport of ours
+    }
+
+    // PvP: another player hit us.
+    void GameplayPlayerHit( unsigned short fromPeer, unsigned char kind, const net::NetEntityHit& hit )
+    {
+        (void)fromPeer;
+        AvatarManager* am = GetAvatarManager();
+        Avatar* avatar = am != NULL ? am->GetAvatarForPlayer( 0 ) : NULL;
+        if ( avatar == NULL ) return;
+        if ( kind == NetworkMatchManager::PE_VEHICLE_HIT )
+        {
+            Vehicle* v = avatar->GetVehicle();
+            if ( avatar->IsInCar() && v != NULL )
+            {
+                v->ApplyNetworkHit( rmt::Vector( hit.ix, hit.iy, hit.iz ), hit.damage / 255.0f );
+            }
+        }
+        else if ( kind == NetworkMatchManager::PE_KNOCKDOWN )
+        {
+            if ( !avatar->IsInCar() && avatar->GetCharacter() != NULL )
+            {
+                avatar->GetCharacter()->ApplyNetworkKnockdown();
+            }
+        }
     }
 }
 
@@ -796,9 +918,40 @@ void GameplayContext::OnStart( ContextEnum previousContext )
         entitySink.spawn = &NetEntitySpawnGhost;
         entitySink.move = &NetEntityMoveGhost;
         entitySink.despawn = &NetEntityDespawnGhost;
+        entitySink.adopt = &NetEntityAdoptGhost;
+        entitySink.hit = &NetEntityHitLocal;
         NetworkMatchManager::Entities().SetSink( entitySink );
         NetworkMatchManager::Entities().SetSampler( &NetEntitySampleTraffic );
+        // Only entities around us need a ghost (collision areas are scarce).
+        NetworkMatchManager::Entities().SetRelevanceRadius( 200.0f );
+        // Migration: a released car is taken over by a player near it, within
+        // our own traffic budget.
+        NetworkMatchManager::Entities().SetPresence(
+            []( float& x, float& z ) -> bool
+            {
+                AvatarManager* am = GetAvatarManager();
+                Avatar* avatar = am != NULL ? am->GetAvatarForPlayer( 0 ) : NULL;
+                if ( avatar == NULL ) return false;
+                rmt::Vector p;
+                avatar->GetPosition( p );
+                x = p.x; z = p.z;
+                return true;
+            },
+            []( float x, float z, float radius ) -> bool
+            {
+                NetworkMatchManager* m = NetworkMatchManager::GetInstance();
+                return m != NULL && m->IsRemotePlayerNear( x, z, radius );
+            },
+            []( uint8_t kind ) -> bool
+            {
+                if ( kind != net::NEK_TRAFFIC_CAR ) return false;
+                TrafficManager* tm = TrafficManager::GetInstance();
+                return tm->GetNumTraffic() < tm->GetMaxTraffic();
+            } );
     }
+    pMatchMgr->SetStateCorrectionHandler( &GameplayStateCorrection );
+    pMatchMgr->SetPlayerHitHandler( &GameplayPlayerHit );
+    pMatchMgr->SetRemoteLookups( &RemoteDriverOfGhost, &RemotePlayerOfPuppet );
 
     // Auto-start a match from the command line (-host <port> / -join <ip:port>).
     // Useful for scripted/testing launches of host and client copies.
@@ -1217,31 +1370,50 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
     if (pMatch != NULL && pMatch->IsInMatch())
     {
         pMatch->Update( static_cast<float>( elapsedTime ) / 1000.0f );
+        if ( !pMatch->IsInMatch() )
+        {
+            // The match just ended on its own (refused / connection lost).
+            if ( pMatch->GetLastRefusal() != net::REFUSE_NONE )
+            {
+                GetConsole()->Printf( "net: the server refused us (reason %d)", (int)pMatch->GetLastRefusal() );
+            }
+            else if ( pMatch->WasConnectionLost() )
+            {
+                GetConsole()->Printf( "net: connection to the server lost" );
+            }
+            GetRemotePlayerWorldView()->Clear();
+            GetRemoteVehicleWorldView()->Clear();
+        }
+        else
+        {
+        // Remote players are rendered behind the server clock (snapshot
+        // interpolation), so their motion does not depend on packet timing.
+        {
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t
+            {
+                NetworkMatchManager* m = NetworkMatchManager::GetInstance();
+                net::Session* s = m != NULL ? m->GetSession() : NULL;
+                return s != NULL ? s->ServerTimeMs() : 0;
+            };
+            GetRemotePlayerWorldView()->SetTiming( timing );
+            GetRemoteVehicleWorldView()->SetTiming( timing );
+        }
         // Reflect remote players' latest states in the world.
         GetRemotePlayerWorldView()->Sync( pMatch->GetRemotePlayers() );
-        // Advance each remote player's visual position smoothly toward its
-        // target so network refresh does not produce teleports.
-        //
-        // NOTE: the world-view Update(float dt) contract is SECONDS (its
-        // m_smoothingSeconds field and every unit test treat dt as seconds).
-        // elapsedTime is MILLISECONDS, so we must normalise before passing it,
-        // otherwise alpha = 1 - exp(-lambda*dt) is fed a value ~1000x too large
-        // and every remote player's visual position teleports its full distance
-        // to the latest reported target on the very first Update — destroying
-        // the smoothing this call exists to provide.
+        // Move each remote player to its interpolated pose.
         GetRemotePlayerWorldView()->Update( static_cast<float>( elapsedTime ) / 1000.0f );
-        // Mirror remote drivers' ghost vehicles (spawn/move/despawn) and step
-        // their positions smoothly as well.
+        // Mirror remote drivers' ghost vehicles (spawn/move/despawn).
         pMatch->GetRemotePlayers().ForEachPlayer(
-            []( int playerId, const PlayerNetworkState& state, void* ) -> bool
+            []( int playerId, const PlayerNetworkState& state, void* user ) -> bool
             {
-                GetRemoteVehicleWorldView()->SyncDriver( playerId, state );
+                const RemotePlayerManager* players = static_cast<const RemotePlayerManager*>( user );
+                GetRemoteVehicleWorldView()->SyncDriver( playerId, state, players->GetPlayerTime( playerId ) );
                 return true;
             },
-            NULL );
+            const_cast<RemotePlayerManager*>( &pMatch->GetRemotePlayers() ) );
         // Drop ghost vehicles of remote players who are no longer connected.
         GetRemoteVehicleWorldView()->Prune( pMatch->GetRemotePlayers() );
-        // Ms -> seconds, as with the player view above (see the NOTE there).
         GetRemoteVehicleWorldView()->Update( static_cast<float>( elapsedTime ) / 1000.0f );
 
         // Surface join/leave notifications as console messages.
@@ -1258,6 +1430,7 @@ void GameplayContext::OnUpdate( unsigned int elapsedTime )
                 GetConsole()->Printf( "net: player %u disconnected", events[i].clientId );
             }
         }
+        } // still in the match
     }
 
     BEGIN_PROFILE( "HitnRunManager" );

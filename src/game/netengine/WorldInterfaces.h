@@ -7,6 +7,7 @@
 #include "Packet.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace net
 {
@@ -39,30 +40,41 @@ namespace net
 
     // IRemoteStateSink: the session delivers a state blob that arrived from a
     // remote peer. Implementers spawn/move/despawn the visual representation.
+    // `serverTimeMs` is the server-clock time the sender sampled the state at
+    // (for interpolation buffers).
     class IRemoteStateSink
     {
     public:
         virtual ~IRemoteStateSink() = default;
-        // before=false = peer left the match (cleanup).
-        virtual void ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size) = 0;
+        virtual void ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size, uint32_t serverTimeMs) = 0;
+        // The peer left the match (cleanup).
         virtual void OnPeerLeft(PeerId peer) = 0;
     };
 
     // IStateValidator: optional server-authoritative plausibility gate for
-    // relayed state. The session invokes this on every inbound player state
-    // from a remote peer BEFORE broadcasting it to the others. Returning false
-    // drops the state (so a teleporting/cheating client is not relayed) while
-    // keeping the last accepted state authoritative. This hook is world-agnostic:
-    // the transport/session only asks "is this blob plausible?"; interpreting
-    // the bytes (position, speed, teleport heuristics) is the implementer's job.
+    // relayed player state. The server asks it about every inbound state blob
+    // BEFORE relaying it. The engine never interprets the bytes; the validator
+    // (game code) decodes them and keeps its own per-peer history.
+    //   SV_ACCEPT  - relay it
+    //   SV_DROP    - do not relay (the last accepted state stays authoritative)
+    //   SV_CORRECT - do not relay, and send `correction` (a state blob the
+    //                client must snap to) as PID_STATE_CORRECTION
+    // `serverNowMs` is the server's receive time (never the client's claim).
+    enum StateVerdict : uint8_t
+    {
+        SV_ACCEPT  = 0,
+        SV_DROP    = 1,
+        SV_CORRECT = 2,
+    };
+
     class IStateValidator
     {
     public:
         virtual ~IStateValidator() = default;
-        // `from` is the origin peer, `data/size` the raw serialized state blob.
-        // The validator may track per-peer history to detect teleports.
-        // Returns true if the state may be relayed, false to drop it.
-        virtual bool ValidatePeerState(PeerId from, const uint8_t* data, uint16_t size) = 0;
+        virtual StateVerdict ValidatePeerState(PeerId from, const uint8_t* data, uint16_t size,
+                                               uint32_t serverNowMs, std::vector<uint8_t>& correction) = 0;
+        // The peer left: forget its history.
+        virtual void OnPeerLeft(PeerId peer) { (void)peer; }
     };
 
     // -------------------------------------------------------------------

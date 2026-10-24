@@ -13,7 +13,9 @@ lists so that the resize request will be minimal or even inexistant.
 namespace sim
 {
 
-const int CollisionAreaListSize           = 37;
+// 37 areas for the original world + 16 for networked-match ghost vehicles
+// (WorldPhysicsManager::NETWORK_GHOST_VEHICLES).
+const int CollisionAreaListSize           = 37 + 16;
 const int CollisionObjectListSize         = 48;
 const int CollisionObjectPairListSize     = 256;
 const int CollisionListSize               = 128;

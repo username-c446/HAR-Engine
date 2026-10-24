@@ -22,7 +22,7 @@ namespace net
         addr.host = ENET_HOST_ANY;
         addr.port = port;
 
-        m_host = enet_host_create(&addr, maxPeers, 1, 0, 0);
+        m_host = enet_host_create(&addr, maxPeers, CH_COUNT, 0, 0);
         if (!m_host) return false;
 
         m_port = port;
@@ -30,6 +30,7 @@ namespace net
         m_peerIds.clear();
         m_peersById.clear();
         m_liveness.clear();
+        m_startMs = enet_time_get();
         m_running = true;
         return true;
     }
@@ -46,11 +47,6 @@ namespace net
         m_peerIds.clear();
         m_peersById.clear();
         m_liveness.clear();
-    }
-
-    void ServerEndpoint::SetPingInterval(unsigned everyNUpdates)
-    {
-        m_pingEvery = everyNUpdates ? everyNUpdates : 1;
     }
 
     void ServerEndpoint::Update()
@@ -92,9 +88,19 @@ namespace net
                             PeerId from = (it != m_peerIds.end()) ? it->second : 0;
                             if (pid == PID_PING)
                             {
-                                // Heartbeat probe: answer with an empty PONG so
-                                // the client can measure RTT and stay alive.
-                                SendTo(from, PID_PONG, nullptr, 0);
+                                // Heartbeat probe {u32 client time}: echo it with
+                                // our clock so the client measures RTT and
+                                // estimates the server time.
+                                Reader r(ev.packet->data + kHeaderBytes, size);
+                                uint32_t clientSent = 0;
+                                if (r.ReadU32(clientSent))
+                                {
+                                    uint8_t pong[8];
+                                    Writer w(pong, sizeof(pong));
+                                    w.WriteU32(clientSent);
+                                    w.WriteU32(NowMs());
+                                    SendTo(from, PID_PONG, pong, sizeof(pong));
+                                }
                             }
                             else if (m_packetSink)
                             {
@@ -162,7 +168,7 @@ namespace net
             }
         }
 
-        if (kFlushAfterService) enet_host_flush(m_host);
+        enet_host_flush(m_host);
     }
 
     bool ServerEndpoint::SendTo(PeerId peer, PacketId id, const uint8_t* payload, uint16_t payloadSize)
@@ -171,16 +177,22 @@ namespace net
         auto it = m_peersById.find(peer);
         if (it == m_peersById.end()) return false;
 
+        // Delivery follows the packet id (Packet.h ChannelOf).
+        Channel ch = ChannelOf(id);
         ENetPacket* pkt = enet_packet_create(nullptr, kHeaderBytes + payloadSize,
-                                             ENET_PACKET_FLAG_RELIABLE);
+                                             ch == CH_RELIABLE ? ENET_PACKET_FLAG_RELIABLE : 0);
         if (!pkt) return false;
         uint8_t* d = pkt->data;
         d[0] = static_cast<uint8_t>(id & 0xFF);
         d[1] = static_cast<uint8_t>((id >> 8) & 0xFF);
         d[2] = static_cast<uint8_t>(payloadSize & 0xFF);
         d[3] = static_cast<uint8_t>((payloadSize >> 8) & 0xFF);
-        std::memcpy(d + kHeaderBytes, payload, payloadSize);
-        enet_peer_send(it->second, kChannel, pkt);
+        if (payloadSize > 0) std::memcpy(d + kHeaderBytes, payload, payloadSize);
+        if (enet_peer_send(it->second, ch, pkt) != 0)
+        {
+            enet_packet_destroy(pkt);
+            return false;
+        }
         return true;
     }
 
@@ -196,9 +208,16 @@ namespace net
         m_peersById.erase(pit);
         m_liveness.erase(id);
         m_peerIds.erase(peer);
-        enet_peer_disconnect(peer, 1);
-        // The disconnect event will land in the next Update() as a DISCONNECT;
-        // since we already removed the mapping, that handler is a safe no-op.
+        // disconnect_later drains what is already queued (a PID_REFUSE) before
+        // the disconnect; plain disconnect would drop it. The DISCONNECT event
+        // that follows finds no mapping and is a no-op.
+        enet_peer_disconnect_later(peer, 1);
+    }
+
+    uint32_t ServerEndpoint::GetPeerRttMs(PeerId id) const
+    {
+        auto it = m_peersById.find(id);
+        return it == m_peersById.end() ? 0 : it->second->roundTripTime;
     }
 
     void ServerEndpoint::Broadcast(PacketId id, const uint8_t* payload, uint16_t payloadSize, PeerId omit)

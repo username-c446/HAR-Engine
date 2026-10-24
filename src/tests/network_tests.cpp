@@ -13,6 +13,8 @@
 #include "NetEntityManager.h"
 #include "PlayerEconomy.h"
 #include "MissionSyncManager.h"
+#include "PlayerMovementValidator.h"
+#include "GameServer.h"
 #include "../game/netengine/Packet.h"
 #include "../game/netengine/PacketRegistry.h"
 #include "../game/netengine/ServerEndpoint.h"
@@ -112,41 +114,8 @@ namespace NetworkTests
         return true;
     }
 
-    // Server-authoritative movement validator that reads the PlayerNetworkState
-    // blob the session relays and applies the old server's plausibility gate:
-    // a large single-tick jump (teleport) is rejected, honest steps pass. Keeps
-    // the world-agnostic net::Session honest without coupling it to game types.
-    struct PlayerMoveValidator : net::IStateValidator
-    {
-        float maxSpeedOnFoot = 15.0f;
-        float maxSpeedInVehicle = 120.0f;
-        float maxTeleportMeters = 5.0f;
-        std::map<net::PeerId, PlayerNetworkState> lastState;
-        int accepted = 0;
-        int rejected = 0;
-
-        bool ValidatePeerState(net::PeerId from, const uint8_t* data, uint16_t size) override
-        {
-            if (size < PlayerNetworkState::SERIALIZED_SIZE) { ++rejected; return false; }
-            PlayerNetworkState st;
-            st.Deserialize(reinterpret_cast<const char*>(data));
-
-            auto it = lastState.find(from);
-            if (it != lastState.end())
-            {
-                const PlayerNetworkState& prev = it->second;
-                float dx = st.x - prev.x, dy = st.y - prev.y, dz = st.z - prev.z;
-                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-                float maxSpeed = (st.inVehicle != 0) ? maxSpeedInVehicle : maxSpeedOnFoot;
-                // Teleport gate: a jump farther than walking/running + the
-                // teleport slack in a single tick is rejected outright.
-                if (dist > maxTeleportMeters + maxSpeed) { ++rejected; return false; }
-            }
-            lastState[from] = st;
-            ++accepted;
-            return true;
-        }
-    };
+    // The server tests use the game's real movement validator.
+    using PlayerMoveValidator = PlayerMovementValidator;
 
     // Nets a real loopback host session + a joiner session, pumping both until
     // the joiner has been welcomed (non-zero self id). Returns false if the
@@ -221,9 +190,10 @@ namespace NetworkTests
             // 4 floats + vehicleModel[16] + int32 + float + 2*uint8         (base 42)
             // + 2*uint16 + 2*uint8 + uint8                                  (loco +7 = 49)
             // + uint8                                                       (action +1 = 50)
-            // + float + uint8 + uint16 + uint8 + uint8                      (vehicle mirror +9 = 59?? -> 58)
-            // Correct: 42 (base) + 4 (2*u16) + 2 (2*u8) + 1 (action) + 4 (float) + 1 (u8) + 2 (u16) + 1 (u8) + 1 (u8) = 58.
-            Assert::AreEqual<int>(4 * 4 + 16 + 4 + 4 + 2 + 4 + 2 + 1 + 4 + 1 + 2 + 1 + 1, PlayerNetworkState::SERIALIZED_SIZE);
+            // + float + uint8 + uint16 + uint8 + uint8                      (vehicle mirror +8 = 58)
+            // + uint8 vehDamage + uint8 teleportSeq                         (+2 = 60)
+            Assert::AreEqual<int>(4 * 4 + 16 + 4 + 4 + 2 + 4 + 2 + 1 + 4 + 1 + 2 + 1 + 1 + 1 + 1,
+                                  PlayerNetworkState::SERIALIZED_SIZE);
         }
 
         TEST_METHOD(LocoFieldsRoundTripSerialize)
@@ -247,8 +217,10 @@ namespace NetworkTests
             state.vehSpeedKmh = 95;
             state.vehState = 0;         // VS_NORMAL
             state.vehFlags = PlayerNetworkState::VEH_FLAG_BRAKE;
+            state.vehDamage = 77;
+            state.teleportSeq = 5;
 
-            Assert::AreEqual<int>(58, PlayerNetworkState::SERIALIZED_SIZE, L"SERIALIZED_SIZE drifted.");
+            Assert::AreEqual<int>(60, PlayerNetworkState::SERIALIZED_SIZE, L"SERIALIZED_SIZE drifted.");
             char buffer[PlayerNetworkState::SERIALIZED_SIZE];
             state.Serialize(buffer);
             PlayerNetworkState restored;
@@ -265,6 +237,8 @@ namespace NetworkTests
             Assert::AreEqual(static_cast<int>(state.vehSpeedKmh), static_cast<int>(restored.vehSpeedKmh));
             Assert::AreEqual(static_cast<int>(state.vehState), static_cast<int>(restored.vehState));
             Assert::AreEqual(static_cast<int>(state.vehFlags), static_cast<int>(restored.vehFlags));
+            Assert::AreEqual(77, static_cast<int>(restored.vehDamage));
+            Assert::AreEqual(5, static_cast<int>(restored.teleportSeq));
         }
     };
 
@@ -430,7 +404,7 @@ namespace NetworkTests
                 measured = client.HasMeasuredPing();
             }
             Assert::IsTrue(measured, L"Client never measured a ping round-trip.");
-            Assert::IsTrue(client.GetPingMs() < 5000, L"Measured ping looks absurdly high.");
+            Assert::IsTrue(client.GetRttMs() < 5000, L"Measured ping looks absurdly high.");
 
             client.Disconnect();
             server.Stop();
@@ -493,6 +467,7 @@ namespace NetworkTests
                 badWelcome = bad.GetLocalPeerId() != 0;
             }
             Assert::IsFalse(badWelcome, L"Wrong password must not be welcomed.");
+            Assert::AreEqual((int)net::REFUSE_PASSWORD, (int)bad.GetRefusal(), L"The client is told why.");
             bad.Leave();
 
             // Correct password: the peer is welcomed.
@@ -796,9 +771,11 @@ namespace NetworkTests
 
             // Pump until the joiner observes the host's relayed position.
             const PlayerNetworkState* seenHost = NULL;
-            for (int i = 0; i < 300 && seenHost == NULL; ++i) {
+            // States stream on a 100 ms cadence: give it real time.
+            for (int i = 0; i < 1000 && seenHost == NULL; ++i) {
                 host->Update(); joiner.Update();
                 seenHost = joinerRemote.GetPlayer(static_cast<int>(hostId));
+                Sleep(1);
             }
             Assert::IsNotNull(seenHost, L"Joiner should see the host player through the relay.");
             if (seenHost) {
@@ -825,6 +802,8 @@ namespace NetworkTests
 
         // Static fake world shared across sink callbacks (sink has no userData).
         FakeWorld g_fakeWorld;
+        // Fake server clock for the interpolating views.
+        uint32_t g_fakeClock = 0;
 
         void* FakeSpawn(int playerId)
         {
@@ -872,7 +851,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f); // near-instant smoothing for determinism
 
             // First sync: player 7 appears.
             RemotePlayerManager players;
@@ -905,66 +883,8 @@ namespace NetworkTests
             view.Clear();
         }
 
-        TEST_METHOD(InterpolationApproachesTargetWithoutTeleporting)
+        TEST_METHOD(InterpolatesBetweenTimedSamplesBehindTheServerClock)
         {
-            g_fakeWorld.spawnCount = 0;
-            g_fakeWorld.despawnCount = 0;
-            g_fakeWorld.lastMoves.clear();
-            RemotePlayerWorldView view;
-            RemotePlayerWorldView::Sink sink;
-            sink.spawn = &FakeSpawn;
-            sink.move = &FakeMove;
-            sink.despawn = &FakeDespawn;
-            view.SetSink(sink);
-            // Slow smoothing so the first step is visibly between start and target.
-            view.SetSmoothing(1.0f);
-
-            RemotePlayerManager players;
-            PlayerNetworkState p;
-            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
-            players.UpdatePlayer(1, p);
-            view.Sync(players); // spawn at 0,0,0
-            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[1].x);
-
-            // Target jumps to 100 on X. Interpolate over a few frames.
-            p.x = 100.0f;
-            players.UpdatePlayer(1, p);
-            view.Sync(players);
-            view.Update(0.1f);
-            float first = g_fakeWorld.lastMoves[1].x;
-            Assert::IsTrue(first > 0.0f && first < 100.0f,
-                L"First interpolated step must be strictly between source and target.");
-
-            // Keep stepping; value must converge toward the target.
-            float prev = first;
-            for (int i = 0; i < 20; ++i)
-            {
-                view.Sync(players); // refresh target
-                view.Update(0.1f);
-                float cur = g_fakeWorld.lastMoves[1].x;
-                Assert::IsTrue(cur > prev || (fabsf(cur - prev) < 1e-4f),
-                    L"Visual position must approach the target monotonically.");
-                prev = cur;
-            }
-            Assert::IsTrue(fabsf(prev - 100.0f) < 1.0f,
-                L"Interpolation should have converged close to the target.");
-
-            view.Clear();
-        }
-
-        TEST_METHOD(UpdateInterpretsDtInSecondsNotMilliseconds)
-        {
-            // REGRESSION (multiplayer sync bug): GameplayContext::OnUpdate feeds
-            // the world view a per-frame dt. `elapsedTime` there is milliseconds
-            // but RemotePlayerWorldView::Update(float dt) is documented (and
-            // unit-tested) as SECONDS, via its m_smoothingSeconds field. If a
-            // caller passes milliseconds (e.g. 16 for a 60fps frame), alpha =
-            // 1 - exp(-lambda * 16) underflows to ~1.0 and the remote player's
-            // visual position teleports its ENTIRE distance to the latest
-            // reported target on the first Update — so "remote players spawn but
-            // never smoothly move". This test pins the seconds contract: a
-            // realistic per-frame dt in seconds must advance only PARTWAY toward
-            // a far target, never teleport the whole way.
             g_fakeWorld.spawnCount = 0;
             g_fakeWorld.despawnCount = 0;
             g_fakeWorld.lastMoves.clear();
@@ -975,71 +895,107 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.12f); // the production default
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            timing.maxExtrapolationMs = 200;
+            view.SetTiming(timing);
 
             RemotePlayerManager players;
             PlayerNetworkState p;
             p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
-            players.UpdatePlayer(1, p);
-            view.Sync(players); // spawn at 0,0,0
-            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[1].x);
-
-            // Target far ahead; advance by one 60fps frame, expressed in seconds.
-            p.x = 100.0f;
-            players.UpdatePlayer(1, p);
+            players.UpdatePlayer(1, p, 1000);
             view.Sync(players);
-            view.Update(1.0f / 60.0f); // ~16.7 ms, correctly in seconds
-            float first = g_fakeWorld.lastMoves[1].x;
-            Assert::IsTrue(first > 0.0f && first < 100.0f,
-                L"A per-frame dt in seconds must NOT teleport the visual position "
-                L"to the target (that is the ms-vs-seconds regression).");
+            p.x = 100.0f;
+            players.UpdatePlayer(1, p, 1100);
+            view.Sync(players);
+
+            g_fakeClock = 1150; // render time 1050: halfway between the samples
+            view.Update(0.016f);
+            Assert::AreEqual(50.0f, g_fakeWorld.lastMoves[1].x, 0.01f, L"Halfway between the two samples.");
+            g_fakeClock = 1200; // render time 1100: exactly the newest sample
+            view.Update(0.016f);
+            Assert::AreEqual(100.0f, g_fakeWorld.lastMoves[1].x, 0.01f);
+            g_fakeClock = 1250; // late packet: extrapolate along the last segment
+            view.Update(0.016f);
+            Assert::AreEqual(150.0f, g_fakeWorld.lastMoves[1].x, 0.01f, L"Short extrapolation.");
+            g_fakeClock = 2000; // far beyond: capped at maxExtrapolationMs
+            view.Update(0.016f);
+            Assert::AreEqual(300.0f, g_fakeWorld.lastMoves[1].x, 0.01f, L"Extrapolation is capped.");
 
             view.Clear();
         }
 
-        TEST_METHOD(FacingSmoothsToTargetOverShortestArc)
+        TEST_METHOD(PoseDependsOnServerTimeNotFrameTime)
+        {
+            // The rendered pose is a function of the server clock only: a long
+            // or a short frame shows the same pose at the same render time.
+            g_fakeWorld.spawnCount = 0;
+            g_fakeWorld.despawnCount = 0;
+            g_fakeWorld.lastMoves.clear();
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            timing.maxExtrapolationMs = 200;
+            view.SetTiming(timing);
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
+            players.UpdatePlayer(1, p, 5000);
+            view.Sync(players);
+            p.x = 10.0f;
+            players.UpdatePlayer(1, p, 5100);
+            view.Sync(players);
+            g_fakeClock = 5125;
+            view.Update(1.0f / 60.0f);
+            float a = g_fakeWorld.lastMoves[1].x;
+            view.Update(16.0f); // a "milliseconds" dt changes nothing
+            Assert::AreEqual(a, g_fakeWorld.lastMoves[1].x, 0.0001f);
+            Assert::AreEqual(2.5f, a, 0.01f);
+            view.Clear();
+        }
+
+        TEST_METHOD(FacingInterpolatesOverShortestArc)
         {
             g_fakeWorld.spawnCount = 0;
             g_fakeWorld.despawnCount = 0;
             g_fakeWorld.lastMoves.clear();
             RemotePlayerWorldView view;
             RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
             sink.spawn = &FakeSpawn;
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(1.0f); // slow: first step visibly between angles
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            timing.maxExtrapolationMs = 200;
+            view.SetTiming(timing);
 
             const float kPi = 3.14159265f;
             RemotePlayerManager players;
             PlayerNetworkState p;
             p.x = p.y = p.z = 0.0f;
             p.rotY = 0.0f;
-            players.UpdatePlayer(1, p);
-            view.Sync(players); // spawn facing 0
-            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[1].rotY);
-
-            // Target jumps to ~350deg (6.1 rad). The shortest arc is +10deg
-            // through 0, so the smoothed value must go NEGATIVE (e.g. -few deg),
-            // not climb toward +350.
-            p.rotY = 350.0f * kPi / 180.0f;
-            players.UpdatePlayer(1, p);
+            players.UpdatePlayer(1, p, 1000);
             view.Sync(players);
-            view.Update(0.1f);
-            float first = g_fakeWorld.lastMoves[1].rotY;
-            Assert::IsTrue(first < 0.0f && first > -1.0f,
-                L"Facing should rotate back (-few deg) toward 350 through the short arc.");
-
-            // Converge. Result should normalize near -10deg (== 350), not +350.
-            for (int i = 0; i < 40; ++i)
-            {
-                view.Sync(players);
-                view.Update(0.1f);
-            }
-            float end = g_fakeWorld.lastMoves[1].rotY;
-            Assert::IsTrue(fabsf(end + 10.0f * kPi / 180.0f) < 0.05f,
-                L"Facing should converge to -10deg (== 350deg), normalized.");
-
+            // 350 degrees: the shortest arc from 0 is -10 degrees through 0.
+            p.rotY = 350.0f * kPi / 180.0f;
+            players.UpdatePlayer(1, p, 1100);
+            view.Sync(players);
+            g_fakeClock = 1150;
+            view.Update(0.016f);
+            Assert::AreEqual(-5.0f * kPi / 180.0f, g_fakeWorld.lastMoves[1].rotY, 0.001f,
+                L"Halfway along the short arc, normalized.");
             view.Clear();
         }
 
@@ -1054,7 +1010,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.12f);
 
             RemotePlayerManager players;
             PlayerNetworkState p;
@@ -1090,8 +1045,10 @@ namespace NetworkTests
             view.Clear();
         }
 
-        TEST_METHOD(JumpFlagSnapsVerticalHeightInstantly)
+        TEST_METHOD(JumpArcFollowsTheSenderSamples)
         {
+            // With timed samples the arc is the sender's own: the rendered
+            // height lies on the segment between two real samples.
             g_fakeWorld.spawnCount = 0;
             g_fakeWorld.despawnCount = 0;
             g_fakeWorld.lastMoves.clear();
@@ -1102,28 +1059,26 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            // Slow smoothing so horizontal still visibly lags; vertical must not.
-            view.SetSmoothing(1.0f);
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            timing.maxExtrapolationMs = 200;
+            view.SetTiming(timing);
 
             RemotePlayerManager players;
             PlayerNetworkState ground;
             ground.x = 0.0f; ground.y = 0.0f; ground.z = 0.0f;
-            players.UpdatePlayer(3, ground);
+            ground.flags = 0;
+            players.UpdatePlayer(3, ground, 1000);
             view.Sync(players);
-            Assert::AreEqual(0.0f, g_fakeWorld.lastMoves[3].y);
-
-            // Remote player jumps: Y +100, flagged airborne.
             PlayerNetworkState air = ground;
-            air.y = 100.0f;
+            air.y = 2.0f;
             air.flags = PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR;
-            players.UpdatePlayer(3, air);
+            players.UpdatePlayer(3, air, 1100);
             view.Sync(players);
-            // First Update: vertical must fully snap (no partial interpolation).
-            view.Update(0.1f);
-            Assert::AreEqual(100.0f, g_fakeWorld.lastMoves[3].y,
-                L"While jumping, the height must snap instantly into place.");
-            // Horizontal may still be interpolating (not a full snap) — that's fine.
-
+            g_fakeClock = 1150;
+            view.Update(0.016f);
+            Assert::AreEqual(1.0f, g_fakeWorld.lastMoves[3].y, 0.001f);
             view.Clear();
         }
 
@@ -1142,7 +1097,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(1.0f); // keep the visual position mostly stationary
 
             RemotePlayerManager players;
             PlayerNetworkState p;
@@ -1202,7 +1156,6 @@ namespace NetworkTests
             sink.action = &FakeAction;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f);
 
             RemotePlayerManager players;
             PlayerNetworkState p;
@@ -1325,7 +1278,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(1.0f); // slow: first step visibly between angles
 
             PlayerNetworkState v;
             v.x = 0.0f; v.y = 0.0f; v.z = 0.0f;
@@ -1350,16 +1302,22 @@ namespace NetworkTests
             Assert::AreEqual(static_cast<int>(v.vehFlags), static_cast<int>(got.vehFlags),
                 L"Vehicle flags should reach the move sink.");
 
-            // Yaw jumps to ~350deg. Shortest arc is through 0 => first step negative.
+            // Timed samples: yaw 0 -> 350deg interpolates over the short arc.
+            view.Clear();
+            g_fakeWorld.lastMoves.clear();
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            view.SetTiming(timing);
             const float kPi = 3.14159265f;
+            v.vehYaw = 0.0f;
+            view.SyncDriver(9, v, 1000);
             v.vehYaw = 350.0f * kPi / 180.0f;
-            view.SyncDriver(9, v);
-            view.Update(0.1f);
-            Assert::IsTrue(g_fakeWorld.lastMoves[9].vehYaw < 0.0f && g_fakeWorld.lastMoves[9].vehYaw > -1.0f,
-                L"Vehicle yaw should rotate back through the short arc, not climb to +350.");
-            for (int i = 0; i < 40; ++i) { view.SyncDriver(9, v); view.Update(0.1f); }
-            Assert::IsTrue(fabsf(g_fakeWorld.lastMoves[9].vehYaw + 10.0f * kPi / 180.0f) < 0.05f,
-                L"Vehicle yaw should converge to -10deg (== 350deg).");
+            view.SyncDriver(9, v, 1100);
+            g_fakeClock = 1150;
+            view.Update(0.016f);
+            Assert::AreEqual(-5.0f * kPi / 180.0f, g_fakeWorld.lastMoves[9].vehYaw, 0.001f,
+                L"Vehicle yaw goes through the short arc.");
 
             view.Clear();
         }
@@ -1379,7 +1337,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f);
 
             // On foot: no ghost.
             RemotePlayerManager players;
@@ -1423,7 +1380,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f);
 
             PlayerNetworkState carA;
             carA.x = 0.0f; carA.y = 0.0f; carA.z = 0.0f; carA.inVehicle = 1;
@@ -1458,7 +1414,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f);
 
             RemotePlayerManager players;
             PlayerNetworkState inCar;
@@ -1499,7 +1454,6 @@ namespace NetworkTests
             sink.move = &FakeMove;
             sink.despawn = &FakeDespawn;
             view.SetSink(sink);
-            view.SetSmoothing(0.01f);
 
             PlayerNetworkState onFoot;
             onFoot.x = 0.0f; onFoot.y = 0.0f; onFoot.z = 0.0f; onFoot.inVehicle = 0;
@@ -1612,14 +1566,14 @@ namespace NetworkTests
             // Give client A a few honest, small footsteps (publish via the
             // scripted provider; the session relays on its own cadence).
             for (int i = 0; i < 120; ++i) {
-                aState.state.x += 0.5f;
+                aState.state.x += 0.02f; // ~10 m/s at the 2 ms pump step
                 a.Update(); b.Update(); host.Update();
                 Sleep(2);
             }
 
             // The validator accepted the honest movement and the relayed state
             // reached another peer.
-            Assert::IsTrue(validator.accepted > 0,
+            Assert::IsTrue(validator.Accepted() > 0,
                 L"Normal movement should be accepted by the server validator.");
             const PlayerNetworkState* bSeesA = bRemote.GetPlayer(static_cast<int>(aId));
             Assert::IsNotNull(bSeesA, L"B should see A's accepted movement through the relay.");
@@ -1664,27 +1618,27 @@ namespace NetworkTests
             net::PeerId aId = a.GetLocalPeerId();
 
             // Establish a plausible position with honest steps first.
-            for (int i = 0; i < 30 && validator.accepted == 0; ++i) {
-                aState.state.x += 0.5f;
+            for (int i = 0; i < 30 && validator.Accepted() == 0; ++i) {
+                aState.state.x += 0.02f;
                 a.Update(); b.Update(); host.Update();
                 Sleep(2);
             }
-            Assert::IsTrue(validator.accepted > 0, L"Baseline steps should be accepted.");
-            int acceptedBefore = validator.accepted;
+            Assert::IsTrue(validator.Accepted() > 0, L"Baseline steps should be accepted.");
+            uint32_t acceptedBefore = validator.Accepted();
 
             // Now a teleport thousands of metres in a single tick.
             long currentX = 0;
             (void)currentX;
             aState.state.x = 1.0f;
             aState.state.z = 10000.0f;
-            for (int i = 0; i < 20; ++i) {
+            for (int i = 0; i < 150; ++i) {
                 a.Update(); b.Update(); host.Update();
                 Sleep(2);
             }
 
             // The validator rejected the teleport and it was NOT relayed: B never
             // observes z near 10000 regardless of how far A's state spread.
-            Assert::IsTrue(validator.rejected > 0,
+            Assert::IsTrue(validator.Refused() > 0,
                 L"Teleport should be rejected by the server validator.");
             const PlayerNetworkState* bSeesA = bRemote.GetPlayer(static_cast<int>(aId));
             if (bSeesA) {
@@ -1749,7 +1703,7 @@ namespace NetworkTests
             }
 
             // And the server authoritative validator accepted A's movement.
-            Assert::IsTrue(validator.accepted > 0,
+            Assert::IsTrue(validator.Accepted() > 0,
                 L"Server should accept A's honest movement in its authoritative set.");
 
             g_scriptedHostHolder = nullptr;
@@ -2241,7 +2195,7 @@ namespace NetworkTests
             struct Sink : net::IRemoteStateSink
             {
                 int got = 0; uint8_t last = 0;
-                void ApplyRemoteState(net::PeerId, const uint8_t* d, uint16_t n) override
+                void ApplyRemoteState(net::PeerId, const uint8_t* d, uint16_t n, uint32_t) override
                 { got++; last = (n > 0) ? d[0] : 0; }
                 void OnPeerLeft(net::PeerId) override {}
             };
@@ -2900,7 +2854,7 @@ namespace NetworkTests
         g_ghosts.push_back(g); return g;
     }
     static void GhostMove(void* h, const net::NetEntityMotion& m) { FakeGhost* g = (FakeGhost*)h; g->last = m; ++g->moves; }
-    static void GhostDespawn(void* h)
+    static void GhostDespawn(void* h, uint8_t)
     {
         ++g_ghostDespawns;
         for (size_t i = 0; i < g_ghosts.size(); ++i) if (g_ghosts[i] == h) { delete g_ghosts[i]; g_ghosts.erase(g_ghosts.begin() + i); break; }
@@ -2918,7 +2872,7 @@ namespace NetworkTests
             m.SetSenders([&](const net::WorldStateOp& op) { ops.push_back(op); return true; },
                          [&](const std::vector<net::EntityStateRecord>& r) { streamed.insert(streamed.end(), r.begin(), r.end()); return true; });
             m.SetSampler(&SampleCar);
-            m.SetSendEvery(1);
+            m.SetSendIntervalMs(0);
 
             int car;
             net::NetEntitySpawn sp; sp.kind = net::NEK_TRAFFIC_CAR; strcpy(sp.model, "compactA");
@@ -2926,7 +2880,8 @@ namespace NetworkTests
             Assert::AreEqual((size_t)0, ops.size(), L"No id before our peer id is known.");
             m.OnWelcomed(3);
             Assert::AreEqual((size_t)1, ops.size(), L"Announced once welcomed.");
-            Assert::IsTrue(ops[0].policy == net::WSP_OWNER && (ops[0].flags & net::WSF_ERASE_ON_OWNER_LEAVE));
+            Assert::IsTrue(ops[0].policy == net::WSP_OWNER && (ops[0].flags & net::WSF_RELEASE_ON_OWNER_LEAVE),
+                L"Traffic survives its owner leaving: released for a nearby player.");
             Assert::IsTrue(net::IsDynamicEntityId(ops[0].key.object) && ops[0].key.channel == net::WS_CHANNEL_ENTITY);
             Assert::IsTrue(m.LocalId(&car) == ops[0].key.object);
 
@@ -3077,7 +3032,7 @@ namespace NetworkTests
             viewer.SetWorldStateSink([&](const net::WorldStateEntry& e, net::WorldStateReason reason, net::PeerId) {
                 if (e.key.object != ent) return;
                 if (reason == net::WSR_ERASED) ++erased; else ++spawned; });
-            viewer.SetEntityStateSink([&](net::PeerId from, const net::EntityStateRecord& rec) {
+            viewer.SetEntityStateSink([&](net::PeerId from, const net::EntityStateRecord& rec, uint32_t) {
                 if (rec.entity == ent && from == owner.GetLocalPeerId()) ++streamed; });
 
             Assert::IsTrue(owner.RequestWorldState(MakeOp(ent, net::WS_CHANNEL_ENTITY, net::WSP_OWNER, 1, net::WSO_SET,
@@ -3173,6 +3128,7 @@ namespace NetworkTests
             Assert::IsTrue(b.Join("127.0.0.1", port));
             PumpAll(host, { &a, &b }, 300);
             Assert::IsFalse(b.IsWelcomed(), L"A peer over the slot cap is not admitted.");
+            Assert::AreEqual((int)net::REFUSE_FULL, (int)b.GetRefusal(), L"Refused as full, not left hanging.");
             b.Leave(); a.Leave(); host.Leave();
         }
     };

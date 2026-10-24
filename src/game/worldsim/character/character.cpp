@@ -103,6 +103,7 @@
 #include <input/realcontroller.h>
 #include <camera/supercam.h>
 #include <camera/supercamcontroller.h>
+#include <network/NetWorldHooks.h>
 #endif
 
 const static rmt::Vector vUp( 0.0f, 1.0f, 0.0f );
@@ -685,6 +686,18 @@ void Character::ResetSpeed( void )
     mpSimStateObj->ResetVelocities( );
     mpWalkerLocomotion->SetDesiredSpeed( 0.0f );
 }
+void Character::ApplyNetworkKnockdown( void )
+{
+    if( IsInCar() || GetStateManager() == NULL )
+    {
+        return;
+    }
+    if( GetStateManager()->GetState() == CharacterAi::LOCO )
+    {
+        GetStateManager()->SetState<CharacterAi::InSim>();
+    }
+}
+
 static rmt::Vector dstart,dend;
 void Character::Kick()
 {
@@ -750,6 +763,16 @@ void Character::Kick()
         {
         case PhysicsAIRef::NPCharacter:
             {
+                // A remote player's puppet: the kick goes to that player (PvP)
+                // and its own state stream shows the result; never knock the
+                // puppet locally.
+                if( networld::ReportRemotePlayerHit( static_cast< Character* >( (NPCharacter*)objectHit ),
+                        kickdir.x * CharacterTune::sfKickingForce,
+                        kickdir.y * CharacterTune::sfKickingForce,
+                        kickdir.z * CharacterTune::sfKickingForce ) )
+                {
+                    break;
+                }
                 // We kicked an NPC. Send some events
                 NPCharacter* ch = (NPCharacter*)objectHit;
                 GetEventManager()->TriggerEvent( EVENT_KICK_NPC, ch );

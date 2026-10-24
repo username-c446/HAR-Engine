@@ -7,6 +7,7 @@
 #include "ENetInit.h"
 #include "Packet.h"
 #include "PacketRegistry.h"
+#include "NetTime.h"
 
 #include <enet/enet.h>
 
@@ -58,24 +59,26 @@ namespace net
         // Clears ready state when (re)connecting.
         void ResetPeerReady() { m_peerReady = false; }
 
-        // ---- ping / RTT measurement -----------------------------------------
+        // ---- ping / RTT / server clock --------------------------------------
 
-        // Sends a PING probe to the server now (used both for heartbeat and
-        // RTT). The server answers with PONG; the endpoint records the
-        // round-trip time measured from the sent timestamp to the PONG.
+        // Sends a PING {client time} now. The server answers PONG {echo, server
+        // time}; each answer feeds the RTT and the server-clock estimate.
         void SendPing();
 
-        // Automatic heartbeat: sends a PING every Nth Update() (each auto/PING
-        // keeps the server's liveness window fresh and measures RTT). Default
-        // every 60th Update (~1 Hz at 60fps). Pass 0 to ping on every Update,
-        // or use SendPing() directly for manual control.
-        void SetPingIntervalMs(unsigned intervalUpdateCount)
-        { m_pingEvery = intervalUpdateCount ? intervalUpdateCount : 1; }
+        // Automatic heartbeat period (default 500 ms). The heartbeat also keeps
+        // the server's liveness window fresh. 0 = ping on every Update().
+        void SetPingIntervalMs(unsigned intervalMs) { m_pingIntervalMs = intervalMs; }
 
-        // True once at least one PING->PONG round-trip has completed.
-        bool HasMeasuredPing() const { return m_hasPing; }
-        // Last measured round-trip time in milliseconds (0 if never measured).
-        unsigned GetPingMs() const { return m_pingMs; }
+        // True once at least one PING->PONG round trip has completed.
+        bool     HasMeasuredPing() const { return m_hasPing; }
+        // Smoothed round-trip time in milliseconds (0 before the first PONG).
+        unsigned GetRttMs() const { return m_clock.RttMs(); }
+
+        // Server clock estimate (ms, the server's own epoch). Valid once
+        // IsClockSynced(); seeded by the session from WELCOME, refined by PONGs.
+        bool     IsClockSynced() const { return m_clock.IsSynced(); }
+        uint32_t ServerTimeMs() const { return m_clock.ServerTime(enet_time_get()); }
+        void     SeedServerClock(uint32_t serverTimeMs) { m_clock.SeedFromWelcome(serverTimeMs, enet_time_get()); }
 
     private:
         net::ENetInit        m_enetInit;
@@ -88,11 +91,10 @@ namespace net
         RawPacketFn          m_packetSink;
         uint8_t              m_decodeBuf[MAX_PACKET_PAYLOAD + 4];
 
-        // Ping/RTT state: last PING sent-at timestamp (ms) and measured RTT.
-        enet_uint32          m_pingSentMs   = 0;
-        unsigned             m_pingMs       = 0;
-        bool                 m_hasPing      = false;
-        unsigned             m_pingEvery    = 60;  // auto heartbeat cadence (Update calls)
-        unsigned             m_pingTick     = 0;
+        // Heartbeat and clock estimate.
+        ClockSync            m_clock;
+        bool                 m_hasPing        = false;
+        unsigned             m_pingIntervalMs = 500;
+        enet_uint32          m_lastPingMs     = 0;
     };
 }

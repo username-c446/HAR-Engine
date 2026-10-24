@@ -63,9 +63,14 @@ NetworkMatchManager::NetworkMatchManager()
     : m_hostPort(0)
     , m_localStateProvider(nullptr)
     , m_missionStateProvider(nullptr)
+    , m_correctionHandler(nullptr)
+    , m_playerHitHandler(nullptr)
+    , m_vehicleDriverLookup(nullptr)
+    , m_puppetPlayerLookup(nullptr)
     , m_hostMaxPlayers(0)
-    , m_allowEconomyCheats(false)
     , m_entitiesWelcomed(false)
+    , m_lastRefusal(net::REFUSE_NONE)
+    , m_lastLost(false)
 {
     m_hostPassword[0] = '\0';
     m_clientPassword[0] = '\0';
@@ -111,10 +116,11 @@ bool NetworkMatchManager::StartHost(unsigned short port)
     m_bridge->SetRemotePlayers(&m_remotePlayers);
 
     // Host configuration: optional authorization, slot cap (+1 for the host's
-    // own loopback client), and the server-side economy rules.
+    // own loopback client), and the game's server rules (economy, movement
+    // validation, mods, PvP) — the same GameServer a dedicated server runs.
     m_session->SetHostPassword(m_hostPassword[0] != '\0' ? m_hostPassword : nullptr);
     m_session->SetMaxPeers(m_hostMaxPlayers ? static_cast<size_t>(m_hostMaxPlayers) + 1 : 0);
-    m_session->ConfigureCounter(economy::COUNTER_COINS, economy::MakeCoinConfig(m_allowEconomyCheats));
+    m_gameServer.Attach(m_session->GetServerCore(), m_serverOptions);
 
     // Session-scoped world seed: randomized per match so every host differs, and
     // broadcast to clients in WELCOME so all peers seed their world RNG
@@ -127,6 +133,7 @@ bool NetworkMatchManager::StartHost(unsigned short port)
     bool ok = m_session->StartHost(port, worldSeed);
     if (!ok)
     {
+        m_gameServer.Detach();
         m_hostPort = 0;
         m_bridge.reset();
         return false;
@@ -163,13 +170,13 @@ void NetworkMatchManager::AttachSession()
 {
     net::Session* s = m_session.get();
 
-    // Bridge the world views to the session sinks, then chain our own
-    // join/leave bookkeeping behind the bridge's (it cleans the remote shadow).
+    // Bridge the world views to the session sinks (the session reports a
+    // departure to the bridge itself), then our join/leave notifications.
+    m_lastRefusal = net::REFUSE_NONE;
+    m_lastLost = false;
     m_bridge->AttachToSession(s);
-    net::GamePlayerBridge* bridge = m_bridge.get();
-    s->SetJoinLeaveFn([this, bridge](net::PeerId peer, bool joined)
+    s->SetJoinLeaveFn([this](net::PeerId peer, bool joined)
     {
-        if (!joined) bridge->OnPeerLeft(peer);
         JoinLeaveEvent ev;
         ev.clientId = static_cast<unsigned short>(peer);
         ev.joined = joined;
@@ -184,19 +191,42 @@ void NetworkMatchManager::AttachSession()
         WorldRegistry().OnAuthoritative(e, reason);
         Entities().OnAuthoritative(e, reason);
     });
-    s->SetEntityStateSink([](net::PeerId owner, const net::EntityStateRecord& rec)
+    s->SetEntityStateSink([](net::PeerId owner, const net::EntityStateRecord& rec, uint32_t serverTimeMs)
     {
-        Entities().OnEntityState(owner, rec);
+        Entities().OnEntityState(owner, rec, serverTimeMs);
+    });
+    s->SetStateCorrectionSink([this](const uint8_t* data, uint16_t size)
+    {
+        if (m_correctionHandler == nullptr || size < PlayerNetworkState::SERIALIZED_SIZE) return;
+        PlayerNetworkState st;
+        st.Deserialize(reinterpret_cast<const char*>(data));
+        m_correctionHandler(st);
     });
     s->SetLedgerSink([s](const net::LedgerOutcome& o)
     {
         Economy().OnOutcome(o, s->GetLedger().Pending());
     });
 
+    s->SetPlayerEventSink([this](net::PeerId from, uint8_t kind, const uint8_t* data, uint16_t size)
+    {
+        net::NetEntityHit hit;
+        if (m_playerHitHandler == nullptr || !hit.Decode(data, size)) return;
+        m_playerHitHandler(from, kind, hit);
+    });
+    s->SetEntityEventSink([](net::PeerId from, uint64_t entity, uint8_t kind, const uint8_t* data, uint16_t size)
+    {
+        Entities().OnEntityEvent(from, entity, kind, data, size);
+    });
+
     WorldRegistry().SetSender([s](const net::WorldStateOp& op) { return s->RequestWorldState(op); });
     Entities().SetSenders(
         [s](const net::WorldStateOp& op) { return s->RequestWorldState(op); },
-        [s](const std::vector<net::EntityStateRecord>& recs) { return s->SendEntityStates(recs); });
+        [s](const std::vector<net::EntityStateRecord>& recs) { return s->SendEntityStates(recs); },
+        [s](uint64_t entity, uint8_t kind, const uint8_t* data, uint16_t size)
+        {
+            return s->SendEntityEvent(entity, kind, data, size);
+        });
+    Entities().SetClock([s]() { return s->ServerTimeMs(); });
     Economy().SetSender([s](net::CounterId c, uint8_t reason, int32_t delta, uint64_t claim)
     {
         return s->RequestLedgerChange(c, reason, delta, claim);
@@ -212,6 +242,14 @@ void NetworkMatchManager::Leave()
 {
     if (m_session)
         m_session->Leave();
+    m_lastRefusal = net::REFUSE_NONE;
+    m_lastLost = false;
+    ResetServices();
+}
+
+void NetworkMatchManager::ResetServices()
+{
+    m_gameServer.Detach();
     m_hostPort = 0;
     m_remotePlayers.Clear();
     m_remoteMissionStates.clear();
@@ -220,6 +258,7 @@ void NetworkMatchManager::Leave()
     WorldRegistry().SetSender(NetWorldRegistry::SendFn());
     WorldRegistry().ClearState();
     Entities().SetSenders(NetEntityManager::SendOpFn(), NetEntityManager::SendStatesFn());
+    Entities().SetClock(NetEntityManager::ClockFn());
     Entities().OnMatchEnd();
     Economy().SetSender(PlayerEconomy::SendFn());
     Economy().OnMatchEnd();
@@ -278,6 +317,12 @@ void NetworkMatchManager::SetHostConfig(const char* password, unsigned short max
     m_hostMaxPlayers = maxPlayers;
 }
 
+void NetworkMatchManager::SetHostPvp(bool pvp)
+{
+    m_serverOptions.pvp = pvp;
+    if (IsHosting()) m_gameServer.SetPvp(pvp);
+}
+
 void NetworkMatchManager::SetClientPassword(const char* password)
 {
     m_clientPassword[0] = '\0';
@@ -290,6 +335,47 @@ void NetworkMatchManager::SetClientPassword(const char* password)
     if (m_session) m_session->SetPassword(m_clientPassword[0] != '\0' ? m_clientPassword : nullptr);
 }
 
+bool NetworkMatchManager::ReportRemoteVehicleHit(void* ghost, const net::NetEntityHit& hit)
+{
+    int peer = m_vehicleDriverLookup ? m_vehicleDriverLookup(ghost) : 0;
+    if (peer <= 0) return false;
+    if (IsPvpEnabled())
+    {
+        uint8_t buf[net::NetEntityHit::SIZE];
+        uint16_t n = hit.Encode(buf, sizeof(buf));
+        if (n) m_session->SendPlayerEvent(static_cast<net::PeerId>(peer), PE_VEHICLE_HIT, buf, n);
+    }
+    return true;
+}
+
+bool NetworkMatchManager::ReportRemotePlayerHit(void* puppet, const net::NetEntityHit& hit)
+{
+    int peer = m_puppetPlayerLookup ? m_puppetPlayerLookup(puppet) : 0;
+    if (peer <= 0) return false;
+    if (IsPvpEnabled())
+    {
+        uint8_t buf[net::NetEntityHit::SIZE];
+        uint16_t n = hit.Encode(buf, sizeof(buf));
+        if (n) m_session->SendPlayerEvent(static_cast<net::PeerId>(peer), PE_KNOCKDOWN, buf, n);
+    }
+    return true;
+}
+
+bool NetworkMatchManager::IsRemotePlayerNear(float x, float z, float radius) const
+{
+    struct Query { float x, z, r2; bool found; } q = { x, z, radius * radius, false };
+    m_remotePlayers.ForEachPlayer(
+        [](int, const PlayerNetworkState& st, void* user) -> bool
+        {
+            Query* q = static_cast<Query*>(user);
+            float dx = st.x - q->x, dz = st.z - q->z;
+            if (dx * dx + dz * dz <= q->r2) { q->found = true; return false; }
+            return true;
+        },
+        &q);
+    return q.found;
+}
+
 void NetworkMatchManager::DrainJoinLeaveEvents(std::vector<JoinLeaveEvent>& out)
 {
     out.insert(out.end(), m_pendingEvents.begin(), m_pendingEvents.end());
@@ -300,6 +386,18 @@ void NetworkMatchManager::Update(float dtSeconds)
 {
     if (!m_session) return;
     m_session->Update();
+
+    // The match ended on its own: refused by the server or connection lost.
+    if (m_session->GetRefusal() != net::REFUSE_NONE || m_session->IsConnectionLost())
+    {
+        net::RefuseReason refusal = m_session->GetRefusal();
+        bool lost = m_session->IsConnectionLost();
+        m_session->Leave();
+        ResetServices();
+        m_lastRefusal = refusal;
+        m_lastLost = lost;
+        return;
+    }
 
     // Keep the bridge's notion of "who am I" in sync with the session. The
     // local peer id is resolved by WELCOME (0 before, then the server-assigned

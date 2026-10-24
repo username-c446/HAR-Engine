@@ -328,6 +328,11 @@ public: // MEMBERS
     // There appear to be bugs when this happens ( character getting stuck in the ground )
     virtual void ApplyForce( const rmt::Vector& direction, float force ){}
 
+    // Networked match (PvP): another player knocked us down. Plays the
+    // flail + get-up sequence (InSim) in place; no velocity is applied, for the
+    // ground-sticking reason above.
+    void ApplyNetworkKnockdown( void );
+
     void SetAmbient(const char* location, float radius);
     bool IsAmbient(void) { return mAmbient;}
     void EnableAmbientDialogue(bool);

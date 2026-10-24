@@ -2,17 +2,19 @@
 
 #include "PlayerNetworkState.h"
 #include "RemotePlayerManager.h"
+#include "RemoteStateTrack.h"
 
 #include <map>
 #include <cstring>
 
-// Bridges an online match's remote players' vehangleModel state (inVehicle +
-// vehicleModel + netVehicleId) to a world-side "ghost" machine.
+// Bridges remote players' vehicle state (inVehicle + vehicleModel +
+// netVehicleId + the kinematic mirror) to a world-side "ghost" machine.
 //
 // Only the data-level concern lives here: knowing when a remote driver entered
-// or left the same machine, and telling the world sink to spawn a vehicle of
-// the reported model. The actual in-world vehicle creation/movement is done by
-// the sink, so this class stays unit-testable.
+// or left a machine, telling the sink to spawn a vehicle of the reported model,
+// and rendering it by snapshot interpolation (RemoteStateTrack). The in-world
+// vehicle creation/movement is done by the sink, so this class stays
+// unit-testable.
 class RemoteVehicleWorldView
 {
 public:
@@ -35,14 +37,14 @@ public:
     ~RemoteVehicleWorldView();
 
     void SetSink(const Sink& sink) { m_sink = sink; }
-    void SetSmoothing(float seconds) { m_smoothingSeconds = seconds; }
+    void SetTiming(const RemoteStateTrack::Timing& timing) { m_timing = timing; }
 
-    // Ingest one remote driver's latest state. Spawns a ghost vehicle when the
-    // driver reports being in a machine, moves it when driving, despawns it when
-    // the driver exits or the model changes.
-    void SyncDriver(int playerId, const PlayerNetworkState& state);
+    // Ingest one remote driver's latest state (with its server sample time).
+    // Spawns a ghost when the driver is in a machine, despawns it when the
+    // driver gets out or the machine changes.
+    void SyncDriver(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs = 0);
 
-    // Removes every ghost (e.g. a remote player left).
+    // Removes the ghost of one driver (e.g. a remote player left).
     void ClearDriver(int playerId);
 
     // Despawns the ghost of any remote player no longer reported by the
@@ -52,31 +54,27 @@ public:
     // Removes all ghosts (e.g. leaving the match).
     void Clear();
 
-    // Advances ghost positions smoothly toward their targets (call after Sync).
+    // Moves every ghost to its interpolated pose (call after SyncDriver).
     void Update(float dt);
+
+    // The remote driver of ghost machine `handle` (0 if none).
+    int FindDriver(const void* handle) const;
 
 private:
     struct Entry
     {
-        void* handle;
-        char model[16];
-        int netVehicleId;
-        float targetX, targetY, targetZ;
-        float visualX, visualY, visualZ;
-        float targetYaw, visualYaw; // smoothed over shortest arc (mirrors player facing)
-        uint8_t targetSteer;
-        uint16_t targetSpeedKmh;
-        uint8_t targetState;
-        uint8_t targetFlags;
-        bool smoothingApplied;
+        void* handle = nullptr;
+        char model[16] = { 0 };
+        int netVehicleId = 0;
+        RemoteStateTrack track;
     };
 
-    void SpawnFor(int playerId, const PlayerNetworkState& state);
+    void SpawnFor(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs);
     void DespawnIt(int playerId, Entry& entry);
 
     Sink m_sink;
+    RemoteStateTrack::Timing m_timing;
     std::map<int, Entry> m_entries;
-    float m_smoothingSeconds;
 
     RemoteVehicleWorldView(const RemoteVehicleWorldView&);
     RemoteVehicleWorldView& operator=(const RemoteVehicleWorldView&);

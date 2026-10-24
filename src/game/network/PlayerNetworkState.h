@@ -30,6 +30,13 @@ struct PlayerNetworkState
     uint16_t vehSpeedKmh;       // machine speed, km/h
     uint8_t  vehState;          // VehicleState enum: 0=VS_NORMAL,1=VS_SLIP,2=VS_EBRAKE_SLIP
     uint8_t  vehFlags;          // VEH_FLAG_* below (brake / reverse)
+    uint8_t  vehDamage;         // machine damage 0 (intact) .. 255 (wrecked)
+
+    // Bumped by the sender on every deliberate discontinuity of its position
+    // (respawn, interior / mission teleport). The server's movement validator
+    // lets a position jump through only together with a new value (rate-
+    // limited), so speed / teleport hacks are refused.
+    uint8_t  teleportSeq;
 
     // Animation/prediction flags carried so a receiver can avoid smoothing the
     // trajectory during behaviors that are not continuous locomotion (e.g. a
@@ -71,7 +78,8 @@ struct PlayerNetworkState
     // 4 floats + vehicleModel[16] + int32 + float + 2*uint8  (base, 42)
     // + 2*uint16 + 2*uint8 + uint8                          (loco, +7)
     // + uint8                                               (actionEvent, +1)
-    // + float + uint8 + uint16 + uint8 + uint8              (vehicle mirror, +9)  => 58 total.
+    // + float + uint8 + uint16 + uint8 + uint8              (vehicle mirror, +9)
+    // + uint8 vehDamage + uint8 teleportSeq                 (+2)  => 60 total.
     static constexpr const int SERIALIZED_SIZE = sizeof(float) * 4
         + sizeof(vehicleModel)
         + sizeof(int32_t)
@@ -86,6 +94,9 @@ struct PlayerNetworkState
         + sizeof(float)
         + sizeof(uint8_t)
         + sizeof(uint16_t)
+        + sizeof(uint8_t)
+        + sizeof(uint8_t)
+        // damage + teleport sequence
         + sizeof(uint8_t)
         + sizeof(uint8_t);
 

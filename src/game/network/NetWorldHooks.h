@@ -31,9 +31,20 @@ namespace networld
     bool     IsEconomyConverging();
 
     // ---- owner-simulated entities (NetEntityManager) ----
-    void     AddLocalEntity(void* handle, const net::NetEntitySpawn& spawn);
+    // `boundId`: the static world object being moved (parked car), 0 = dynamic.
+    void     AddLocalEntity(void* handle, const net::NetEntitySpawn& spawn, uint64_t boundId = 0);
     void     RemoveLocalEntity(void* handle);
+    bool     IsLocalEntity(void* handle);
     bool     IsRemoteEntity(void* handle);
-    int      CountRemoteEntitiesNear(float x, float z, float radius);
+    int      CountRemoteEntitiesNear(float x, float z, float radius, uint8_t kind = net::NEK_NONE);
+    // Our physics hit another player's entity (a ghost): forward to its owner.
+    bool     ReportEntityHit(void* remoteHandle, const net::NetEntityHit& hit);
+    // Our vehicle hit a ghost machine: an entity's (to its owner) or a remote
+    // player's own car (to that player, only with PvP).
+    bool     ReportGhostHit(void* ghost, const net::NetEntityHit& hit);
+    // Our attack hit a character: if it is a remote player's puppet, the knock
+    // is sent to that player (PvP) and true is returned — the caller must not
+    // apply it locally.
+    bool     ReportRemotePlayerHit(void* character, float vx, float vy, float vz);
     bool     IsInMatch();
 }

@@ -28,6 +28,13 @@
 //
 // Owner-policy entries flagged WSF_ERASE_ON_OWNER_LEAVE (dynamic entities such
 // as traffic) are erased server-side when their owner disconnects.
+//
+// Ownership migration: an owner may RELEASE its entry (owner -> 0, flagged
+// WSF_CLAIMABLE, optionally with a fresh value such as the current pose); any
+// peer may then CLAIM it — the first claim wins, later ones are rejected. An
+// entry flagged WSF_RELEASE_ON_OWNER_LEAVE is released (not erased) when its
+// owner disconnects. A claimable entry nobody claims within the server's claim
+// window is erased.
 namespace net
 {
     // Write policy, enforced by the server per entry.
@@ -42,13 +49,18 @@ namespace net
     enum WorldStateFlags : uint8_t
     {
         WSF_NONE                 = 0x00,
-        WSF_ERASE_ON_OWNER_LEAVE = 0x01, // owner disconnect erases the entry
+        WSF_ERASE_ON_OWNER_LEAVE   = 0x01, // owner disconnect erases the entry
+        WSF_RELEASE_ON_OWNER_LEAVE = 0x02, // owner disconnect releases it for a claim
+        WSF_CLAIMABLE              = 0x80, // server-set: released, waiting for a claim
     };
 
     enum WorldStateOpKind : uint8_t
     {
         WSO_SET   = 0,
         WSO_ERASE = 1,
+        WSO_RELEASE = 2, // owner gives the entry up (value: optional new value)
+        WSO_CLAIM   = 3, // take a released entry
+        WSO_COUNT
     };
 
     static constexpr const uint8_t  WS_MAX_VALUE   = 48;     // bytes per entry value
@@ -133,16 +145,23 @@ namespace net
         // Applies `op` from peer `from`. `out` receives the resulting (or, on
         // rejection, the current) entry; `existed` tells whether an entry exists
         // after the call (false for an erase or a rejected write to nothing).
-        Result Apply(PeerId from, const WorldStateOp& op, WorldStateEntry& out, bool& existed);
+        // `nowMs` (server clock) timestamps releases for ExpireClaimable.
+        Result Apply(PeerId from, const WorldStateOp& op, WorldStateEntry& out, bool& existed,
+                     uint32_t nowMs = 0);
 
         // Owner left: erases its WSF_ERASE_ON_OWNER_LEAVE entries (keys appended
-        // to `erased`) and hands its other owned entries to nobody (owner 0, so
-        // they become read-only until the server reassigns them).
-        void OnPeerLeft(PeerId peer, std::vector<WorldStateKey>& erased);
+        // to `erased`), releases its WSF_RELEASE_ON_OWNER_LEAVE entries (the new
+        // entries appended to `released`) and hands its other owned entries to
+        // nobody (owner 0, read-only).
+        void OnPeerLeft(PeerId peer, std::vector<WorldStateKey>& erased,
+                        std::vector<WorldStateEntry>* released = nullptr, uint32_t nowMs = 0);
+
+        // Erases claimable entries released more than windowMs ago.
+        void ExpireClaimable(uint32_t nowMs, uint32_t windowMs, std::vector<WorldStateKey>& erased);
 
         bool Find(const WorldStateKey& key, WorldStateEntry& out) const;
         size_t Size() const { return m_entries.size(); }
-        void Clear() { m_entries.clear(); }
+        void Clear() { m_entries.clear(); m_releasedAt.clear(); }
 
         template <typename Fn>
         void ForEach(Fn fn) const
@@ -152,6 +171,7 @@ namespace net
 
     private:
         std::map<WorldStateKey, WorldStateEntry> m_entries;
+        std::map<WorldStateKey, uint32_t>        m_releasedAt; // claimable entries
     };
 
     // ---------------------------------------------------------------------

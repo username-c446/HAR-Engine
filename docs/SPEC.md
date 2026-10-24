@@ -20,74 +20,100 @@ to any specific game.
 ## 1. Project map (network area)
 
 The network layer is split into independent layers: the reusable engine layer
-(`src/game/netengine/`) and the game layer (`src/game/network/`). The legacy
-monolith `NetworkServer`/`NetworkClient` has been fully removed.
+(`src/game/netengine/`), the game layer (`src/game/network/`) and the dedicated
+server product (`src/server/`). The legacy monolith `NetworkServer`/`NetworkClient`
+has been fully removed.
 
 ### Engine layer `src/game/netengine/` (reusable, world-agnostic)
 
 | File | Role |
 |------|------|
-| `Packet.h` | Wire protocol: `PacketId`, protocol version, reserved id ranges, bounds-checked `Writer`/`Reader` |
-| `PacketRegistry.{h,cpp}` | Packet registry (id → handler) instead of `switch`; extensible without touching the core |
-| `ServerEndpoint.{h,cpp}` | Pure ENet host: peer admission, `PeerId`, liveness tracking, timeout sweep, `KickPeer`, PING probes |
-| `ClientEndpoint.{h,cpp}` | Pure ENet client: connect, framing, heartbeat (`SetPingIntervalMs`), RTT (`SendPing`/`GetPingMs`) |
-| `Session.{h,cpp}` | Match orchestrator: host/join/leave, state relay, password (`SetHostPassword`/`SetPassword`), validator (`SetStateValidator`), peer roster |
-| `GamePlayerBridge.{h,cpp}` | Game adapter: ties `PlayerNetworkState` to the `Session`'s opaque blobs |
-| `WorldInterfaces.h` | Interfaces `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator` — the world attaches externally |
-| `ENetInit.{h,cpp}` | RAII reference-counting for ENet (static defined in `.cpp`) |
+| `Packet.h` | Wire protocol: `PacketId`, `PROTOCOL_VERSION`/`PROTOCOL_MAGIC`, refusal reasons, ENet channels + per-id delivery (`ChannelOf`), bounds-checked `Writer`/`Reader` |
+| `PacketRegistry.{h,cpp}` | Packet registry (id → handler) |
+| `ServerEndpoint.{h,cpp}` | Pure ENet host: `PeerId`s, framing, liveness sweep, `KickPeer` (drains queued packets first), server clock `NowMs`, PONG with server time, per-peer RTT |
+| `ClientEndpoint.{h,cpp}` | Pure ENet client: framing, time-based heartbeat, RTT + server-clock estimate (`ClockSync`) |
+| `NetTime.h` | `ClockSync`, `SnapshotBuffer<T>` (jitter buffer), `TokenBucket` |
+| `ServerCore.{h,cpp}` | **The authoritative server** (one implementation for the hosting game and the dedicated server): handshake, admission, world state, ledger, relays, validation, rate limits, session options, ownership migration expiry |
+| `Session.{h,cpp}` | A match participant: always a client; when hosting it also runs an embedded `ServerCore` and joins it through loopback |
+| `WorldState.{h,cpp}` | Replicated world table / mirror / codecs, ownership transfer (§17, §18.5) |
+| `Ledger.{h,cpp}` | Server-authoritative counters (§17.3) |
+| `GamePlayerBridge.{h,cpp}` | Game adapter: ties `PlayerNetworkState` to the session's opaque blobs |
+| `WorldInterfaces.h` | `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator`/`IMissionStateProvider` |
+| `ENetInit.{h,cpp}` | RAII reference-counting for ENet |
 
 ### Game layer `src/game/network/`
 
 | File | Role |
 |------|------|
-| `NetworkPacket.h` | Game types and little-endian primitives (`net::Write*/Read*`) |
-| `PlayerNetworkState.{h,cpp}` | Player state struct (position/rotation/vehicle) + serialization |
-| `NetworkMatchManager.{h,cpp}` | THIN BRIDGE: keeps the old public API (`StartHost`/`JoinHost`/`Leave`/`GetRemotePlayers`), internally delegates to `net::Session` + `GamePlayerBridge` |
-| `RemotePlayerManager.{h,cpp}` | Remote-player registry (keyed by clientId) |
-| `RemotePlayerWorldView.{h,cpp}` | Visualization of remote on-foot players + interpolation |
-| `RemoteVehicleWorldView.{h,cpp}` | Visualization of "ghost" vehicles of remote drivers |
-| `ServerModManager.{h,cpp}` | Server-side Lua mods (admission/validation hooks) |
-| `MissionSyncManager.{h,cpp}` | Mission/stage/objective sync between clients (co-op progress) |
-| `MissionSyncState.{h,cpp}` | Serializable mission state (mission/stage/objective) |
+| `NetworkPacket.h` | Little-endian primitives (`net::Write*/Read*`) |
+| `PlayerNetworkState.{h,cpp}` | Player state struct + serialization (§3) |
+| `GameServer.{h,cpp}` | The game's server rules applied to a `ServerCore` (economy, movement validation, Lua mods, PvP) — used by the hosting game AND the dedicated server |
+| `PlayerMovementValidator.{h,cpp}` | Server-side movement plausibility (§18.3) |
+| `NetworkMatchManager.{h,cpp}` | Orchestrator for gameplay (§10) |
+| `RemotePlayerManager.{h,cpp}` | Remote-player registry (state + server sample time) |
+| `RemoteStateTrack.h` | Snapshot interpolation of one remote player (§11) |
+| `RemotePlayerWorldView.{h,cpp}` | Remote on-foot players in the world |
+| `RemoteVehicleWorldView.{h,cpp}` | Ghost machines of remote drivers |
+| `NetWorldRegistry`, `NetEntityManager`, `PlayerEconomy`, `NetWorldHooks`, `WorldObjectId.h`, `EconomyConfig.h` | Replicated world (§17, §18) |
+| `ServerModManager.{h,cpp}` | Server-side Lua mods |
+| `MissionSyncManager`/`MissionSyncState` | Mission progress (co-op) |
 | `NetworkConsoleCommands.{h,cpp}` | Console commands `host`/`join`/`match` |
 
+### Dedicated server `src/server/` (product)
+
+`HarServer.vcxproj` → `har_server.exe` (§8).
+
 In-game integration: `src/game/contexts/gameplay/gameplaycontext.cpp`
-(state provider, sinks, calls in the game loop) and
+(providers, sinks, calls in the game loop) and
 `src/game/main/commandlineoptions.{h,cpp}` (CLI auto-start).
 
 ---
 
 ## 2. Network model and transport
 
-- **Transport:** ENet (vcpkg `enet`), channel `GAME_CHANNEL = 0`, all gameplay
-  packets reliable (`ENET_PACKET_FLAG_RELIABLE`). Order and delivery are
-  guaranteed by ENet; our protocol is only type + payload.
-- **Architectural principle:** authoritative server (not P2P). The server admits
-  clients, issues `clientId`, validates states, relays them, keeps the entity
-  registry and distributes it to clients. The client is not self-authoritative.
-- `MAX_PACKET_SIZE = 512` bytes. `CLIENT_TIMEOUT_MS = 8000`, `PING_INTERVAL_MS = 2000`.
-- Data is linear, there is no bloated protocol: payload can contain repeated
-  `clientId` (in `PLAYER_STATE`), but the full id is always the server's
-  authoritative concern.
+- **Transport:** ENet (vcpkg `enet`), three channels (`Packet.h`):
+  - `CH_RELIABLE` (0) — reliable ordered: handshake, world state, ledger,
+    events, user data;
+  - `CH_STREAM` (1) — unreliable sequenced: latest-state streams
+    (`PID_PLAYER_STATE`, `PID_MISSION_STATE`, `PID_ENTITY_STATE`,
+    `PID_USER_STREAM`). A lost stream packet is replaced by the next one
+    instead of stalling everything behind a retransmit; an older packet that
+    arrives late is dropped by ENet's sequencing;
+  - `CH_TIME` (2) — unreliable: `PID_PING`/`PID_PONG` (a reliable retransmit
+    would inflate the RTT sample).
+  The channel is chosen by the packet id in one place (`ChannelOf`); both
+  endpoints use it.
+- **Authoritative server**, never P2P. The server admits clients, assigns
+  `PeerId`s, validates, relays and arbitrates; clients predict and the server
+  decides (§17).
+- `MAX_PACKET_PAYLOAD = 512` bytes; framing `[u16 id][u16 size][payload]`.
+- Liveness: the client pings every 500 ms (`SetPingIntervalMs`); the server drops a
+  peer silent for 30 s (`SetClientTimeoutMs`).
 
-### Packet types (`net::PacketType`, 1-byte tag at the start)
+### Packet ids (`Packet.h`, `PROTOCOL_VERSION = 2`)
 
-| Tag | Name | Direction | Purpose |
-|-----|------|-----------|---------|
-| 0 | `HELLO` | C→S | Announcement after ENet connect |
-| 1 | `WELCOME` | S→C | Authoritative `clientId` (admission analog) |
-| 2 | `PLAYER_STATE` | C→S→C | Player state (relay) |
-| 3 | `DISCONNECT` | C→S | Disconnect declaration |
-| 4 | `PLAYER_LIST` | S→C | Authoritative registry of present entities |
-| 5 | `VEHICLE_STATE` | reserved | (described in §6 as part of PLAYER_STATE in practice) |
-| 6 | `PING` | C→S | Heartbeat + RTT measurement |
-| 7 | `PONG` | S→C | Ping reply |
-| 8 | `AUTH` | C→S | Password for a protected host |
-| 9 | `MISSION_STATE` | C→S→C | Mission/stage/objective progress (relay, for co-op) |
+| Id | Name | Dir | Purpose |
+|----|------|-----|---------|
+| 0x00 | `HELLO` | C→S | `u32 magic, u16 protocol, u32 game version, u8 n, password` |
+| 0x01 | `WELCOME` | S→C | `u16 peer id, u32 server time, u32 session options` |
+| 0x03 | `REFUSE` | S→C | `u8 reason, u16 server protocol`, then disconnect |
+| 0x04 | `PLAYER_LIST` | S→C | admitted peers |
+| 0x05/0x06 | `PING`/`PONG` | C↔S | `{client time}` / `{echo, server time}` |
+| 0x07 | `WORLD_SEED` | S→C | `u32` |
+| 0x08 | `SESSION_INFO` | S→C | session options changed |
+| 0x09 | `STATE_CORRECTION` | S→C | validator refused our state: snap to this blob |
+| 0x10–0x15 | `WS_*` | | replicated world (§17.1) |
+| 0x20/0x21 | `LEDGER_*` | | counters (§17.3) |
+| 0x100 | `PLAYER_STATE` | C→S→C | player stream (timestamped) |
+| 0x102 | `MISSION_STATE` | C→S→C | mission progress stream |
+| 0x103 | `ENTITY_STATE` | C→S→C | owner-checked entity stream |
+| 0x104 | `ENTITY_EVENT` | C→S→owner | hit on an entity (§18.6) |
+| 0x105 | `PLAYER_EVENT` | C→S→victim | PvP hit (§18.7) |
+| 0x8000/0x8001 | `USER`/`USER_STREAM` | C→S→C | opaque mod data, reliable / stream |
 
-> Note: `PACKET_VEHICLE_STATE` is declared in the enum, but the current
-> implementation carries the transport data inside `PLAYER_STATE` (see §6), i.e.
-> packet 5 is not used on the wire yet.
+Stream framing: client → server `[u32 sample server time][payload]`; server →
+others `[u16 sender][u32 time][payload]`. The server clamps the time into
+`[now − 2000 ms, now]` (a client cannot claim the future).
 
 ---
 
@@ -101,7 +127,7 @@ struct PlayerNetworkState {
     float rotY;               // rotation around vertical
     char  vehicleModel[16];   // vehicle model name ("" if on foot)
     int32 netVehicleId;       // stable network id of the vehicle
-    float vehicleSpeed;       // vehicle speed (km/h) for validation
+    float vehicleSpeed;       // vehicle speed (km/h)
     uint8 inVehicle;          // 1 = in a vehicle
     uint8 flags;              // FLAG_JUMPING | FLAG_IN_AIR | FLAG_LOCO_TURBO
     // --- continuous locomotion (on foot) ---
@@ -116,93 +142,107 @@ struct PlayerNetworkState {
     uint8  vehSteer;          // signed steer -128..127 -> -45..+45 deg
     uint16 vehSpeedKmh;       // speed, km/h
     uint8  vehState;          // VS_NORMAL / VS_SLIP / VS_EBRAKE_SLIP
-    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE
+    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE | VEH_FLAG_DESTROYED
+    uint8  vehDamage;         // machine damage 0 (intact) .. 255 (wrecked)
+    uint8  teleportSeq;       // bumped on every deliberate position discontinuity
 };
 ```
 
-- `SERIALIZED_SIZE = 42 (base) + 7 (locomotion) + 1 (actionEvent) + 9 (vehicle) = 58` bytes.
+- `SERIALIZED_SIZE = 42 (base) + 7 (locomotion) + 1 (actionEvent) + 8 (vehicle) + 2 = 60` bytes.
 - In a vehicle the locomotion/action fields are zeroed; on foot the vehicle fields are.
 - `actionEvent` comes from `net::LocalActionLatch` (`LocalActionLatch.h`): the game's
-  action sites for the local avatar (`GetCharacter(0)`) call `Report(id)`; the latch
-  holds the latest action with a 3-bit sequence (`MakeActionEvent`/`ActionId`). The
-  sender holds the value and the receiver fires on a byte change, so a repeat of the
-  same action differs by seq and a late snapshot sample never loses a clip.
-  Sources: `state.cpp` (DODGE, CRINGE, ATTACK, CELEB_SMALL/BIG, FLAIL in
-  `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK in `JumpAction`, GETUP in
-  `GetUpAction::WakeUp`). Jumps ride `FLAG_JUMPING` (not `ACTION_JUMP`) so they do
-  not double-fire. `ACTION_KD`/`ACTION_SURF` are reserved.
-- Little-endian-compatible serialization, free of padding bugs
-  (`Serialize`/`Deserialize` in `PlayerNetworkState.cpp` via `net::Write*`).
-- **Validation link:** `inVehicle` picks the speed limit on the server
-  (`kMaxSpeedOnFoot ≈ 15 m/s`, `kMaxSpeedInVehicle ≈ 120 m/s`).
-- **Vehicle link:** `vehicleModel` + `netVehicleId` go to `RemoteVehicleWorldView`
-  so the receiver spawns a ghost vehicle of the same model. `netVehicleId` is
-  derived from `mVehicleCentralIndex` (or a pointer hash as fallback) — stable
-  within a session.
+  action sites for the local avatar call `Report(id)`; the latch holds the latest
+  action with a 3-bit sequence (`MakeActionEvent`/`ActionId`). The receiver fires on
+  a byte change. Sources: `state.cpp` (DODGE, CRINGE, ATTACK, CELEB_SMALL/BIG, FLAIL
+  in `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK, GETUP). Jumps ride
+  `FLAG_JUMPING`. `ACTION_KD`/`ACTION_SURF` are reserved.
+- `vehDamage` = `(1 − Vehicle::GetHealthFraction()) · 255`; receivers show it on the
+  ghost machine (`Vehicle::ApplyNetworkDamage`).
+- `teleportSeq`: the game teleports the avatar from many places, so the provider
+  detects it (`TrackLocalTeleport` in `gameplaycontext.cpp`): a jump between two
+  samples that no vehicle (110 m/s) or runner (20 m/s) can make, plus 25 m. A
+  server correction is not counted (the server already knows that pose). The server
+  lets a jump through only together with a new value, rate-limited (§18.3).
+- Serialization is little-endian and padding-free (`net::Write*`).
+- `vehicleModel` + `netVehicleId` go to `RemoteVehicleWorldView`, so the receiver
+  spawns a ghost of the same model.
 
 ---
 
-## 4. Server layer `net::ServerEndpoint` + `net::Session`
+## 4. Server: `net::ServerCore`
 
-Server-side logic is split into two layers:
+One authoritative server implementation (`netengine/ServerCore.h`). The hosting
+game runs it inside its `Session` (embedded) and joins it through loopback; the
+dedicated server product (§8) runs the same class standalone. Hence a hosted
+match and a dedicated-server match behave identically.
 
-- **`net::ServerEndpoint`** — pure ENet host: peer admission, `PeerId` assignment,
-  packet framing, liveness counting, timeout sweep, auto-PING probing (the client
-  itself requests heartbeats), and forcible `KickPeer`. Knows nothing about a world.
-- **`net::Session`** (host mode) — on top of the server endpoint: verifies the
-  password against `PID_AUTH` and only then sends `WELCOME`+`WORLD_SEED`+`PLAYER_LIST`;
-  relays `PID_PLAYER_STATE` through an optional `IStateValidator` (anti-teleport);
-  keeps the authoritative peer roster.
+### Handshake and admission
+1. ENet connect → `ServerEndpoint` assigns a `PeerId` (from 1). The peer is NOT
+   admitted: nothing but `PID_HELLO` is accepted from it, and it receives nothing
+   about the world (all world/roster broadcasts go to admitted peers only).
+2. `PID_HELLO` is checked in order: magic + `PROTOCOL_VERSION` → game version
+   (`SetGameVersion`, 0 = unchecked) → password (`SetPassword`, empty = open
+   session) → slot cap (`SetMaxPeers`, the host's loopback included) → admission
+   filter (`SetAdmissionFilter`, e.g. a Lua mod's `on_join`). Any failure sends
+   `PID_REFUSE{reason}` (`REFUSE_PROTOCOL`, `_GAME_VERSION`, `_PASSWORD`, `_FULL`,
+   `_DENIED`) and disconnects after the refusal is delivered.
+3. A peer that does not send a valid HELLO within `SetHandshakeTimeoutMs` (5 s) is
+   refused with `REFUSE_HANDSHAKE`.
+4. Admission: `WELCOME{peer, server time, options}` + `WORLD_SEED` +
+   `PLAYER_LIST` to everyone + the world snapshot (reliable ordered channel: the
+   whole world arrives before any later change).
+5. The ENet transport capacity is the slot cap + 4, so a client over the cap is
+   told `REFUSE_FULL` instead of timing out.
 
-### Connection (admission)
-1. ENet connect → `ServerEndpoint` assigns a `PeerId` (`m_nextPeerId++`, starts at 1).
-2. If the `Session` is password-protected (`SetHostPassword`), `WELCOME` is deferred
-   until the client sends a correct `PID_AUTH`; a wrong/missing password → `KickPeer`
-   (the peer never learns the world composition).
-3. Without a password — `WELCOME` + `WORLD_SEED` immediately, then `PLAYER_LIST` to all.
+### Rate limits (`RateLimitConfig`, `SetRateLimits`)
+Per admitted peer, token buckets per class: streams (90/s, burst 180), requests
+(world state / ledger / events: 240/s, burst 600 — a joiner flushes its queue at
+once), reliable user packets (60/s, burst 120) and bytes (96 KiB/s, burst 192
+KiB). A packet over budget is dropped; 300 drops within 10 s →
+`REFUSE_FLOOD` and kick. `GetStats()` counts refusals, drops, validator refusals,
+corrections and flood kicks.
 
-### Heartbeat / dead sweep
-- The client sends `PID_PING` at a configured frequency
-  (`ClientEndpoint::SetPingIntervalMs`); every inbound packet refreshes the peer's
-  `lastSeenMs` in `ServerEndpoint`.
-- At the end of `ServerEndpoint::Update()` a sweep runs: `now - lastSeenMs >
-  m_clientTimeoutMs` → the peer is removed, `PeerEvent{id,false}` (the Session
-  cleans its roster), and `enet_peer_disconnect` is called. `SetClientTimeoutMs`
-  overrides the window (for tests).
+### Relay and validation
+- `PID_PLAYER_STATE` passes `IStateValidator::ValidatePeerState(from, blob,
+  serverNow, correction)` (§18.3): `SV_ACCEPT` relays, `SV_DROP` drops,
+  `SV_CORRECT` drops and sends `PID_STATE_CORRECTION` with the blob to snap to.
+- Streams are relayed timestamped (§2); entity streams only for records the
+  sender owns; entity events go to the owner; player events to the victim with
+  PvP on.
+- Departure: owned entities are erased or released (§18.5), balances dropped, the
+  validator forgets the peer, `PLAYER_LIST` is broadcast.
 
-### Validation and relay
-- `net::Session` feeds every inbound `PID_PLAYER_STATE` to
-  `IStateValidator::ValidatePeerState` (when set). A rejected state is **not
-  relayed**; the last honest state stays with receivers.
-- `GamePlayerBridge`/tests implement the validator as an anti-teleport gate with a
-  speed limit chosen by `inVehicle` (`kMaxSpeedOnFoot ≈ 15 m/s`,
-  `kMaxSpeedInVehicle ≈ 120 m/s`).
-- Accepted state is relayed to all other peers as `PLAYER_STATE` with sender = `PeerId`.
-
-### Entity registry
-- After each connect/disconnect/sweep the server sends `PLAYER_LIST` to all
-  (`uint16 count` + array of `PeerId`). This is the authoritative source of world
-  composition.
-
-### Configuration
-- `Session::SetHostPassword(pw)` — protect the host; `ServerEndpoint::SetClientTimeoutMs`.
+### Observers
+`SetJoinLeaveFn` (server-side join/leave), `SetWorldChangeObserver` (every
+accepted change/erasure), `SetUserPacketObserver`.
 
 ---
 
-## 5. Client layer `net::ClientEndpoint` + `net::Session`
+## 5. Client: `net::Session`
 
-- `net::ClientEndpoint::Connect(ip, port)` → ENet host + peer.
-- `Session::SetPassword(pw)` sets the password; the `PID_AUTH` send is deferred
-  until the ENet connection is established (`IsPeerReady()`) via
-  `Session::SendAuthIfDue()` in `Update()` — sending before the handshake would
-  drop the payload on a protected host.
-- `net::ClientEndpoint` itself sends `PID_PING` at a configured frequency
-  (heartbeat) and, on `PONG`, computes RTT → `GetPingMs()`/`HasMeasuredPing()`.
-- On `WELCOME` the `Session` stores `selfId`; `PLAYER_LIST` rebuilds the peer
-  roster (`GetPeerRoster`); `PLAYER_STATE` from others → `IRemoteStateSink`
-  (via `GamePlayerBridge` into the game); own echo ignored by `selfId`.
-- Local state is sent through `ILocalStateProvider` at `SetStateSendEvery`
-  cadence (default every 6th `Update`, ~10 Hz).
+- `Join(ip, port)` → `ClientEndpoint`; once the ENet connection is up, `PID_HELLO`
+  goes out with `SetGameVersion` and `SetPassword` (a hosting session presents its
+  own server's password).
+- `GetRefusal()` — why the server refused us (the session has then left the
+  match). `IsConnectionLost()` — an established connection dropped without a
+  refusal. A refusal is applied only after the transport's service loop returns
+  (the endpoint is never destroyed inside its own callback).
+- Server clock: seeded by WELCOME, refined by every PONG (`ClockSync`: the
+  lowest-RTT sample of the last 8 gives the offset; the RTT is smoothed).
+  `ServerTimeMs()`, `GetRttMs()`, `IsClockSynced()`.
+- Join/leave: derived from the `PLAYER_LIST` diff on every client (host loopback
+  and joiners alike) → `SetJoinLeaveFn` and `IRemoteStateSink::OnPeerLeft`.
+  `Leave()` reports the remaining peers as gone; the destructor reports nothing
+  (the sinks may already be destroyed).
+- Streams: local state every `SetStateSendIntervalMs` (100 ms), mission progress
+  every `SetMissionSendIntervalMs` (300 ms), time-based.
+- Requests (world state, ledger, events, reliable user data) wait in an outbox
+  (≤ 256, order kept) until WELCOME.
+- Session options: `GetSessionOptions()` / `SetSessionOptionsFn` (bit `SO_PVP`);
+  hosting: `SetSessionOptions`.
+- Events: `SendEntityEvent`/`SetEntityEventSink`, `SendPlayerEvent`/
+  `SetPlayerEventSink`; user data `SendCustomEvent(data, size, stream)`.
+- `SetStateCorrectionSink` receives server corrections.
 
 ---
 
@@ -227,10 +267,11 @@ separate `PACKET_VEHICLE_STATE` is declared but not used. Do not duplicate it.
   - model/id changed → despawn old + spawn new;
   - exited → despawn.
 - `Prune(players)` — despawn vehicles of drivers missing from the authoritative set.
-- `Update(dt)` — position interpolation (same mechanism as on-foot).
-
-- `Update(dt)` also smooths `vehYaw` over the shortest arc; steer/speed/state/
-  flags are passed to the move sink verbatim.
+- `SyncDriver(playerId, state, serverTime)` records a timestamped sample;
+  `Update` renders the snapshot-interpolated pose (§11), `vehYaw` over the
+  shortest arc; steer/speed/state/flags/damage come from the nearer sample.
+- A ghost the world could not create (no free collision area) is retried on the
+  next sample.
 
 ### Sink in gameplay context (`RemoteVehicleSpawn/Move/Despawn`)
 - Spawn via `VehicleCentral::AddNetworkGhostVehicle(model)` — a "network
@@ -242,7 +283,16 @@ separate `PACKET_VEHICLE_STATE` is declared but not used. Do not duplicate it.
   brake/reverse lights.
 - Despawn — `RemoveNetworkGhostVehicle` (its final `Release()` self-deletes the
   object). Do **not** `delete` — that double free crashed the host with two
-  remote drivers.
+  remote drivers. A ghost removed while its vehicle script (`.con`) is still
+  loading keeps one reference until construction finishes
+  (`ReleaseDeferredNetworkGhosts`): the script's console hooks write into the
+  vehicle under construction (a freed ghost there was a use-after-free).
+- Ghosts have their own collision-area budget
+  (`WorldPhysicsManager::NETWORK_GHOST_VEHICLES = 16`, sim
+  `CollisionAreaListSize = 37 + 16`); `AddNetworkGhostVehicle` returns NULL when
+  none is free instead of the release assert.
+- Damage: `Vehicle::ApplyNetworkDamage(1 − vehDamage/255)`; a ghost is never
+  damaged locally (`Vehicle::mNetworkGhost`, §18.6).
 
 ---
 
@@ -261,21 +311,27 @@ separate `PACKET_VEHICLE_STATE` is declared but not used. Do not duplicate it.
 
 ---
 
-## 8. Dedicated server (D10/D11)
+## 8. Dedicated server (product)
 
-`src/tests/mp_standalone.cpp` — headless server and join client without game data.
+`src/server/HarServer.vcxproj` → `har_server.exe`: the bare `net::ServerCore` with
+the game's rules (`GameServer`: economy, movement validation, PvP, server Lua
+mods) and no game, window, assets or loopback player — the server takes no slot.
+It is the same server a hosting game embeds.
 
-Usage:
 ```
-mp_standalone server [port] [--mod lua] [--password pw] [--max slots] [--log file]
-mp_standalone host   [port] [--password pw] [--max slots] [--log file]
-mp_standalone join   <hostIp> [port] [--password pw]
+har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...
+           [--pvp] [--cheats] [--game-version <n>] [--seed <n>]
+           [--log <file>] [--verbose]
 ```
+- Default port 3737; no password = open session; `--max` = player slots.
+- `--mod` may repeat (one `ServerModManager` per script).
+- `--verbose` logs every world-state change; refusals / flood kicks / movement
+  corrections are logged from `ServerCore::GetStats()`.
+- Ctrl+C / SIGTERM stop it cleanly. The build copies `lua.dll` next to the exe.
 
-- Runs on the engine layer `net::Session` (instead of the old `NetworkServer`/`Client`).
-- `--password` → `session.SetHostPassword()` / `session.SetPassword()`.
-- `--log` → log file (launch line + `clients:N` on roster change).
-- `--mod` → `server.LoadServerMod()`.
+`src/tests/mp_standalone` is now only a headless TEST client (`join`, `genui`):
+it joins a hosting game or `har_server`, sends a fake moving state and prints the
+remote players and the late-join snapshot it receives.
 
 ### Main game CLI (`CommandLineOptions`)
 - `HOSTPORT=<port>` — auto-start host.
@@ -292,10 +348,13 @@ mp_standalone join   <hostIp> [port] [--password pw]
 
 ## 9. Lua mods (`ServerModManager`)
 
-- Loads a single script: `LoadScript(path)`.
-- Hooks: `on_join(clientId)`, `on_validate(clientId, x,y,z,speed)`,
-  `on_leave(clientId)`.
-- The server calls them at the admission/validation/drop points (see §4).
+- One manager per script (`LoadScript(path)`); `GameServer` loads the configured
+  list for BOTH kinds of server (hosting game: `NetworkMatchManager::SetHostMods`;
+  dedicated: `--mod`).
+- Hooks: `on_join(clientId)` → admission filter (false = `REFUSE_DENIED`),
+  `on_validate(clientId, x,y,z, speed)` (speed = measured m/s since the last
+  accepted state) after the movement rules, `on_leave(clientId)`; events
+  `player.joined` / `player.left` through `net.on`.
 - Without a script, behavior = built-in authoritative server.
 - Test script: `src/tests/test_server_mod.lua`.
 
@@ -326,32 +385,39 @@ do not change.
   (`selfId`) from the remote set; the raw server registry would include the host
   to itself.
 - `DrainJoinLeaveEvents(out)` — join/leave notifications.
-- `Update()` — drives `net::Session::Update()` (server+client+relay+validator).
+- `Update()` — drives `net::Session::Update()`; when the match ends on its own
+  (refused / connection lost) it leaves and resets the world services;
+  `GetLastRefusal()` / `WasConnectionLost()` tell why.
+- Hosting attaches `GameServer` to the session's embedded core
+  (`SetHostConfig`, `SetHostPvp`, `SetHostMods`, `SetAllowEconomyCheats`).
+- PvP and corrections: `SetStateCorrectionHandler`, `SetPlayerHitHandler`,
+  `SetRemoteLookups` (ghost machine / puppet → peer), `ReportRemoteVehicleHit`,
+  `ReportRemotePlayerHit`, `IsPvpEnabled`, `IsRemotePlayerNear`.
 
 ---
 
 ## 11. Interpolated visualization (`RemotePlayerWorldView`)
 
-- Sink: `spawn`/`move`/`despawn` decoupled from the world (testable).
-- `Sync(players)` — updates targets for each remote player, spawns/despawns by
-  authoritative composition.
-- `Update(dt)` — per-frame exponential smoothing toward the target
-  (frame-rate independent, `lambda = 3/smoothingSeconds`), does not teleport.
-- Key contract: changing a position does NOT move the model in `Sync` — only sets
-  the target; the actual movement happens in `Update`. This removes stutter and
-  jitter at the packet frequency.
-- Facing (`rotY`) is smoothed over the shortest arc (350° → 10° through 0).
-- Locomotion fields (`motionAngle`/`facingAngle`/`speedFactor`/`characterState`,
-  turbo) reach the move sink unsmoothed: in game, when `characterState == LOCO`,
-  the puppet's `LocomotionDriver` drives them (`SetFacingDir` + speed from
-  `GetMaxSpeed()`).
-- The `action` sink fires once when the `actionEvent` byte changes to a non-zero id
-  and receives the bare id (seq stripped). A held action is not replayed on spawn.
-  `RemotePlayerAction` replays the clip visually: dodge/cringe/break_quick/
-  victory_small/victory_large/flail/get_up as their own `PlayAnimationAction`
-  sequence (no-op if the NPC bank lacks the clip); jump_kick/stomp_in_air are
-  overlaid on the puppet (the remote is inside `JumpAction` then). Gameplay effects
-  of actions (a prop broken by a kick) arrive as world events, not from here.
+- Sink: `spawn`/`move`/`jump`/`action`/`despawn` decoupled from the world (testable).
+- **Snapshot interpolation** (`RemoteStateTrack.h`, `net::SnapshotBuffer`): every
+  relayed state carries the server time its sender sampled it at; the view keeps a
+  short history per player and renders at `serverNow − interpolationDelay`
+  (150 ms ≈ 1.5 send periods), which normally lies between two received samples:
+  the player follows the sender's real path (jump arcs included) regardless of
+  packet jitter. A late packet is covered by extrapolating the last segment, at
+  most `maxExtrapolationMs` (250 ms). Frame time does not matter.
+- `Sync(players)` records new samples (a repeated packet is ignored) and fires
+  edges (jump rising edge, a changed `actionEvent` byte); spawns/despawns by
+  composition. `Update` moves every player to its interpolated pose; nothing moves
+  between spawns without `Update`.
+- Continuous fields (position, `rotY` over the shortest arc, `vehYaw`) are
+  blended; discrete ones (flags, locomotion inputs, states) come from the nearer
+  sample. Locomotion fields drive the puppet's `LocomotionDriver` in game.
+- Untimed input (time 0: no clock) shows the newest state.
+- `SetTiming(Timing{clock, delay, extrapolation})`; the game passes
+  `Session::ServerTimeMs`. The ghost-machine view (§6) uses the same track.
+- The `action` sink receives the bare id; a held action is not replayed on spawn;
+  `RemotePlayerAction` replays the clip visually.
 
 ---
 
@@ -648,6 +714,7 @@ refused prediction is rolled back.
   **Shared density budget:** spawning counts other players' cars nearby
   (`CountRemoteEntitiesNear`), so two players side by side do not double traffic.
 - A player's own machine blowing up is `VEH_FLAG_DESTROYED` in `PlayerNetworkState`.
+- Ghost rendering, migration, hits, damage, interest management: §18.4–§18.6.
 
 ### 17.5 Parked cars (`ParkedCarManager`)
 - A zone's placement (which car type on which locator, colour) is a first-write
@@ -661,23 +728,102 @@ refused prediction is rolled back.
 
 ### 17.6 Admission and authorization
 - Authorization is **optional** and off by default: without a password the session
-  is open (co-op / session games) and a peer is admitted on connect. A password
-  turns the `PID_AUTH` gate on.
-- In both modes the server accepts nothing but `PID_AUTH` from a peer before it is
-  admitted (`m_admitted`) — an unauthenticated client can neither write the world
-  nor broadcast events. The admitted set is separate from the client-side
-  `GetPeerRoster()` (one shared set used to "un-admit" the host's loopback on every
-  `PLAYER_LIST`).
-- Slot cap: `Session::SetMaxPeers` (`NetworkMatchManager::SetHostConfig`,
-  `mp_standalone --max`); the host's loopback takes one slot.
+  is open (co-op / session games). A password is checked in `PID_HELLO` (§4).
+- The server accepts nothing but `PID_HELLO` from a peer before it is admitted and
+  sends it nothing about the world.
+- Slot cap: `ServerCore::SetMaxPeers` (`Session::SetMaxPeers`,
+  `NetworkMatchManager::SetHostConfig`, `har_server --max`); a hosting game's
+  loopback takes one slot, the dedicated server none.
 
 ### 17.7 Known limitations (open)
-- No ownership migration: a traffic car disappears for everyone when its owner
-  drives off and despawns it, even if another player is next to it.
-- Collisions with a kinematic ghost are not sent to its owner (the ghost does not
-  react to a hit); pushed parked cars are simulated per client.
-- A destroyed remote traffic car shows the explosion on the ghost, not a husk model.
 - World state changed by the host before the match started (from a save) is unknown
   to the server.
-- Two players getting into the same parked car at once: the first wins, the second
-  keeps their copy (entry rollback is not implemented).
+- A released traffic car is adopted only if the claimant has a free pooled car of
+  the same model and a road under it; otherwise it expires after the claim window.
+- Pushed parked cars, pedestrians and actors: §18.9.
+
+---
+
+## 18. Transport, server core and physics sync (2026-10-25)
+
+### 18.1 One server for host and dedicated
+`net::ServerCore` (§4) is the only server implementation. `Session` = client +
+optional embedded core; `har_server` = core without a client. `GameServer` (game
+rules) attaches to either. `Session::Create/Get/Destroy` (an unused second way to
+own a session) was removed.
+
+### 18.2 Channels, handshake, clock
+§2, §4, §5: three ENet channels with per-id delivery; `PID_HELLO` with magic,
+protocol and game version; explicit `PID_REFUSE` reasons; handshake timeout;
+server clock in WELCOME/PONG, `ClockSync` on the client; every stream timestamped
+with the server time; snapshot interpolation on receivers (§11).
+
+### 18.3 Movement validation (`PlayerMovementValidator`)
+Server-side, on the server's own receive times (a client cannot forge dt). Against
+the peer's last ACCEPTED state: horizontal distance ≤ maxSpeed·dt + slack (on foot
+20 m/s, vehicle 110 m/s if either state is in a machine, slack 4 m); climbing ≤
+maxSpeed·dt + slack, falling ≤ 80 m/s·dt + slack; non-finite / out-of-world
+coordinates refused. A jump beyond the limits passes only with a new
+`teleportSeq`, at most 3 at once and 0.5/s on average. A refusal answers
+`SV_CORRECT` with the last accepted state (at most once per second; states in
+between are dropped); the game snaps the avatar (or its car) back
+(`GameplayStateCorrection`). The mods' `on_validate` runs last.
+
+### 18.4 Rate limits
+§4. Applies to every admitted peer, the host's loopback included.
+
+### 18.5 Ownership migration
+`WorldState`: `WSO_RELEASE` (owner → 0, flagged `WSF_CLAIMABLE`, optionally with
+a new value = the current pose) and `WSO_CLAIM` (first claim wins; later claims are
+rejected with the winner). `WSF_RELEASE_ON_OWNER_LEAVE` releases instead of erasing
+when the owner disconnects. Unclaimed entries expire after `SetClaimWindowMs`
+(3 s). `NetEntityManager`: when the local simulation drops a migratable entity
+(traffic, pedestrians) and another player is within the hand-over radius (150 m),
+it is released at its current pose; a player within the claim radius (120 m) with
+budget (`CanAdoptFn`) claims it; on success the sink's `adopt` turns the ghost into
+a simulated local entity with the same id (`TrafficManager::AdoptNetworkTraffic`:
+a free pooled car of the model on the closest lane, at the pose and speed, without
+announcing a new entity). Traffic is announced with `WSF_RELEASE_ON_OWNER_LEAVE`.
+
+### 18.6 Hits and damage
+- A ghost (`Vehicle::mNetworkGhost`, set by `AddNetworkGhostVehicle`) is never
+  damaged locally. In `Vehicle::PostReactToCollision` a collision of OUR vehicle
+  with a ghost becomes a `NetEntityHit` {impulse on the ghost (pointing away from
+  our car), contact point, damage = normalized magnitude · 255} →
+  `networld::ReportGhostHit`: to the entity's owner (`PID_ENTITY_EVENT`, the server
+  delivers it to the owner only) or, for a remote player's own car, to that player
+  (PvP, §18.7). Ghost–ghost collisions are the owners' business.
+- The owner applies it: `Vehicle::ApplyNetworkHit(impulse, damage)` (Δv = impulse
+  / mass + `TriggerDamage` + the damage visuals of its type); the result streams
+  back.
+- Damage is replicated: `NetEntityMotion::damage` and `PlayerNetworkState::
+  vehDamage`; ghosts show it with `ApplyNetworkDamage` (only ever more damage).
+- `NetEntityMotion` (22 bytes) gained `damage` and `state`; flags gained
+  `MF_KNOCKED`.
+- Interest management: a ghost of a dynamic entity exists only within the
+  relevance radius (200 m in game, removed beyond 1.25×; the record is kept); a
+  ghost the world cannot create now is retried every frame.
+
+### 18.7 PvP as a session option
+`SO_PVP` in the session options (WELCOME / `PID_SESSION_INFO`, changeable live:
+`GameServer::SetPvp`, `NetworkMatchManager::SetHostPvp`, `har_server --pvp`). The
+server relays `PID_PLAYER_EVENT` to the victim only with PvP on. Kinds
+(`NetworkMatchManager::PlayerEventKind`, payload `NetEntityHit`):
+`PE_VEHICLE_HIT` (our car hit the victim's ghost machine → the victim's car gets
+`ApplyNetworkHit`) and `PE_KNOCKDOWN` (our kick hit the victim's puppet →
+`Character::ApplyNetworkKnockdown`: flail + get up via `InSim`, no velocity, like
+the original avoids moving the player character). A remote player's puppet is
+never knocked locally — with or without PvP (its owner's stream shows the truth).
+
+### 18.8 Deployment of the server product
+`HarServer.vcxproj` (Debug/Release x64) copies `lua.dll` after the build;
+`src/server/x64/` is ignored by git.
+
+### 18.9 Still open
+- Player context (level / interior in the world) and appearance (model /
+  costume) — next.
+- Pushed parked cars (entity bound to the static object — `NEK_PARKED_CAR` and
+  `AddLocal(handle, spawn, boundId)` are in place, the parked-car hooks are not),
+  parked-car entry rollback.
+- Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
+- No player identity across reconnects (T7).

@@ -157,7 +157,14 @@ class VehicleCentral : public LoadingManager::ProcessRequestsCallback
 
         //
         bool IsCarUnderConstruction(const char* name); 
-        bool IsCarUnderConstruction(const Vehicle* vehicle); 
+        bool IsCarUnderConstruction(const Vehicle* vehicle);
+
+        // Network ghosts removed while their vehicle script (.con) was still
+        // loading: the script's console hooks write into the vehicle under
+        // construction, so its final Release waits until construction ends.
+        void ReleaseDeferredNetworkGhosts();
+        Vehicle* mDeferredGhostRelease[MAX_ACTIVE_VEHICLES];
+        int      mNumDeferredGhostReleases;
 
         bool GetVehicleTriggersActive(void) {return mbVehicleTriggersActive;}
 

@@ -1,21 +1,32 @@
 #include "RemotePlayerManager.h"
 
+#include <iterator>
+
 RemotePlayerManager::RemotePlayerManager() {}
 RemotePlayerManager::~RemotePlayerManager() {}
 
-void RemotePlayerManager::UpdatePlayer(int playerId, const PlayerNetworkState& state)
+void RemotePlayerManager::UpdatePlayer(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
     m_players[playerId] = state;
+    m_times[playerId] = serverTimeMs;
+}
+
+uint32_t RemotePlayerManager::GetPlayerTime(int playerId) const
+{
+    auto it = m_times.find(playerId);
+    return it == m_times.end() ? 0 : it->second;
 }
 
 void RemotePlayerManager::RemovePlayer(int playerId)
 {
     m_players.erase(playerId);
+    m_times.erase(playerId);
 }
 
 void RemotePlayerManager::Clear()
 {
     m_players.clear();
+    m_times.clear();
 }
 
 void RemotePlayerManager::KeepOnly(const std::vector<unsigned short>& keepIds)
@@ -28,6 +39,8 @@ void RemotePlayerManager::KeepOnly(const std::vector<unsigned short>& keepIds)
         }
     }
     m_players.swap(kept);
+    for (auto it = m_times.begin(); it != m_times.end();)
+        it = m_players.count(it->first) ? std::next(it) : m_times.erase(it);
 }
 
 const PlayerNetworkState* RemotePlayerManager::GetPlayer(int playerId) const

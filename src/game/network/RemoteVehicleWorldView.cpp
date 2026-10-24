@@ -1,9 +1,6 @@
 #include "RemoteVehicleWorldView.h"
 
-#include <cmath>
-
 RemoteVehicleWorldView::RemoteVehicleWorldView()
-    : m_smoothingSeconds(0.12f)
 {
     memset(&m_sink, 0, sizeof(m_sink));
 }
@@ -13,14 +10,14 @@ RemoteVehicleWorldView::~RemoteVehicleWorldView()
     Clear();
 }
 
-void RemoteVehicleWorldView::SyncDriver(int playerId, const PlayerNetworkState& state)
+void RemoteVehicleWorldView::SyncDriver(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
     bool inVehicle = (state.inVehicle != 0) && state.vehicleModel[0] != '\0';
 
     auto it = m_entries.find(playerId);
     if (it == m_entries.end())
     {
-        if (inVehicle) SpawnFor(playerId, state);
+        if (inVehicle) SpawnFor(playerId, state, serverTimeMs);
         return;
     }
 
@@ -33,27 +30,20 @@ void RemoteVehicleWorldView::SyncDriver(int playerId, const PlayerNetworkState& 
         return;
     }
 
-    // Still in a machine: if the model changed, rebuild the ghost; otherwise
-    // just refresh the movement target.
+    // A different machine: rebuild the ghost.
     bool modelChanged = strncmp(entry.model, state.vehicleModel, sizeof(entry.model)) != 0
         || entry.netVehicleId != state.netVehicleId;
     if (modelChanged)
     {
         DespawnIt(playerId, entry);
         m_entries.erase(it);
-        SpawnFor(playerId, state);
+        SpawnFor(playerId, state, serverTimeMs);
         return;
     }
-
-    entry.targetX = state.x;
-    entry.targetY = state.y;
-    entry.targetZ = state.z;
-    entry.targetYaw = state.vehYaw;
-    entry.targetSteer = state.vehSteer;
-    entry.targetSpeedKmh = state.vehSpeedKmh;
-    entry.targetState = state.vehState;
-    entry.targetFlags = state.vehFlags;
-    entry.smoothingApplied = false;
+    // The world could not create the ghost earlier (no free slot): retry.
+    if (entry.handle == nullptr && m_sink.spawn)
+        entry.handle = m_sink.spawn(playerId, state.vehicleModel, state.netVehicleId);
+    entry.track.Push(serverTimeMs, state);
 }
 
 void RemoteVehicleWorldView::ClearDriver(int playerId)
@@ -91,66 +81,34 @@ void RemoteVehicleWorldView::Clear()
 
 void RemoteVehicleWorldView::Update(float dt)
 {
-    if (dt <= 0.0f) return;
-
-    const float lambda = 3.0f / (m_smoothingSeconds > 0.0f ? m_smoothingSeconds : 0.12f);
-    const float alpha = 1.0f - expf(-lambda * dt);
-
+    (void)dt; // poses come from the server clock, not from frame time
+    if (!m_sink.move) return;
     for (auto& kv : m_entries)
     {
-        Entry& entry = kv.second;
-        if (entry.smoothingApplied) continue;
-
-        entry.visualX += (entry.targetX - entry.visualX) * alpha;
-        entry.visualY += (entry.targetY - entry.visualY) * alpha;
-        entry.visualZ += (entry.targetZ - entry.visualZ) * alpha;
-        entry.smoothingApplied = true;
-
-        // Decrementally rotate the yaw toward its target over the shortest arc
-        // (mirrors RemotePlayerWorldView's facing smoothing).
-        static const float kPi = 3.14159265f;
-        float diff = entry.targetYaw - entry.visualYaw;
-        while (diff >  kPi) diff -= 2.0f * kPi;
-        while (diff < -kPi) diff += 2.0f * kPi;
-        if (diff != 0.0f) entry.visualYaw += diff * alpha;
-        if (entry.visualYaw >  kPi) entry.visualYaw -= 2.0f * kPi;
-        if (entry.visualYaw < -kPi) entry.visualYaw += 2.0f * kPi;
-
-        if (m_sink.move)
-        {
-            PlayerNetworkState state;
-            state.x = entry.visualX;
-            state.y = entry.visualY;
-            state.z = entry.visualZ;
-            state.vehYaw = entry.visualYaw;
-            state.vehSteer = entry.targetSteer;
-            state.vehSpeedKmh = entry.targetSpeedKmh;
-            state.vehState = entry.targetState;
-            state.vehFlags = entry.targetFlags;
-            m_sink.move(kv.first, entry.handle, state);
-        }
+        if (kv.second.handle == nullptr) continue;
+        PlayerNetworkState s;
+        if (kv.second.track.Render(m_timing, s)) m_sink.move(kv.first, kv.second.handle, s);
     }
 }
 
-void RemoteVehicleWorldView::SpawnFor(int playerId, const PlayerNetworkState& state)
+int RemoteVehicleWorldView::FindDriver(const void* handle) const
+{
+    if (handle == nullptr) return 0;
+    for (const auto& kv : m_entries)
+        if (kv.second.handle == handle) return kv.first;
+    return 0;
+}
+
+void RemoteVehicleWorldView::SpawnFor(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
     void* handle = m_sink.spawn ? m_sink.spawn(playerId, state.vehicleModel, state.netVehicleId) : nullptr;
-    Entry entry;
-    memset(&entry, 0, sizeof(entry));
+    Entry& entry = m_entries[playerId];
     entry.handle = handle;
     strncpy(entry.model, state.vehicleModel, sizeof(entry.model) - 1);
     entry.model[sizeof(entry.model) - 1] = '\0';
     entry.netVehicleId = state.netVehicleId;
-    entry.targetX = entry.visualX = state.x;
-    entry.targetY = entry.visualY = state.y;
-    entry.targetZ = entry.visualZ = state.z;
-    entry.targetYaw = entry.visualYaw = state.vehYaw;
-    entry.targetSteer = state.vehSteer;
-    entry.targetSpeedKmh = state.vehSpeedKmh;
-    entry.targetState = state.vehState;
-    entry.targetFlags = state.vehFlags;
-    entry.smoothingApplied = false;
-    m_entries[playerId] = entry;
+    entry.track.Clear();
+    entry.track.Push(serverTimeMs, state);
 
     if (handle != nullptr && m_sink.move) m_sink.move(playerId, handle, state);
 }

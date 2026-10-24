@@ -15,7 +15,9 @@ extern "C" {
 // admission + state-validation decisions. A script may override the default
 // outcomes through callbacks:
 //   on_join(clientId)       -> returns bool (true = admit, default true)
-//   on_validate(clientId, x, y, z, speed) -> returns bool (true = relay)
+//   on_validate(clientId, x, y, z, speed) -> returns bool (true = relay);
+    //                                            speed = measured m/s since the
+//                                            last accepted state
 //   on_leave(clientId)
 // If no script is loaded, behavior matches the built-in authoritative server.
 //
@@ -34,7 +36,7 @@ public:
 
     // Hooks called by the server.
     bool OnPlayerJoin(int clientId);
-    bool OnPlayerValidate(int clientId, const PlayerNetworkState& state);
+    bool OnPlayerValidate(int clientId, const PlayerNetworkState& state, float measuredSpeed = 0.0f);
     void OnPlayerLeave(int clientId);
 
     // ---- event bus -----------------------------------------------------

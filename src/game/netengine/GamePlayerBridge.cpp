@@ -13,11 +13,7 @@ namespace net
     {
         if (!session) return;
         session->SetLocalStateProvider(this);   // engine pulls local blob from us
-        session->SetRemoteStateSink(this);      // engine delivers remote blobs to us
-        session->SetJoinLeaveFn([this](PeerId peer, bool joined)
-        {
-            if (!joined) OnPeerLeft(peer);      // cleanup world shadow on disconnect
-        });
+        session->SetRemoteStateSink(this);      // remote blobs + departures
     }
 
     bool GamePlayerBridge::GetLocalState(uint8_t* out, uint16_t capacity, uint16_t& size)
@@ -38,7 +34,7 @@ namespace net
         return false;
     }
 
-    void GamePlayerBridge::ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size)
+    void GamePlayerBridge::ApplyRemoteState(PeerId from, const uint8_t* data, uint16_t size, uint32_t serverTimeMs)
     {
         if (from == m_selfId) return;                    // skip our own echo
         if (size < static_cast<uint16_t>(PlayerNetworkState::SERIALIZED_SIZE)) return;
@@ -47,7 +43,7 @@ namespace net
         st.Deserialize(reinterpret_cast<const char*>(data));
 
         if (m_remotePlayers)
-            m_remotePlayers->UpdatePlayer(static_cast<int>(from), st);
+            m_remotePlayers->UpdatePlayer(static_cast<int>(from), st, serverTimeMs);
     }
 
     void GamePlayerBridge::OnPeerLeft(PeerId peer)

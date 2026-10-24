@@ -185,10 +185,19 @@ public:
     void SwapInTrafficHusk( Vehicle* vehicle ); // Remove traffic vehicle, swap in a husk...
 
     bool IsVehicleTrafficVehicle( Vehicle* vehicle );
+    int  GetNumTraffic() const { return mNumTraffic; }
+
+    // Networked match: take over a traffic car another player released (we won
+    // the server's claim). Places a free pooled car of `model` on the closest
+    // lane at the given pose and speed and makes it ours, WITHOUT announcing a
+    // new entity (the caller keeps the claimed id). NULL if no free car of that
+    // model or no road there.
+    Vehicle* AdoptNetworkTraffic( const char* model, const rmt::Vector& pos, float yaw, float speedMps );
 
 //MEMBERS
 private:
     float mDesiredTrafficSpeedKph;
+    bool  mAdoptingNetworkTraffic; // AddTraffic must not announce a new entity
 
     enum {
         MAX_TRAFFIC_MODEL_GROUPS = 10, // Max # different groups of traffic models 

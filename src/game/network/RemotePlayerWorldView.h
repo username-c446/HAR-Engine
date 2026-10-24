@@ -1,6 +1,7 @@
 #pragma once
 
 #include "RemotePlayerManager.h"
+#include "RemoteStateTrack.h"
 
 #include <map>
 #include <string.h>
@@ -8,6 +9,10 @@
 
 // Bridges an online match's remote-player states to the game world. It spawns
 // and moves a lightweight visual representation for each remote player.
+//
+// Motion is snapshot interpolation (RemoteStateTrack): each received state is
+// kept with its server sample time and the player is rendered behind the
+// server clock, so it follows the sender's real path at any packet rate.
 //
 // The world access is decoupled through a sink so the logic is unit-testable:
 // the playing context wires the real sink (CharacterManager-based), tests wire
@@ -37,44 +42,38 @@ public:
     ~RemotePlayerWorldView();
 
     void SetSink(const Sink& sink) { m_sink = sink; }
-    void SetSmoothing(float seconds) { m_smoothingSeconds = seconds; }
+    // Server clock + interpolation parameters (no clock: newest state shown).
+    void SetTiming(const RemoteStateTrack::Timing& timing) { m_timing = timing; }
 
     // Called every frame with the authoritative set of remote players. Spawns
-    // new players, moves changed ones, despawns removed ones.
+    // new players, records new samples (and fires jump / action edges),
+    // despawns removed ones.
     void Sync(const RemotePlayerManager& players);
 
-    // Called every frame (after Sync) to advance the visual position of each
-    // remote player smoothly toward its latest reported target. This removes
-    // teleports caused by the refresh rate of network state packets.
+    // Called every frame (after Sync): moves each remote player to its
+    // interpolated pose. Nothing moves between spawns without Update().
     void Update(float dt);
 
     // Despawn everything (e.g. on leaving the match).
     void Clear();
 
+    // The remote player whose puppet `handle` is (0 if none).
+    int FindPlayer(const void* handle) const;
+
 private:
-    void SyncOne(int playerId, const PlayerNetworkState& state);
+    void SyncOne(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs);
 
     struct Entry
     {
-        void* handle;
-        float targetX, targetY, targetZ;
-        float visualX, visualY, visualZ;
-        float targetFacing, visualFacing; // yaw (radians); smoothed over shortest arc
-        // Locomotion / one-shot channels carried verbatim so Update() can re-emit
-        // them to the move sink (which drives the remote character's locomotion).
-        uint16_t targetMotionAngle;
-        uint16_t targetFacingAngle;
-        uint8_t  targetSpeedFactor;
-        uint8_t  targetCharacterState;
-        uint8_t  targetActionEvent; // latched: fires the action sink only on rising edge
-        uint8_t  targetFlags;       // FLAG_* set (turbo etc.)
-        bool smoothingApplied;
-        bool jumping; // last reported FLAG_JUMPING/FLAG_IN_AIR — snap Y, don't smooth
+        void*            handle = nullptr;
+        RemoteStateTrack track;
+        uint8_t          lastActionEvent = 0; // fires the action sink only on change
+        bool             jumping = false;     // FLAG_JUMPING / FLAG_IN_AIR rising edge
     };
 
     Sink m_sink;
+    RemoteStateTrack::Timing m_timing;
     std::map<int, Entry> m_entries;
-    float m_smoothingSeconds;
 
     RemotePlayerWorldView(const RemotePlayerWorldView&);
     RemotePlayerWorldView& operator=(const RemotePlayerWorldView&);

@@ -42,9 +42,35 @@ namespace networld
         return NetworkMatchManager::Economy().IsConverging();
     }
 
-    void AddLocalEntity(void* handle, const net::NetEntitySpawn& spawn)
+    void AddLocalEntity(void* handle, const net::NetEntitySpawn& spawn, uint64_t boundId)
     {
-        NetworkMatchManager::Entities().AddLocal(handle, spawn);
+        NetworkMatchManager::Entities().AddLocal(handle, spawn, boundId);
+    }
+
+    bool IsLocalEntity(void* handle)
+    {
+        return NetworkMatchManager::Entities().IsLocal(handle);
+    }
+
+    bool ReportEntityHit(void* remoteHandle, const net::NetEntityHit& hit)
+    {
+        return NetworkMatchManager::Entities().ReportHit(remoteHandle, hit);
+    }
+
+    bool ReportRemotePlayerHit(void* character, float vx, float vy, float vz)
+    {
+        NetworkMatchManager* m = NetworkMatchManager::GetInstance();
+        if (m == nullptr || !m->IsInMatch()) return false;
+        net::NetEntityHit hit;
+        hit.ix = vx; hit.iy = vy; hit.iz = vz;
+        return m->ReportRemotePlayerHit(character, hit);
+    }
+
+    bool ReportGhostHit(void* ghost, const net::NetEntityHit& hit)
+    {
+        if (NetworkMatchManager::Entities().ReportHit(ghost, hit)) return true;
+        NetworkMatchManager* m = NetworkMatchManager::GetInstance();
+        return m != nullptr && m->ReportRemoteVehicleHit(ghost, hit);
     }
 
     void RemoveLocalEntity(void* handle)
@@ -57,9 +83,9 @@ namespace networld
         return NetworkMatchManager::Entities().IsRemoteHandle(handle);
     }
 
-    int CountRemoteEntitiesNear(float x, float z, float radius)
+    int CountRemoteEntitiesNear(float x, float z, float radius, uint8_t kind)
     {
-        return static_cast<int>(NetworkMatchManager::Entities().CountRemoteNear(x, z, radius));
+        return NetworkMatchManager::Entities().CountRemoteNear(x, z, radius, kind);
     }
 
     bool IsInMatch()

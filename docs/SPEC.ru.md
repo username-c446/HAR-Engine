@@ -26,82 +26,103 @@
 
 ## 1. Карта проекта (область сети)
 
-Сетевой слой движка разбит на **независимые слои**: игровой слой
-(`src/game/network/`) и переиспользуемый движковый слой (`src/game/netengine/`).
-Старый монолит `NetworkServer`/`NetworkClient` полностью выпилен.
+Сетевой слой разделён на независимые части: переиспользуемый движковый слой
+(`src/game/netengine/`), игровой слой (`src/game/network/`) и продукт «выделенный
+сервер» (`src/server/`). Старый монолит `NetworkServer`/`NetworkClient` удалён.
 
 ### Движковый слой `src/game/netengine/` (переиспользуемый, world-agnostic)
 
 | Файл | Роль |
 |------|------|
-| `Packet.h` | Он-найр протокол: `PacketId`, версия, зарезервированные id (0x00-0xFF системные, 0x100+ игровые), bounds-checked `Writer`/`Reader` |
-| `PacketRegistry.{h,cpp}` | Реестр пакетов (id → обработчик) вместо `switch`; расширяем без правки ядра |
-| `ServerEndpoint.{h,cpp}` | Чистый ENet-хост: допуск пиров, `PeerId`, счёт liveness, таймаут-свип, `KickPeer`, авто-PING-проб |
-| `ClientEndpoint.{h,cpp}` | Чистый ENet-клиент: коннект, фрейминг, heartbeat (`SetPingIntervalMs`), замер RTT (`SendPing`/`GetPingMs`) |
-| `Session.{h,cpp}` | Оркестратор матча: host/join/leave, релей состояния, пароль (`SetHostPassword`/`SetPassword`), валидатор (`SetStateValidator`), реестр пиров |
-| `GamePlayerBridge.{h,cpp}` | Игровой адаптер: связывает `PlayerNetworkState` с opaque-блобами `Session`'а |
-| `WorldInterfaces.h` | Интерфейсы `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator` — мир подключается снаружи |
-| `ENetInit.{h,cpp}` | RAII-счётчик ссылок ENet (статика определена в `.cpp`) |
+| `Packet.h` | Протокол: `PacketId`, `PROTOCOL_VERSION`/`PROTOCOL_MAGIC`, причины отказа, каналы ENet + доставка по id (`ChannelOf`), `Writer`/`Reader` с проверкой границ |
+| `PacketRegistry.{h,cpp}` | Реестр пакетов (id → обработчик) |
+| `ServerEndpoint.{h,cpp}` | Чистый ENet-хост: `PeerId`, фрейминг, таймаут, `KickPeer` (сначала доставляет очередь), серверные часы `NowMs`, PONG с серверным временем, RTT пира |
+| `ClientEndpoint.{h,cpp}` | Чистый ENet-клиент: фрейминг, heartbeat по времени, RTT и оценка серверных часов (`ClockSync`) |
+| `NetTime.h` | `ClockSync`, `SnapshotBuffer<T>` (буфер джиттера), `TokenBucket` |
+| `ServerCore.{h,cpp}` | **Авторитетный сервер** (одна реализация для игры-хоста и выделенного сервера): рукопожатие, допуск, мир, леджер, релеи, валидация, лимиты, опции сессии, истечение передачи владения |
+| `Session.{h,cpp}` | Участник матча: всегда клиент; при хостинге дополнительно крутит встроенный `ServerCore` и подключается к нему через loopback |
+| `WorldState.{h,cpp}` | Реплицируемый мир: таблица / зеркало / кодеки, передача владения (§17, §18.5) |
+| `Ledger.{h,cpp}` | Серверные счётчики (§17.3) |
+| `GamePlayerBridge.{h,cpp}` | Игровой адаптер: `PlayerNetworkState` ↔ непрозрачные блобы сессии |
+| `WorldInterfaces.h` | `ILocalStateProvider`/`IRemoteStateSink`/`IStateValidator`/`IMissionStateProvider` |
+| `ENetInit.{h,cpp}` | RAII-счётчик ссылок ENet |
 
 ### Игровой слой `src/game/network/`
 
 | Файл | Роль |
 |------|------|
-| `NetworkPacket.h` | Игровые типы и little-endian-примитивы (`net::Write*/Read*`) |
-| `PlayerNetworkState.{h,cpp}` | Структура состояния игрока (позиция/поворот/машина) + сериализация |
-| `NetworkMatchManager.{h,cpp}` | ТОНКИЙ МОСТ: сохраняет старый публичный АПИ (`StartHost`/`JoinHost`/`Leave`/`GetRemotePlayers`), внутри делегирует `net::Session` + `GamePlayerBridge` |
-| `RemotePlayerManager.{h,cpp}` | Реестр удалённых игроков (идент. по clientId) |
-| `RemotePlayerWorldView.{h,cpp}` | Визуализация удалённых пеших игроков + интерполяция |
-| `RemoteVehicleWorldView.{h,cpp}` | Визуализация «призраков» машин удалённых водителей |
-| `ServerModManager.{h,cpp}` | Серверные Lua-моды (хуки допуска/валидации) |
-| `MissionSyncManager.{h,cpp}` | Синхронизация миссии/стадии/цели между клиентами (co-op-прогресс) |
-| `MissionSyncState.{h,cpp}` | Сериализуемое состояние миссии (миссия/стадия/цель) |
+| `NetworkPacket.h` | Little-endian примитивы (`net::Write*/Read*`) |
+| `PlayerNetworkState.{h,cpp}` | Структура состояния игрока + сериализация (§3) |
+| `GameServer.{h,cpp}` | Игровые правила сервера поверх `ServerCore` (экономика, валидация движения, Lua-моды, PvP) — общие для игры-хоста И выделенного сервера |
+| `PlayerMovementValidator.{h,cpp}` | Серверная проверка правдоподобия движения (§18.3) |
+| `NetworkMatchManager.{h,cpp}` | Оркестратор для геймплея (§10) |
+| `RemotePlayerManager.{h,cpp}` | Реестр удалённых игроков (состояние + серверное время сэмпла) |
+| `RemoteStateTrack.h` | Snapshot-интерполяция одного удалённого игрока (§11) |
+| `RemotePlayerWorldView.{h,cpp}` | Удалённые пешие игроки в мире |
+| `RemoteVehicleWorldView.{h,cpp}` | Машины-призраки удалённых водителей |
+| `NetWorldRegistry`, `NetEntityManager`, `PlayerEconomy`, `NetWorldHooks`, `WorldObjectId.h`, `EconomyConfig.h` | Реплицируемый мир (§17, §18) |
+| `ServerModManager.{h,cpp}` | Серверные Lua-моды |
+| `MissionSyncManager`/`MissionSyncState` | Прогресс миссий (co-op) |
 | `NetworkConsoleCommands.{h,cpp}` | Консольные команды `host`/`join`/`match` |
 
-Интеграция в игру: `src/game/contexts/gameplay/gameplaycontext.cpp`
-(провайдер состояния, sink-и, вызовы в игровом цикле) и
-`src/game/main/commandlineoptions.{h,cpp}` (автостарт из CLI).
+### Выделенный сервер `src/server/` (продукт)
+
+`HarServer.vcxproj` → `har_server.exe` (§8).
+
+Интеграция в игру: `src/game/contexts/gameplay/gameplaycontext.cpp` (провайдеры,
+sink'и, вызовы в игровом цикле) и `src/game/main/commandlineoptions.{h,cpp}`
+(автостарт из CLI).
 
 ---
 
 ## 2. Сетевая модель и транспорт
 
-- **Транспорт:** ENet (vcpkg `enet`), единственный канал, все игровые пакеты
-  надёжные (`ENET_PACKET_FLAG_RELIABLE`). Порядок и доставку гарантирует ENet;
-  свой протокол — только id + payload.
-- **Архитектурный принцип:** авторитетный сервер (а не P2P). Сервер допускает
-  клиентов, выдаёт `PeerId`, валидирует состояния, ретранслирует их, ведёт
-  реестр пиров и раздаёт его клиентам. Клиент не само-авторизуется.
-- `MAX_PACKET_PAYLOAD = 512` байт. Таймаут liveness по умолчанию 30 с
-  (переопределяется `SetClientTimeoutMs`), heartbeat-кадр по умолчанию 60 Update.
-- Данные линейны: payload может содержать повторяющиеся `PeerId` (в `PLAYER_STATE`),
-  но полный id — всегда авторитетная забота сервера.
+- **Транспорт:** ENet (vcpkg `enet`), три канала (`Packet.h`):
+  - `CH_RELIABLE` (0) — надёжный упорядоченный: рукопожатие, мир, леджер,
+    события, пользовательские данные;
+  - `CH_STREAM` (1) — ненадёжный последовательный: потоки «последнего
+    состояния» (`PID_PLAYER_STATE`, `PID_MISSION_STATE`, `PID_ENTITY_STATE`,
+    `PID_USER_STREAM`). Потерянный пакет потока заменяется следующим, а не
+    задерживает всё за ретрансмитом; опоздавший старый пакет ENet отбрасывает;
+  - `CH_TIME` (2) — ненадёжный: `PID_PING`/`PID_PONG` (ретрансмит исказил бы RTT).
+  Канал выбирается по id пакета в одном месте (`ChannelOf`), для обоих эндпоинтов.
+- **Авторитетный сервер**, никакого P2P. Сервер допускает клиентов, выдаёт
+  `PeerId`, валидирует, ретранслирует и арбитрирует; клиенты предсказывают, сервер
+  решает (§17).
+- `MAX_PACKET_PAYLOAD = 512` байт; фрейминг `[u16 id][u16 size][payload]`.
+- Живость: клиент пингует каждые 500 мс (`SetPingIntervalMs`); сервер отключает
+  пира, молчащего 30 с (`SetClientTimeoutMs`).
 
-### Типы пакетов (`net::ReservedPacketId`, 2-байтовый id в начале)
+### Id пакетов (`Packet.h`, `PROTOCOL_VERSION = 2`)
 
-| Id | Имя | Направление | Назначение |
-|----|-----|-------------|------------|
-| 0x0000 | `HELLO` | C→S | Анонс после ENet-коннекта |
-| 0x0001 | `WELCOME` | S→C | Авторитетный `PeerId` (self id) |
-| 0x0002 | `ACK` | S/C | Квитирование версии/liveness |
-| 0x0003 | `AUTH` | C→S | Пароль для защищённого хоста |
-| 0x0004 | `PLAYER_LIST` | S→C | Авторитетный реестр присутствующих пиров |
-| 0x0005 | `PING` | C→S | Heartbeat + замер RTT |
-| 0x0006 | `PONG` | S→C | Ответ на ping |
-| 0x0007 | `WORLD_SEED` | S→C | Авторитетный сид мира (u32) |
-| 0x0100 | `PLAYER_STATE` | C→S→C | Состояние игрока (релей) |
-| 0x0101 | `VEHICLE_STATE` | зарезервирован | (данные машин переносятся внутри PLAYER_STATE) |
-| 0x0102 | `MISSION_STATE` | C→S→C | Прогресс миссии/стадии/цели (релей, для co-op) |
+| Id | Имя | Направл. | Назначение |
+|----|-----|----------|------------|
+| 0x00 | `HELLO` | C→S | `u32 magic, u16 protocol, u32 версия игры, u8 n, пароль` |
+| 0x01 | `WELCOME` | S→C | `u16 peer id, u32 время сервера, u32 опции сессии` |
+| 0x03 | `REFUSE` | S→C | `u8 причина, u16 протокол сервера`, затем отключение |
+| 0x04 | `PLAYER_LIST` | S→C | допущенные пиры |
+| 0x05/0x06 | `PING`/`PONG` | C↔S | `{время клиента}` / `{эхо, время сервера}` |
+| 0x07 | `WORLD_SEED` | S→C | `u32` |
+| 0x08 | `SESSION_INFO` | S→C | опции сессии изменились |
+| 0x09 | `STATE_CORRECTION` | S→C | валидатор отклонил наше состояние: встать в этот блоб |
+| 0x10–0x15 | `WS_*` | | реплицируемый мир (§17.1) |
+| 0x20/0x21 | `LEDGER_*` | | счётчики (§17.3) |
+| 0x100 | `PLAYER_STATE` | C→S→C | поток игрока (с меткой времени) |
+| 0x102 | `MISSION_STATE` | C→S→C | поток прогресса миссии |
+| 0x103 | `ENTITY_STATE` | C→S→C | поток сущностей с проверкой владельца |
+| 0x104 | `ENTITY_EVENT` | C→S→владелец | удар по сущности (§18.6) |
+| 0x105 | `PLAYER_EVENT` | C→S→жертва | PvP-удар (§18.7) |
+| 0x8000/0x8001 | `USER`/`USER_STREAM` | C→S→C | данные модов, надёжно / потоком |
 
-> Примечание: `PACKET_VEHICLE_STATE` объявлен в enum, но текущая реализация
-> переносит транспортные данные внутри `PLAYER_STATE` (см. §6), т.е. пакет 0x0101
-> пока не используется на проводе.
+Фрейминг потоков: клиент → сервер `[u32 серверное время сэмпла][payload]`;
+сервер → остальным `[u16 отправитель][u32 время][payload]`. Сервер зажимает время в
+`[now − 2000 мс, now]` (клиент не может заявить будущее).
 
 ---
 
 ## 3. Состояние игрока `PlayerNetworkState`
 
-Точное байтовое представление (порядок полей важен для сериализации):
+Точная раскладка байт (порядок полей важен для сериализации):
 
 ```
 struct PlayerNetworkState {
@@ -109,105 +130,123 @@ struct PlayerNetworkState {
     float rotY;               // поворот вокруг вертикали
     char  vehicleModel[16];   // имя модели машины ("" если пешком)
     int32 netVehicleId;       // стабильный сетевой id машины
-    float vehicleSpeed;       // скорость машины (км/ч) для валидации
+    float vehicleSpeed;       // скорость машины (км/ч)
     uint8 inVehicle;          // 1 = в машине
     uint8 flags;              // FLAG_JUMPING | FLAG_IN_AIR | FLAG_LOCO_TURBO
-    // --- непрерывный локомоушн (пешком) ---
-    uint16 motionAngle;       // желаемое направление движения, рад*1000
-    uint16 facingAngle;       // желаемый фейсинг, рад*1000
+    // --- непрерывная локомоция (пешком) ---
+    uint16 motionAngle;       // направление движения, рад*1000
+    uint16 facingAngle;       // направление взгляда, рад*1000
     uint8  speedFactor;       // 0..255 доля максимальной скорости
     uint8  characterState;    // CharacterAi::CharacterState (LOCO и т.п.)
-    // --- одноразовое действие ---
-    uint8  actionEvent;       // [seq:3 | ACTION_* id:5] последнее действие; 0 = ещё не было
+    // --- разовое действие ---
+    uint8  actionEvent;       // [seq:3 | ACTION_* id:5] последнее действие; 0 = нет
     // --- кинематическое зеркало машины (inVehicle) ---
     float  vehYaw;            // курс машины, рад
-    uint8  vehSteer;          // знаковый руль -128..127 -> -45..+45°
+    uint8  vehSteer;          // руль -128..127 -> -45..+45 град
     uint16 vehSpeedKmh;       // скорость, км/ч
     uint8  vehState;          // VS_NORMAL / VS_SLIP / VS_EBRAKE_SLIP
-    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE
+    uint8  vehFlags;          // VEH_FLAG_BRAKE | VEH_FLAG_REVERSE | VEH_FLAG_DESTROYED
+    uint8  vehDamage;         // повреждение машины 0 (целая) .. 255 (разбита)
+    uint8  teleportSeq;       // растёт при каждом намеренном разрыве позиции
 };
 ```
 
-- `SERIALIZED_SIZE = 42 (база) + 7 (локомоушн) + 1 (actionEvent) + 9 (машина) = 58` байт.
-- В машине поля локомоушна/действия обнуляются, пешком — поля машины.
-- `actionEvent` берётся из `net::LocalActionLatch` (`LocalActionLatch.h`): игровые
-  точки действий локального аватара (`GetCharacter(0)`) вызывают `Report(id)`, латч
-  держит последнее действие с 3-битной последовательностью (`MakeActionEvent`/
-  `ActionId`). Отправитель держит значение, приёмник срабатывает на смену байта —
-  повтор того же действия отличается seq, поздняя выборка снапшота не теряет клип.
-  Источники: `state.cpp` (DODGE, CRINGE, ATTACK, CELEB_SMALL/BIG, FLAIL в
-  `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK в `JumpAction`, GETUP в
-  `GetUpAction::WakeUp`). Прыжок идёт через `FLAG_JUMPING` (не `ACTION_JUMP`), чтобы
-  не срабатывать дважды. `ACTION_KD`/`ACTION_SURF` зарезервированы.
-- Сериализация little-endian совместимая, свободна от padding-багов
-  (`Serialize`/`Deserialize` в `PlayerNetworkState.cpp` через `net::Write*`).
-- **Связь с валидацией:** поле `inVehicle` выбирает лимит скорости на сервере
-  (`kMaxSpeedOnFoot ≈ 15 м/с`, `kMaxSpeedInVehicle ≈ 120 м/с`).
-- **Связь с машинами:** `vehicleModel` + `netVehicleId` идут в
-  `RemoteVehicleWorldView`, чтобы приёмник создал «призрака» машины той же
-  модели. `netVehicleId` выводится из `mVehicleCentralIndex` (или хэша указателя
-  как запас) — стабилен в рамках сессии.
+- `SERIALIZED_SIZE = 42 (база) + 7 (локомоция) + 1 (actionEvent) + 8 (машина) + 2 = 60` байт.
+- В машине поля локомоции/действия обнулены; пешком — поля машины.
+- `actionEvent` приходит из `net::LocalActionLatch` (`LocalActionLatch.h`): точки
+  действий локального аватара зовут `Report(id)`; защёлка держит последнее действие
+  с 3-битной последовательностью (`MakeActionEvent`/`ActionId`). Приёмник
+  срабатывает на изменение байта. Источники: `state.cpp` (DODGE, CRINGE, ATTACK,
+  CELEB_SMALL/BIG, FLAIL в `InSim::Enter`), `action.cpp` (SLAM, JUMPKICK, GETUP).
+  Прыжки идут через `FLAG_JUMPING`. `ACTION_KD`/`ACTION_SURF` зарезервированы.
+- `vehDamage` = `(1 − Vehicle::GetHealthFraction()) · 255`; приёмник показывает его
+  на машине-призраке (`Vehicle::ApplyNetworkDamage`).
+- `teleportSeq`: игра телепортирует аватара из многих мест, поэтому провайдер
+  определяет это сам (`TrackLocalTeleport` в `gameplaycontext.cpp`): скачок между
+  двумя сэмплами, недостижимый ни для машины (110 м/с), ни бегом (20 м/с), плюс
+  25 м. Серверная коррекция не считается (сервер эту позу уже знает). Сервер
+  пропускает скачок только вместе с новым значением и с ограничением частоты (§18.3).
+- Сериализация little-endian без зависимости от паддинга (`net::Write*`).
+- `vehicleModel` + `netVehicleId` идут в `RemoteVehicleWorldView`: приёмник
+  создаёт призрака той же модели.
 
 ---
 
-## 4. Серверный слой `net::ServerEndpoint` + `net::Session`
+## 4. Сервер: `net::ServerCore`
 
-Серверная сторона разнесена на два слоя (см. §1):
+Единственная реализация авторитетного сервера (`netengine/ServerCore.h`). Игра-хост
+крутит его внутри своей `Session` (встроенный) и подключается к нему через
+loopback; продукт «выделенный сервер» (§8) запускает тот же класс отдельно.
+Поэтому матч на хосте и на выделенном сервере ведёт себя одинаково.
 
-- **`net::ServerEndpoint`** — чистый ENet-хост: допуск пиров, назначение `PeerId`,
-  фрейминг пакетов, счёт liveness, таймаут-свип, авто-PING-проб (heartbeat
-  запрашивает клиент сам), принудительный `KickPeer`. Ничего не знает про мир.
-- **`net::Session`** (host-режим) — поверх серверного эндпоинта: при приёме
-  `PID_AUTH` сверяет пароль и только тогда шлёт `WELCOME`+`WORLD_SEED`+`PLAYER_LIST`;
-  релее `PID_PLAYER_STATE` через **опциональный `IStateValidator`** (анти-телепорт);
-  ведёт авторитетный реестр пиров.
+### Рукопожатие и допуск
+1. ENet connect → `ServerEndpoint` выдаёт `PeerId` (с 1). Пир НЕ допущен: от него
+   принимается только `PID_HELLO`, и он ничего не получает о мире (рассылки мира и
+   списка игроков идут только допущенным).
+2. `PID_HELLO` проверяется по порядку: magic + `PROTOCOL_VERSION` → версия игры
+   (`SetGameVersion`, 0 = не проверять) → пароль (`SetPassword`, пусто = открытая
+   сессия) → лимит слотов (`SetMaxPeers`, loopback хоста учитывается) → фильтр
+   допуска (`SetAdmissionFilter`, например `on_join` Lua-мода). Любой отказ
+   отправляет `PID_REFUSE{причина}` (`REFUSE_PROTOCOL`, `_GAME_VERSION`,
+   `_PASSWORD`, `_FULL`, `_DENIED`) и отключает пира после доставки отказа.
+3. Пир, не приславший верный HELLO за `SetHandshakeTimeoutMs` (5 с), получает
+   `REFUSE_HANDSHAKE`.
+4. Допуск: `WELCOME{peer, время сервера, опции}` + `WORLD_SEED` + `PLAYER_LIST`
+   всем + снапшот мира (надёжный упорядоченный канал: весь мир приходит раньше
+   любого последующего изменения).
+5. Ёмкость транспорта ENet = лимит слотов + 4, чтобы клиент сверх лимита получал
+   `REFUSE_FULL`, а не таймаут.
 
-### Допуск
-1. ENet-коннект → `ServerEndpoint` назначает `PeerId` (`m_nextPeerId++`, стартует с 1).
-2. Если `Session` защищён паролем (`SetHostPassword`), `WELCOME` откладывается,
-   пока клиент не пришлёт корректный `PID_AUTH`; неправильный/отсутствующий пароль
-   → `KickPeer` (пир никогда не узнаёт состав мира).
-3. Без пароля — `WELCOME` + `WORLD_SEED` сразу, затем `PLAYER_LIST` всему составу.
+### Лимиты частоты (`RateLimitConfig`, `SetRateLimits`)
+На каждого допущенного пира — token bucket по классам: потоки (90/с, всплеск 180),
+запросы (мир / леджер / события: 240/с, всплеск 600 — новичок сбрасывает очередь
+разом), надёжные пользовательские пакеты (60/с, всплеск 120) и байты (96 КиБ/с,
+всплеск 192 КиБ). Пакет сверх бюджета отбрасывается; 300 отбросов за 10 с →
+`REFUSE_FLOOD` и кик. `GetStats()` считает отказы, отбросы, отказы валидатора,
+коррекции и кики за флуд.
 
-### Heartbeat / таймаут
-- Клиент сам шлёт `PID_PING` с заданной частотой (`ClientEndpoint::SetPingIntervalMs`);
-  каждый входящий пакет обновляет `lastSeenMs` пира в `ServerEndpoint`.
-- В конце `ServerEndpoint::Update()` — свип: `now - lastSeenMs > m_clientTimeoutMs`
-  → пир удаляется, `PeerEvent{id,false}` (Session чистит реестр/рекстур), и вызывается
-  `enet_peer_disconnect`. `SetClientTimeoutMs` переопределяет окно (для тестов).
+### Релей и валидация
+- `PID_PLAYER_STATE` проходит `IStateValidator::ValidatePeerState(from, blob,
+  serverNow, correction)` (§18.3): `SV_ACCEPT` — переслать, `SV_DROP` —
+  отбросить, `SV_CORRECT` — отбросить и отправить `PID_STATE_CORRECTION` с блобом,
+  в который клиент должен встать.
+- Потоки пересылаются с метками времени (§2); потоки сущностей — только для
+  записей, которыми владеет отправитель; события сущностей — владельцу; события
+  игрока — жертве при включённом PvP.
+- Уход пира: его сущности стираются или освобождаются (§18.5), балансы удаляются,
+  валидатор забывает пира, рассылается `PLAYER_LIST`.
 
-### Валидация и релей
-- `net::Session` на каждый входящий `PID_PLAYER_STATE` вызывает
-  `IStateValidator::ValidatePeerState` (если задан). Отклонённое состояние
-  **не ретранслируется**; последнее честное остаётся у получателя.
-- `GamePlayerBridge`/тесты реализуют валидатор как анти-телепорт с лимитом
-  скорости в зависимости от `inVehicle` (`kMaxSpeedOnFoot ≈ 15 м/с`,
-  `kMaxSpeedInVehicle ≈ 120 м/с`).
-- Принятое состояние ретранслируется всем остальным пирам как `PLAYER_STATE`
-  с полем sender = `PeerId`.
-
-### Реестр сущностей
-- После каждого подключения/отключения/свипа сервер шлёт всем `PLAYER_LIST`
-  (`uint16 count` + массив `PeerId`). Это авторитетный источник состава мира.
-
-### Конфигурация
-- `Session::SetHostPassword(pw)` — защита хоста; `ServerEndpoint::SetClientTimeoutMs`.
+### Наблюдатели
+`SetJoinLeaveFn` (вход/выход на стороне сервера), `SetWorldChangeObserver` (каждое
+принятое изменение/стирание), `SetUserPacketObserver`.
 
 ---
 
-## 5. Клиентский слой `net::ClientEndpoint` + `net::Session`
+## 5. Клиент: `net::Session`
 
-- `net::ClientEndpoint::Connect(ip, port)` → ENet host + peer.
-- `Session::SetPassword(pw)` — задаёт пароль; отправка `PID_AUTH` отложена до
-  момента, когда ENet-соединение установлено (`IsPeerReady()`), через
-  `Session::SendAuthIfDue()` в `Update()` — иначе пакет до рукопожатия теряется.
-- `net::ClientEndpoint` сам шлёт `PID_PING` с заданной частотой (heartbeat), по
-  `PONG` считает RTT → `GetPingMs()`/`HasMeasuredPing()`.
-- `Session` при приёме `WELCOME` запоминает `selfId`; `PLAYER_LIST` → перестроение
-  реестра пиров (`GetPeerRoster`); `PLAYER_STATE` от других → `IRemoteStateSink`
-  (через `GamePlayerBridge` в игру); собственный эхо игнорируется по `selfId`.
-- Локальное состояние шлётся через `ILocalStateProvider` с каденцией
-  `SetStateSendEvery` (по умолчанию каждая 6-я `Update`, ~10 Гц).
+- `Join(ip, port)` → `ClientEndpoint`; как только ENet-соединение установлено,
+  уходит `PID_HELLO` с `SetGameVersion` и `SetPassword` (сессия-хост предъявляет
+  пароль своего же сервера).
+- `GetRefusal()` — почему сервер отказал (сессия при этом вышла из матча).
+  `IsConnectionLost()` — установленное соединение оборвалось без отказа. Отказ
+  применяется только после выхода из цикла обслуживания транспорта (эндпоинт
+  никогда не уничтожается внутри собственного колбэка).
+- Серверные часы: начальная оценка из WELCOME, уточнение каждым PONG (`ClockSync`:
+  смещение берётся из сэмпла с минимальным RTT среди последних 8; RTT сглажен).
+  `ServerTimeMs()`, `GetRttMs()`, `IsClockSynced()`.
+- Вход/выход: из разницы `PLAYER_LIST` на каждом клиенте (loopback хоста и
+  присоединившиеся одинаково) → `SetJoinLeaveFn` и `IRemoteStateSink::OnPeerLeft`.
+  `Leave()` сообщает об уходе оставшихся пиров; деструктор ничего не сообщает
+  (sink'и к этому моменту могут быть уже уничтожены).
+- Потоки: локальное состояние каждые `SetStateSendIntervalMs` (100 мс), прогресс
+  миссии каждые `SetMissionSendIntervalMs` (300 мс), по времени.
+- Запросы (мир, леджер, события, надёжные пользовательские данные) ждут в очереди
+  (≤ 256, порядок сохраняется) до WELCOME.
+- Опции сессии: `GetSessionOptions()` / `SetSessionOptionsFn` (бит `SO_PVP`); при
+  хостинге — `SetSessionOptions`.
+- События: `SendEntityEvent`/`SetEntityEventSink`, `SendPlayerEvent`/
+  `SetPlayerEventSink`; пользовательские данные `SendCustomEvent(data, size, stream)`.
+- `SetStateCorrectionSink` получает коррекции сервера.
 
 ---
 
@@ -233,10 +272,11 @@ struct PlayerNetworkState {
   - модель/id сменились → деспавн старого + спавн нового;
   - вышел → деспавн.
 - `Prune(players)` — деспавн машин водителей, пропавших из авторитетного набора.
-- `Update(dt)` — интерполяция позиции (тот же механизм, что у пеших).
-
-- `Update(dt)` также сглаживает `vehYaw` по кратчайшей дуге; руль/скорость/
-  состояние/флаги передаются в move-sink как есть.
+- `SyncDriver(playerId, state, serverTime)` записывает сэмпл с меткой времени;
+  `Update` показывает позу по snapshot-интерполяции (§11), `vehYaw` по кратчайшей
+  дуге; руль/скорость/состояние/флаги/урон — из ближайшего сэмпла.
+- Призрак, которого мир не смог создать (нет свободной области коллизии),
+  создаётся повторно со следующим сэмплом.
 
 ### Sink в gameplay-контексте (`RemoteVehicleSpawn/Move/Despawn`)
 - Спавн через `VehicleCentral::AddNetworkGhostVehicle(model)` — «сетевой
@@ -248,7 +288,16 @@ struct PlayerNetworkState {
   крутятся), руль, огни тормоза/заднего хода.
 - Despawn — `RemoveNetworkGhostVehicle` (финальный `Release()` сам удаляет
   объект). **Не** вызывать `delete` — двойное освобождение крашило хост при
-  двух удалённых водителях.
+  двух удалённых водителях. Призрак, удалённый, пока его скрипт машины (`.con`)
+  ещё грузится, держит одну ссылку до конца постройки
+  (`ReleaseDeferredNetworkGhosts`): консольные хуки скрипта пишут в «машину в
+  постройке» (освобождённый призрак там давал use-after-free).
+- У призраков свой бюджет областей коллизии
+  (`WorldPhysicsManager::NETWORK_GHOST_VEHICLES = 16`, в sim
+  `CollisionAreaListSize = 37 + 16`); `AddNetworkGhostVehicle` возвращает NULL,
+  если свободной нет, вместо release-assert.
+- Урон: `Vehicle::ApplyNetworkDamage(1 − vehDamage/255)`; призрак никогда не
+  получает локальный урон (`Vehicle::mNetworkGhost`, §18.6).
 
 ---
 
@@ -267,22 +316,27 @@ struct PlayerNetworkState {
 
 ---
 
-## 8. Дедикат-сервер (D10/D11)
+## 8. Выделенный сервер (продукт)
 
-`src/tests/mp_standalone.cpp` — headless-сервер и join-клиент без данных игры.
+`src/server/HarServer.vcxproj` → `har_server.exe`: голый `net::ServerCore` с
+игровыми правилами (`GameServer`: экономика, валидация движения, PvP, серверные
+Lua-моды), без игры, окна, ассетов и loopback-игрока — сервер не занимает слот.
+Это тот же сервер, что встроен в игру-хост.
 
-Использование:
 ```
-mp_standalone server [port] [--mod lua] [--password pw] [--max slots] [--log file]
-mp_standalone host   [port] [--password pw] [--max slots] [--log file]
-mp_standalone join   <hostIp> [port] [--password pw]
+har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...
+           [--pvp] [--cheats] [--game-version <n>] [--seed <n>]
+           [--log <file>] [--verbose]
 ```
+- Порт по умолчанию 3737; без пароля — открытая сессия; `--max` — слоты игроков.
+- `--mod` можно повторять (по `ServerModManager` на скрипт).
+- `--verbose` пишет каждое изменение мира; отказы / кики за флуд / коррекции
+  движения логируются из `ServerCore::GetStats()`.
+- Ctrl+C / SIGTERM корректно останавливают. Сборка кладёт `lua.dll` рядом с exe.
 
-- Работает на движковом слое `net::Session` (вместо старого `NetworkServer`/`Client`).
-- `--password` → `session.SetHostPassword()` / `session.SetPassword()`.
-- `--log` → файл лога (строка запуска + `clients:N` при смене состава).
-- `--mod` → принимается, но примечание: Lua-моды на движковом слое не
-  подгружаются (см. §9); признак оставлен для совместимости интерфейса.
+`src/tests/mp_standalone` теперь только headless ТЕСТОВЫЙ клиент (`join`,
+`genui`): подключается к игре-хосту или `har_server`, шлёт фейковое движение и
+печатает удалённых игроков и полученный снапшот.
 
 ### CLI основной игры (`CommandLineOptions`)
 - `HOSTPORT=<port>` — автостарт хоста.
@@ -299,10 +353,13 @@ mp_standalone join   <hostIp> [port] [--password pw]
 
 ## 9. Lua-моды (`ServerModManager`)
 
-- Загружается один скрипт: `LoadScript(path)`.
-- Хуки: `on_join(clientId)`, `on_validate(clientId, x,y,z,speed)`,
-  `on_leave(clientId)`.
-- Сервер вызывает их в точках допуска/валидации/отвала (см. §4).
+- По менеджеру на скрипт (`LoadScript(path)`); `GameServer` грузит заданный
+  список для ОБОИХ видов сервера (игра-хост: `NetworkMatchManager::SetHostMods`;
+  выделенный: `--mod`).
+- Хуки: `on_join(clientId)` → фильтр допуска (false = `REFUSE_DENIED`),
+  `on_validate(clientId, x,y,z, speed)` (speed — измеренные м/с с последнего
+  принятого состояния) после правил движения, `on_leave(clientId)`; события
+  `player.joined` / `player.left` через `net.on`.
 - Без скрипта поведение = встроенный авторитетный сервер.
 - Тестовый скрипт: `src/tests/test_server_mod.lua`.
 
@@ -332,32 +389,40 @@ mp_standalone join   <hostIp> [port] [--password pw]
   join-клиента), т.к. клиентская перспектива исключает самого игрока (`selfId`)
   из remote-набора; голый серверный реестр включал бы host самому себе.
 - `DrainJoinLeaveEvents(out)` — уведомления join/leave.
-- `Update()` — крутит `net::Session::Update()` (сервер+клиент+релей+валидатор).
+- `Update()` — крутит `net::Session::Update()`; если матч закончился сам (отказ /
+  обрыв), выходит и сбрасывает сервисы мира; `GetLastRefusal()` /
+  `WasConnectionLost()` говорят почему.
+- Хостинг подключает `GameServer` к встроенному ядру сессии (`SetHostConfig`,
+  `SetHostPvp`, `SetHostMods`, `SetAllowEconomyCheats`).
+- PvP и коррекции: `SetStateCorrectionHandler`, `SetPlayerHitHandler`,
+  `SetRemoteLookups` (машина-призрак / марионетка → пир), `ReportRemoteVehicleHit`,
+  `ReportRemotePlayerHit`, `IsPvpEnabled`, `IsRemotePlayerNear`.
 
 ---
 
 ## 11. Визуализация с интерполяцией (`RemotePlayerWorldView`)
 
-- Sink: `spawn`/`move`/`despawn` оторваны от мира (тестируемо).
-- `Sync(players)` — обновляет цели (target) для каждого удалённого игрока,
-  спавнит/деспавнит по авторитетному составу.
-- `Update(dt)` — покадровое экспоненциальное сглаживание к цели
-  (frame-rate independent, `lambda = 3/smoothingSeconds`), не телепортирует.
-- Ключевой договор: изменение позиции НЕ двигает модель в `Sync` — только
-  задаёт цель; реальное движение происходит в `Update`. Это убирает рывки и
-  джиттер на частоте пакетов.
-- Фейсинг (`rotY`) сглаживается по кратчайшей дуге (350° → 10° через 0).
-- Поля локомоушна (`motionAngle`/`facingAngle`/`speedFactor`/`characterState`,
-  turbo) передаются в move-sink без предсглаживания: в игре при
-  `characterState == LOCO` ими управляет `LocomotionDriver` пуппета
-  (`SetFacingDir` + скорость от `GetMaxSpeed()`).
-- `action`-sink вызывается один раз при смене байта `actionEvent` с ненулевым id и
-  получает «голый» id (без seq). Удержанное действие при спавне не проигрывается.
-  `RemotePlayerAction` проигрывает клип визуально: dodge/cringe/break_quick/
-  victory_small/victory_large/flail/get_up — отдельной последовательностью
-  `PlayAnimationAction` (no-op, если клипа нет в NPC-банке); jump_kick/stomp_in_air —
-  поверх пуппета (удалённый в этот момент внутри `JumpAction`). Игровые эффекты
-  действий (сломанный пинком проп) приходят событиями мира, не отсюда.
+- Sink: `spawn`/`move`/`jump`/`action`/`despawn`, отвязан от мира (тестируем).
+- **Snapshot-интерполяция** (`RemoteStateTrack.h`, `net::SnapshotBuffer`): каждое
+  пересланное состояние несёт серверное время, когда отправитель его снял; view
+  держит короткую историю по игроку и показывает его на
+  `serverNow − interpolationDelay` (150 мс ≈ 1,5 периода отправки) — обычно между
+  двумя полученными сэмплами: игрок идёт по реальной траектории отправителя
+  (включая дугу прыжка) при любом джиттере. Опоздавший пакет покрывается
+  экстраполяцией последнего отрезка, не дальше `maxExtrapolationMs` (250 мс). Время
+  кадра не влияет.
+- `Sync(players)` записывает новые сэмплы (повтор пакета игнорируется) и ловит
+  фронты (начало прыжка, изменение байта `actionEvent`); спавн/деспавн по составу.
+  `Update` ставит каждого игрока в интерполированную позу; без `Update` ничего не
+  двигается (кроме спавна).
+- Непрерывные поля (позиция, `rotY` по кратчайшей дуге, `vehYaw`) смешиваются;
+  дискретные (флаги, входы локомоции, состояния) — из ближайшего сэмпла. Поля
+  локомоции в игре ведут `LocomotionDriver` марионетки.
+- Вход без времени (0: нет часов) показывает новейшее состояние.
+- `SetTiming(Timing{clock, delay, extrapolation})`; игра передаёт
+  `Session::ServerTimeMs`. View машин-призраков (§6) использует тот же трек.
+- `action`-sink получает голый id; удерживаемое действие при спавне не
+  проигрывается; `RemotePlayerAction` визуально проигрывает клип.
 
 ---
 
@@ -656,6 +721,7 @@ Abort вызывает `exit(-10)` — это не SEH и не попадает 
   **Общий бюджет плотности:** при спавне учитываются чужие машины рядом
   (`CountRemoteEntitiesNear`), поэтому два игрока рядом не удваивают трафик.
 - Уничтожение машины игрока — `VEH_FLAG_DESTROYED` в `PlayerNetworkState`.
+- Отрисовка призраков, миграция, удары, урон, interest management: §18.4–§18.6.
 
 ### 17.5 Припаркованные машины (`ParkedCarManager`)
 - Расстановка зоны (какой тип на каком локаторе, цвет) — first-write запись
@@ -668,24 +734,103 @@ Abort вызывает `exit(-10)` — это не SEH и не попадает 
 
 ### 17.6 Допуск и авторизация
 - Авторизация **опциональна** и по умолчанию выключена: без пароля сессия открыта
-  (кооператив/сессионки), пир допускается сразу при подключении. С паролем
-  включается гейт `PID_AUTH`.
-- В обоих режимах сервер принимает от пира что-либо, кроме `PID_AUTH`, только
-  после допуска (`m_admitted`) — неаутентифицированный клиент не может ни писать
-  мир, ни рассылать события. Множество допущенных отделено от клиентского
-  `GetPeerRoster()` (раньше общий набор «разжаловал» loopback хоста при каждом
-  `PLAYER_LIST`).
-- Лимит слотов: `Session::SetMaxPeers` (`NetworkMatchManager::SetHostConfig`,
-  `mp_standalone --max`), loopback хоста занимает один слот.
+  (кооператив/сессионки). Пароль проверяется в `PID_HELLO` (§4).
+- До допуска сервер принимает от пира только `PID_HELLO` и ничего не сообщает ему
+  о мире.
+- Лимит слотов: `ServerCore::SetMaxPeers` (`Session::SetMaxPeers`,
+  `NetworkMatchManager::SetHostConfig`, `har_server --max`); loopback игры-хоста
+  занимает слот, выделенный сервер — нет.
 
 ### 17.7 Известные ограничения (открытые задачи)
-- Нет миграции владения: машина трафика исчезает у всех, когда её владелец
-  отъезжает и деспавнит её, даже если рядом другой игрок.
-- Столкновения с кинематическим призраком не передаются владельцу (призрак не
-  реагирует на удар), физика сдвинутых припаркованных машин у каждого своя.
-- Хаск уничтоженной чужой машины трафика — эффект взрыва на призраке, без смены
-  модели.
 - Состояние мира, изменённое хостом до старта матча (из сохранения), серверу не
   известно.
-- Одновременная посадка двух игроков в одну припаркованную машину: побеждает
-  первый, у второго копия остаётся (откат посадки не реализован).
+- Освобождённую машину трафика можно принять, только если у претендента есть
+  свободная машина пула той же модели и дорога под ней; иначе запись истекает по
+  окну claim.
+- Сдвинутые припаркованные машины, пешеходы и актёры: §18.9.
+
+---
+
+## 18. Транспорт, серверное ядро и синхронизация физики (2026-10-25)
+
+### 18.1 Один сервер для хоста и выделенного
+`net::ServerCore` (§4) — единственная реализация сервера. `Session` = клиент +
+необязательное встроенное ядро; `har_server` = ядро без клиента. `GameServer`
+(игровые правила) подключается к любому. `Session::Create/Get/Destroy` (второй,
+неиспользуемый способ владеть сессией) удалены.
+
+### 18.2 Каналы, рукопожатие, часы
+§2, §4, §5: три канала ENet с доставкой по id; `PID_HELLO` с magic, версией
+протокола и игры; явные причины `PID_REFUSE`; таймаут рукопожатия; серверные часы
+в WELCOME/PONG, `ClockSync` на клиенте; каждый поток помечен серверным временем;
+snapshot-интерполяция у приёмников (§11).
+
+### 18.3 Валидация движения (`PlayerMovementValidator`)
+На сервере, по собственному времени приёма (клиент не может подделать dt).
+Относительно последнего ПРИНЯТОГО состояния пира: горизонталь ≤ maxSpeed·dt +
+запас (пешком 20 м/с, в машине 110 м/с, если хоть одно из состояний в машине,
+запас 4 м); подъём ≤ maxSpeed·dt + запас, падение ≤ 80 м/с·dt + запас;
+бесконечные / вне мира координаты отклоняются. Скачок сверх лимитов проходит
+только с новым `teleportSeq`, не больше 3 подряд и 0,5/с в среднем. На отказ —
+`SV_CORRECT` с последним принятым состоянием (не чаще раза в секунду; состояния
+между ними отбрасываются); игра ставит аватара (или его машину) обратно
+(`GameplayStateCorrection`). `on_validate` модов выполняется последним.
+
+### 18.4 Лимиты частоты
+§4. Действуют на каждого допущенного пира, включая loopback хоста.
+
+### 18.5 Миграция владения
+`WorldState`: `WSO_RELEASE` (владелец → 0, флаг `WSF_CLAIMABLE`, при желании с
+новым значением = текущая поза) и `WSO_CLAIM` (первый claim побеждает,
+последующие отклоняются с указанием победителя). `WSF_RELEASE_ON_OWNER_LEAVE`
+освобождает запись, а не стирает, при отключении владельца. Невостребованные
+записи истекают через `SetClaimWindowMs` (3 с). `NetEntityManager`: когда
+локальная симуляция бросает мигрируемую сущность (трафик, пешеходы), а другой
+игрок в радиусе передачи (150 м), она освобождается в текущей позе; игрок в
+радиусе claim (120 м) и с запасом бюджета (`CanAdoptFn`) забирает её; при успехе
+sink `adopt` превращает призрака в локально симулируемую сущность с тем же id
+(`TrafficManager::AdoptNetworkTraffic`: свободная машина пула той же модели на
+ближайшей полосе, в той же позе и с той же скоростью, без объявления новой
+сущности). Трафик объявляется с `WSF_RELEASE_ON_OWNER_LEAVE`.
+
+### 18.6 Удары и урон
+- Призрак (`Vehicle::mNetworkGhost`, ставит `AddNetworkGhostVehicle`) никогда не
+  получает локальный урон. В `Vehicle::PostReactToCollision` столкновение НАШЕЙ
+  машины с призраком превращается в `NetEntityHit` {импульс на призрака (от нашей
+  машины), точка контакта, урон = нормированная сила · 255} →
+  `networld::ReportGhostHit`: владельцу сущности (`PID_ENTITY_EVENT`, сервер
+  доставляет только владельцу) или, если это машина удалённого игрока, этому
+  игроку (PvP, §18.7). Столкновения призраков между собой — дело владельцев.
+- Владелец применяет: `Vehicle::ApplyNetworkHit(impulse, damage)` (Δv = импульс /
+  масса + `TriggerDamage` + визуальный урон своего типа); результат уходит потоком
+  обратно.
+- Урон реплицируется: `NetEntityMotion::damage` и `PlayerNetworkState::vehDamage`;
+  призраки показывают его через `ApplyNetworkDamage` (урон только растёт).
+- `NetEntityMotion` (22 байта) получил `damage` и `state`; во флагах — `MF_KNOCKED`.
+- Interest management: призрак динамической сущности существует только в радиусе
+  релевантности (200 м в игре, удаляется дальше 1,25×; запись сохраняется);
+  призрак, которого мир сейчас не может создать, пробуется каждый кадр.
+
+### 18.7 PvP как опция сессии
+`SO_PVP` в опциях сессии (WELCOME / `PID_SESSION_INFO`, меняется на ходу:
+`GameServer::SetPvp`, `NetworkMatchManager::SetHostPvp`, `har_server --pvp`).
+Сервер пересылает `PID_PLAYER_EVENT` жертве только при включённом PvP. Виды
+(`NetworkMatchManager::PlayerEventKind`, payload `NetEntityHit`):
+`PE_VEHICLE_HIT` (наша машина ударила машину-призрака жертвы → машина жертвы
+получает `ApplyNetworkHit`) и `PE_KNOCKDOWN` (наш пинок попал в марионетку жертвы →
+`Character::ApplyNetworkKnockdown`: flail + подъём через `InSim`, без скорости —
+как оригинал избегает толкать персонажа игрока). Марионетку удалённого игрока
+локально не сбивают никогда — с PvP или без (правду показывает поток владельца).
+
+### 18.8 Поставка серверного продукта
+`HarServer.vcxproj` (Debug/Release x64) после сборки копирует `lua.dll`;
+`src/server/x64/` игнорируется git.
+
+### 18.9 Ещё открыто
+- Контекст игрока (уровень / интерьер в мире) и внешность (модель / костюм) —
+  следующим.
+- Сдвинутые припаркованные машины (сущность, привязанная к статическому объекту —
+  `NEK_PARKED_CAR` и `AddLocal(handle, spawn, boundId)` готовы, хуков в
+  припаркованных машинах нет), откат посадки в припаркованную машину.
+- Пешеходы / актёры как сущности (`NEK_PEDESTRIAN`/`NEK_ACTOR` зарезервированы).
+- Нет идентичности игрока между переподключениями (T7).

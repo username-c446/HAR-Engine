@@ -96,6 +96,7 @@ const int MAX_HUSKS = 5;
 VehicleCentral::VehicleCentral() :
     mCurrentVehicleUnderContructionHead( 0 ),
     mCurrentVehicleUnderConstructionTail( 0 ),
+    mNumDeferredGhostReleases( 0 ),
     mbVehicleTriggersActive(true),
     mSuppressedDriverCount(0)
 {
@@ -112,6 +113,7 @@ VehicleCentral::VehicleCentral() :
         mActiveVehicleControllerList[ i ]->AddRef();
 
         mVehicleUnderConstruction[ i ] = NULL;
+        mDeferredGhostRelease[ i ] = NULL;
         //mDoorTriggerList[ i ] = 0;
     }
     
@@ -1266,6 +1268,12 @@ Vehicle* VehicleCentral::AddNetworkGhostVehicle( const char* name )
     {
         return NULL;
     }
+    // No collision area left: no ghost (the network layer retries later)
+    // rather than the release assert in GetVehicleCollisionAreaIndex.
+    if( !GetWorldPhysicsManager()->HasFreeVehicleCollisionArea() )
+    {
+        return NULL;
+    }
 
     // Do NOT add to the active vehicle list: if the network ghost were registered
     // there (especially as VT_TRAFFIC), the regular vehicle managers could sweep,
@@ -1303,6 +1311,7 @@ Vehicle* VehicleCentral::AddNetworkGhostVehicle( const char* name )
 
     // Not a real active-list slot.
     ghost->mVehicleCentralIndex = -1;
+    ghost->mNetworkGhost = true;
 
     return ghost;
 }
@@ -1353,11 +1362,39 @@ bool VehicleCentral::RemoveNetworkGhostVehicle( Vehicle* vehicle )
 
     vehicle->mVehicleCentralIndex = -1;
 
-    // Balance the ownership AddRef from AddNetworkGhostVehicle. This leaves the
-    // object alive (refcount >= 1) for the caller to delete.
+    // Balance the ownership AddRef from AddNetworkGhostVehicle. A ghost whose
+    // vehicle script is still loading must outlive it (the script's hooks
+    // write into the vehicle under construction): release it afterwards.
+    if( IsCarUnderConstruction( vehicle ) && mNumDeferredGhostReleases < MAX_ACTIVE_VEHICLES )
+    {
+        mDeferredGhostRelease[ mNumDeferredGhostReleases++ ] = vehicle;
+        return true;
+    }
     vehicle->Release();
 
     return true;
+}
+
+void VehicleCentral::ReleaseDeferredNetworkGhosts()
+{
+    int kept = 0;
+    for( int i = 0; i < mNumDeferredGhostReleases; ++i )
+    {
+        Vehicle* v = mDeferredGhostRelease[ i ];
+        if( IsCarUnderConstruction( v ) )
+        {
+            mDeferredGhostRelease[ kept++ ] = v;
+        }
+        else
+        {
+            v->Release();
+        }
+    }
+    for( int i = kept; i < mNumDeferredGhostReleases; ++i )
+    {
+        mDeferredGhostRelease[ i ] = NULL;
+    }
+    mNumDeferredGhostReleases = kept;
 }
 
 
@@ -2171,6 +2208,9 @@ void VehicleCentral::OnProcessRequestsComplete( void* pUserData )
     {
         rAssert( mVehicleUnderConstruction[mCurrentVehicleUnderContructionHead] == NULL );
     }
+
+    // A network ghost dropped while it was being built can go now.
+    ReleaseDeferredNetworkGhosts();
 }
 
 void VehicleCentral::ActivateVehicleTriggers(bool active)

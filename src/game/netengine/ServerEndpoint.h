@@ -49,7 +49,10 @@ namespace net
         ServerEndpoint(const ServerEndpoint&) = delete;
         ServerEndpoint& operator=(const ServerEndpoint&) = delete;
 
-        // Binds and starts listening. Returns false if the port is busy.
+        // Binds and starts listening. `maxPeers` is the transport capacity;
+        // the session layer enforces its own slot cap on top (so a client over
+        // the cap gets an explicit PID_REFUSE instead of a silent connect
+        // timeout) — pass the cap plus some headroom. False if the port is busy.
         bool    Start(uint16_t port, uint16_t maxPeers);
         void    Stop();
         void    Update();
@@ -85,19 +88,17 @@ namespace net
         // True while a peer with the given id is connected and has not timed out.
         bool HasPeer(PeerId id) const { return m_peersById.find(id) != m_peersById.end(); }
 
-        // Forcibly disconnects a peer by id (e.g. a rejected authenticator).
-        // Emits PeerEvent{id,false} and clears its liveness/session state.
+        // Disconnects a peer by id. Packets already queued to it (e.g. a
+        // PID_REFUSE explaining why) are still delivered first. Emits
+        // PeerEvent{id,false} immediately and forgets the peer.
         void KickPeer(PeerId id);
 
-        // On-wire framing bounds.
-        static constexpr int kChannel = 0;
-        static constexpr enet_uint32 kFlushAfterService = 1; // service+flush per Update
+        // Server clock: milliseconds since Start(). Stamped into PONG / WELCOME
+        // and used as the timebase of every stream timestamp.
+        uint32_t NowMs() const { return enet_time_get() - m_startMs; }
 
-        // Transport-level heartbeat cadence. The endpoint sends a PING probe to
-        // every peer every `everay` Update() calls; a responding peer is heard
-        // on the wire and so stays alive. Callers wire the actual PONG handling
-        // through the packet sink; the endpoint only originates the probe.
-        void SetPingInterval(unsigned everyNUpdates);
+        // Transport-measured round-trip time to a peer (ENet's estimate).
+        uint32_t GetPeerRttMs(PeerId id) const;
 
         // How many milliseconds the server keeps a peer with no inbound activity
         // before considering it dead. Defaults to kDefaultClientTimeoutMs.
@@ -111,7 +112,6 @@ namespace net
         void Broadcast(PacketId id, const uint8_t* payload, uint16_t payloadSize, PeerId omit);
 
     private:
-        void OnService(ENetHost* host);
 
         net::ENetInit        m_enetInit;
         ENetHost*            m_host        = nullptr;
@@ -131,9 +131,7 @@ namespace net
         std::map<PeerId, PeerLiveness> m_liveness;
         unsigned int                   m_clientTimeoutMs = kDefaultClientTimeoutMs;
 
-        // Heartbeat state: send a PING probe to every peer every Nth Update.
-        unsigned                      m_pingEvery = 6;   // ~10 Hz at 60fps
-        unsigned                      m_pingTick  = 0;
+        enet_uint32                    m_startMs = 0;
 
         // Staging buffer for framed inbound (id+size+payload) so sinks can hold
         // a stable pointer across the dispatch call.

@@ -473,7 +473,9 @@ MEMTRACK_PUSH_GROUP( "WorldPhysicsManager" );
     // only need slots for shit that is in existence simultaneously
     
     // 10 is probably enough
-    mMaxVehicles = 15;
+    // + a separate budget for networked-match ghosts (other players' cars and
+    // the entities they simulate), so mirrors never starve local vehicles.
+    mMaxVehicles = 15 + NETWORK_GHOST_VEHICLES;
 
     // 12 - 15 would probably be enough
     mMaxChars = 18; 
@@ -1026,6 +1028,18 @@ int WorldPhysicsManager::GetCameraCollisionAreaIndex()
 // Return:      int 
 //
 //=============================================================================
+bool WorldPhysicsManager::HasFreeVehicleCollisionArea() const
+{
+    for( int i = mReservedCollisionAreas; i < mReservedCollisionAreas + mMaxVehicles; i++ )
+    {
+        if( !mCollisionAreaAllocated[i] )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int WorldPhysicsManager::GetVehicleCollisionAreaIndex()
 {
     //int maxVehicles = GetVehicleCentral()->GetMaxActiveVehicles();

@@ -5,13 +5,15 @@ namespace net
     // ---------------------------------------------------------------- table
 
     WorldStateTable::Result WorldStateTable::Apply(PeerId from, const WorldStateOp& op,
-                                                   WorldStateEntry& out, bool& existed)
+                                                   WorldStateEntry& out, bool& existed, uint32_t nowMs)
     {
+        if (op.kind >= WSO_COUNT) return REJECTED;
         auto it = m_entries.find(op.key);
         if (it == m_entries.end())
         {
             existed = false;
             if (op.kind == WSO_ERASE) return UNCHANGED;          // nothing to erase
+            if (op.kind != WSO_SET) return REJECTED;              // nothing to release / claim
             if (op.policy >= WSP_COUNT) return REJECTED;          // malformed policy
             if (op.value.len > WS_MAX_VALUE) return REJECTED;
             if (m_entries.size() >= WS_MAX_ENTRIES) return REJECTED;
@@ -22,7 +24,7 @@ namespace net
             e.version = 1;
             e.owner   = from;
             e.policy  = op.policy;
-            e.flags   = op.flags;
+            e.flags   = static_cast<uint8_t>(op.flags & ~WSF_CLAIMABLE); // server-only bit
             m_entries[op.key] = e;
             out = e;
             existed = true;
@@ -34,6 +36,30 @@ namespace net
         WorldStateEntry& e = it->second;
         existed = true;
         out = e;
+
+        // Ownership transfer (owner-policy entries only).
+        if (op.kind == WSO_RELEASE || op.kind == WSO_CLAIM)
+        {
+            if (e.policy != WSP_OWNER) return REJECTED;
+            if (op.kind == WSO_RELEASE)
+            {
+                if (from != e.owner) return REJECTED;
+                if (op.value.len) e.value = op.value;
+                e.owner = 0;
+                e.flags |= WSF_CLAIMABLE;
+                m_releasedAt[e.key] = nowMs;
+            }
+            else
+            {
+                if ((e.flags & WSF_CLAIMABLE) == 0 || e.owner != 0) return REJECTED;
+                e.owner = from;
+                e.flags = static_cast<uint8_t>(e.flags & ~WSF_CLAIMABLE);
+                m_releasedAt.erase(e.key);
+            }
+            ++e.version;
+            out = e;
+            return ACCEPTED;
+        }
 
         switch (e.policy)
         {
@@ -51,6 +77,7 @@ namespace net
 
         if (op.kind == WSO_ERASE)
         {
+            m_releasedAt.erase(it->first);
             m_entries.erase(it);
             existed = false;
             return ACCEPTED;
@@ -62,7 +89,8 @@ namespace net
         return ACCEPTED;
     }
 
-    void WorldStateTable::OnPeerLeft(PeerId peer, std::vector<WorldStateKey>& erased)
+    void WorldStateTable::OnPeerLeft(PeerId peer, std::vector<WorldStateKey>& erased,
+                                     std::vector<WorldStateEntry>* released, uint32_t nowMs)
     {
         for (auto it = m_entries.begin(); it != m_entries.end(); )
         {
@@ -72,12 +100,37 @@ namespace net
                 if (e.flags & WSF_ERASE_ON_OWNER_LEAVE)
                 {
                     erased.push_back(e.key);
+                    m_releasedAt.erase(e.key);
                     it = m_entries.erase(it);
                     continue;
                 }
                 e.owner = 0; // orphaned: read-only until reassigned
+                if (e.flags & WSF_RELEASE_ON_OWNER_LEAVE)
+                {
+                    e.flags |= WSF_CLAIMABLE;
+                    ++e.version;
+                    m_releasedAt[e.key] = nowMs;
+                    if (released) released->push_back(e);
+                }
             }
             ++it;
+        }
+    }
+
+    void WorldStateTable::ExpireClaimable(uint32_t nowMs, uint32_t windowMs, std::vector<WorldStateKey>& erased)
+    {
+        for (auto it = m_releasedAt.begin(); it != m_releasedAt.end(); )
+        {
+            if (static_cast<int32_t>(nowMs - it->second) > static_cast<int32_t>(windowMs))
+            {
+                erased.push_back(it->first);
+                m_entries.erase(it->first);
+                it = m_releasedAt.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
     }
 
@@ -183,7 +236,7 @@ namespace net
         bool DecodeRequest(const uint8_t* d, uint16_t n, uint32_t& seq, WorldStateOp& op)
         {
             Reader r(d, n);
-            return r.ReadU32(seq) && ReadKey(r, op.key) && r.ReadU8(op.kind) && op.kind <= WSO_ERASE
+            return r.ReadU32(seq) && ReadKey(r, op.key) && r.ReadU8(op.kind) && op.kind < WSO_COUNT
                 && r.ReadU8(op.policy) && r.ReadU8(op.flags) && ReadValue(r, op.value);
         }
 

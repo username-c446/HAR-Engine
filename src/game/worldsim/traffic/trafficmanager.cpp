@@ -713,7 +713,7 @@ BEGIN_PROFILE( "Traffic Man: Add" );
                             // Shared density budget in a match: traffic owned by
                             // other players around us counts too, so two players
                             // side by side do not double the cars on the road.
-                            int remoteTraffic = networld::CountRemoteEntitiesNear( center.x, center.z, addRadius );
+                            int remoteTraffic = networld::CountRemoteEntitiesNear( center.x, center.z, addRadius, net::NEK_TRAFFIC_CAR );
                             if( mNumTraffic + remoteTraffic < maxTrafficToUse )
                             {
                                 // set cPos;
@@ -1364,6 +1364,7 @@ TrafficManager::TrafficManager()
 
     mCurrTrafficModelGroup = -1;
     mMaxTraffic = MAX_TRAFFIC;
+    mAdoptingNetworkTraffic = false;
 
     // initialize NULL list.
     mNumCharsToStopFor = 0;
@@ -1551,7 +1552,9 @@ bool TrafficManager::AddTraffic(Lane* lane, TrafficVehicle* tv)
     ::GetEventManager()->TriggerEvent( EVENT_TRAFFIC_SPAWN, v );
 
     // Replicate: the server registers the car (owned and simulated by us) and
-    // every other player mirrors it as a ghost.
+    // every other player mirrors it as a ghost. An adopted car already has its
+    // server id (the claimed one).
+    if( !mAdoptingNetworkTraffic )
     {
         net::NetEntitySpawn spawn;
         spawn.kind = net::NEK_TRAFFIC_CAR;
@@ -1655,6 +1658,102 @@ void TrafficManager::RemoveTrafficVehicle( TrafficVehicle* tv )
             break;
         }
     }
+}
+
+Vehicle* TrafficManager::AdoptNetworkTraffic( const char* model, const rmt::Vector& pos, float yaw, float speedMps )
+{
+    if( model == NULL || model[0] == '\0' )
+    {
+        return NULL;
+    }
+
+    // A free pooled car of the same model (pooled cars keep their model).
+    TrafficVehicle* tv = NULL;
+    for( int i = 0; i < MAX_TRAFFIC; ++i )
+    {
+        if( mVehicles[i].GetIsActive() || mVehicles[i].GetVehicle() == NULL )
+        {
+            continue;
+        }
+        const char* name = mVehicles[i].GetVehicle()->GetName();
+        if( name != NULL && strcmp( name, model ) == 0 )
+        {
+            tv = &mVehicles[i];
+            break;
+        }
+    }
+    if( tv == NULL )
+    {
+        return NULL;
+    }
+
+    // The road under the car, and the lane whose direction matches its heading.
+    const float SEARCH_RADIUS = 15.0f;
+    RoadManager::PathElement elem;
+    elem.elem = NULL;
+    RoadSegment* seg = NULL;
+    float segT = 0.0f, roadT = 0.0f;
+    RoadManager::GetInstance()->FindClosestPathElement( pos, SEARCH_RADIUS, RoadManager::PO_SEARCH_ROADS,
+                                                        elem, seg, segT, roadT );
+    if( seg == NULL )
+    {
+        return NULL;
+    }
+    Road* road = seg->GetRoad();
+    unsigned int laneIndex = 0;
+    float bestDiff = 1000.0f;
+    rmt::Vector laneDir( 0.0f, 0.0f, 1.0f );
+    for( unsigned int j = 0; j < seg->GetNumLanes(); ++j )
+    {
+        rmt::Vector p, d;
+        seg->GetLaneLocation( segT, j, p, d );
+        float diff = GetRotationAboutY( d.x, d.z ) - yaw;
+        while( diff > rmt::PI )  diff -= 2.0f * rmt::PI;
+        while( diff < -rmt::PI ) diff += 2.0f * rmt::PI;
+        if( rmt::Fabs( diff ) < bestDiff )
+        {
+            bestDiff = rmt::Fabs( diff );
+            laneIndex = j;
+            laneDir = d;
+        }
+    }
+    Lane* lane = road->GetLane( laneIndex );
+    if( lane == NULL )
+    {
+        return NULL;
+    }
+
+    mAdoptingNetworkTraffic = true;
+    bool added = AddTraffic( lane, tv );
+    mAdoptingNetworkTraffic = false;
+    if( !added )
+    {
+        return NULL;
+    }
+
+    Vehicle* v = tv->GetVehicle();
+    rmt::Vector cPos = pos;
+    v->SetInitialPosition( &cPos );
+    v->SetResetFacingInRadians( yaw );
+    v->Reset();
+    v->mHijackedByUser = false;
+
+    laneDir.y = 0.0f;
+    if( laneDir.MagnitudeSqr() > 0.0001f )
+    {
+        laneDir.Normalize();
+    }
+    v->mTrafficLocomotion->Init();
+    v->mTrafficLocomotion->InitPos( cPos );
+    v->mTrafficLocomotion->InitFacing( laneDir );
+    v->mTrafficLocomotion->InitVehicleAI( v );
+    v->mTrafficLocomotion->InitLane( lane, laneIndex, lane->GetSpeedLimit() );
+    v->mTrafficLocomotion->InitSegment( seg, seg->GetSegmentIndex(), segT );
+    v->mTrafficLocomotion->SetActive( true );
+    v->mTrafficLocomotion->SetAISpeed( speedMps > 0.0f ? speedMps : 0.0f );
+    v->mVehicleType = VT_TRAFFIC;
+    v->SetLocomotion( VL_TRAFFIC );
+    return v;
 }
 
 TrafficVehicle* TrafficManager::GetFreeTrafficVehicle()

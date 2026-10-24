@@ -84,7 +84,7 @@ bool ServerModManager::OnPlayerJoin(int clientId)
     return result != 0;
 }
 
-bool ServerModManager::OnPlayerValidate(int clientId, const PlayerNetworkState& state)
+bool ServerModManager::OnPlayerValidate(int clientId, const PlayerNetworkState& state, float measuredSpeed)
 {
     if (m_state == nullptr) return true; // no script -> allow
     if (!PushFunction("on_validate")) return true;
@@ -93,7 +93,7 @@ bool ServerModManager::OnPlayerValidate(int clientId, const PlayerNetworkState& 
     lua_pushnumber(m_state, state.x);
     lua_pushnumber(m_state, state.y);
     lua_pushnumber(m_state, state.z);
-    lua_pushnumber(m_state, 0.0f);        // scalar speed placeholder
+    lua_pushnumber(m_state, measuredSpeed);
 
     if (lua_pcall(m_state, 5, 1, 0) != LUA_OK) {
         const char* err = lua_tostring(m_state, -1);

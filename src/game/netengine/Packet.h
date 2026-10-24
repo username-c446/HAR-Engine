@@ -9,9 +9,15 @@
 
 namespace net
 {
-    // Version of the on-wire protocol. Bumped only on incompatible changes to
-    // the packet framing. Clients and servers must agree on this to talk.
-    static constexpr const uint16_t PROTOCOL_VERSION = 1;
+    // Version of the on-wire protocol. Bumped on every incompatible change to a
+    // packet layout. A client presents it in PID_HELLO; a server refuses any
+    // other version (PID_REFUSE, REFUSE_PROTOCOL) instead of silently
+    // misreading its packets.
+    static constexpr const uint16_t PROTOCOL_VERSION = 2;
+
+    // First field of PID_HELLO ('HARN'): tells an engine client from random
+    // UDP traffic that happens to reach the port.
+    static constexpr const uint32_t PROTOCOL_MAGIC = 0x4E524148u;
 
     // Hard cap for any single packet payload (one UDP datagram body). Kept small
     // so a packet fits one ENet packet without fragmentation concerns.
@@ -26,14 +32,15 @@ namespace net
 
     enum ReservedPacketId : PacketId
     {
-        PID_HELLO        = 0x0000, // C->S: protocol/version handshake
-        PID_WELCOME      = 0x0001, // S->C: session id + world seed
-        PID_ACK          = 0x0002, // S/C: acknowledge version/liveness
-        PID_AUTH         = 0x0003, // C->S: password for protected session
+        PID_HELLO        = 0x0000, // C->S: {magic, protocol, game version, password}
+        PID_WELCOME      = 0x0001, // S->C: {peer id, server time, session options}
+        PID_REFUSE       = 0x0003, // S->C: {reason, server protocol} then disconnect
         PID_PLAYER_LIST  = 0x0004, // S->C: authoritative present-peer list
-        PID_PING         = 0x0005, // C->S: heartbeat / RTT probe
-        PID_PONG         = 0x0006, // S->C: heartbeat acknowledgment (carries RTT)
+        PID_PING         = 0x0005, // C->S: {client time} heartbeat / RTT probe
+        PID_PONG         = 0x0006, // S->C: {client time echo, server time}
         PID_WORLD_SEED   = 0x0007, // S->C: authoritative world seed (u32)
+        PID_SESSION_INFO = 0x0008, // S->C: session options changed {u32 options}
+        PID_STATE_CORRECTION = 0x0009, // S->C: validator refused our state; snap to this blob
 
         // Server-authoritative replicated world state (WorldState.h).
         PID_WS_REQUEST      = 0x0010, // C->S: predicted set/erase {seq, key, op}
@@ -51,6 +58,8 @@ namespace net
         PID_VEHICLE_STATE= 0x0101, // relayed remote driver's machine
         PID_MISSION_STATE= 0x0102, // relayed mission progress
         PID_ENTITY_STATE = 0x0103, // owner-streamed dynamic entity state (owner-checked relay)
+        PID_ENTITY_EVENT = 0x0104, // C->S->owner: hit/impulse/damage aimed at an entity
+        PID_PLAYER_EVENT = 0x0105, // C->S->victim: hit aimed at another player (PvP)
 
         // Open user-data channel in the reserved 0x8000+ range. The engine does
         // not interpret the payload: the session relays it to all other peers
@@ -58,7 +67,57 @@ namespace net
         // game's custom-event sink. Games/mods use it to ship their own packets
         // without touching the core protocol.
         PID_USER         = 0x8000,
+        // Same, unreliable-sequenced (stream channel): for frequent mod data
+        // where only the newest packet matters.
+        PID_USER_STREAM  = 0x8001,
     };
+
+    // Why a server refused a client (PID_REFUSE). The client stays
+    // disconnected and reports the reason (Session::GetRefusal).
+    enum RefuseReason : uint8_t
+    {
+        REFUSE_NONE         = 0,
+        REFUSE_PROTOCOL     = 1, // different PROTOCOL_VERSION / not an engine client
+        REFUSE_GAME_VERSION = 2, // different game content version
+        REFUSE_PASSWORD     = 3, // protected session, wrong or missing password
+        REFUSE_FULL         = 4, // no free slot
+        REFUSE_HANDSHAKE    = 5, // no HELLO within the handshake window
+        REFUSE_FLOOD        = 6, // kicked for exceeding the rate limits
+        REFUSE_DENIED       = 7, // the server's admission filter (mod) said no
+    };
+
+    // ENet channels. Reliable traffic (handshake, world state, ledger, events)
+    // is ordered on its own channel; frequent latest-state streams ride an
+    // unreliable-sequenced channel, so a lost stream packet is simply replaced
+    // by the next one instead of stalling everything behind a retransmit.
+    // Ping/pong get their own unreliable channel: a reliable retransmit would
+    // inflate the RTT sample, and a shared sequenced channel would drop pings.
+    enum Channel : uint8_t
+    {
+        CH_RELIABLE = 0,
+        CH_STREAM   = 1,
+        CH_TIME     = 2,
+        CH_COUNT    = 3,
+    };
+
+    // Single delivery policy for every packet id, used by both endpoints.
+    inline Channel ChannelOf(PacketId id)
+    {
+        switch (id)
+        {
+        case PID_PING:
+        case PID_PONG:
+            return CH_TIME;
+        case PID_PLAYER_STATE:
+        case PID_VEHICLE_STATE:
+        case PID_MISSION_STATE:
+        case PID_ENTITY_STATE:
+        case PID_USER_STREAM:
+            return CH_STREAM;
+        default:
+            return CH_RELIABLE;
+        }
+    }
 
     // Opaque identifier of a connected peer (assigned by the transport).
     using PeerId = uint16_t;
@@ -67,6 +126,7 @@ namespace net
     static_assert(PID_HELLO < 0x0100, "core packet ids must stay in reserved range");
     static_assert(PID_MISSION_STATE >= 0x0100 && PID_MISSION_STATE < 0x0200,
                   "gameplay ids must stay in reserved range");
+    static_assert(PID_PLAYER_EVENT < 0x0200, "gameplay ids must stay in reserved range");
 
     // ---------------------------------------------------------------------
     // net::Reader / net::Writer: bounds-checked little-endian serializers.

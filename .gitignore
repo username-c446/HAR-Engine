@@ -204,3 +204,6 @@ src/tests/**/*.idb
 src/tests/**/*.recipe
 src/tests/**/*.exp
 src/tests/**/*.pdb
+# Dedicated server build output
+src/server/x64/
+src/server/HarServer/
