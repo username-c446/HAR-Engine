@@ -402,14 +402,26 @@ do not change.
 - **Snapshot interpolation** (`RemoteStateTrack.h`, `net::SnapshotBuffer`): every
   relayed state carries the server time its sender sampled it at; the view keeps a
   short history per player and renders at `serverNow − interpolationDelay`
-  (150 ms ≈ 1.5 send periods), which normally lies between two received samples:
+  (100 ms = two periods of the 20 Hz player stream), which normally lies between two received samples:
   the player follows the sender's real path (jump arcs included) regardless of
   packet jitter. A late packet is covered by extrapolating the last segment, at
   most `maxExtrapolationMs` (250 ms). Frame time does not matter.
-- `Sync(players)` records new samples (a repeated packet is ignored) and fires
-  edges (jump rising edge, a changed `actionEvent` byte); spawns/despawns by
-  composition. `Update` moves every player to its interpolated pose; nothing moves
-  between spawns without `Update`.
+- `Sync(players)` records new samples (a repeated packet is ignored) and
+  spawns/despawns by composition. `Update` moves every player to its interpolated
+  pose and fires the edges (jump rising edge, a changed `actionEvent` byte) of the
+  RENDERED state — a jump or clip starts when the shown pose reaches it, not one
+  interpolation delay early. The first shown state only primes the edges (no
+  replay on spawn / reappearance).
+- The move sink also receives the pose's velocity (`RemoteMotion`, from the
+  bracketing samples). In game (`RemotePlayerMove`) the puppet is placed exactly at
+  the interpolated pose every frame (after the world physics update — the last
+  write before rendering) and the locomotion driver gets the MEASURED horizontal
+  speed and direction, so the walk/run cycle matches the real motion and the
+  animation's own advance lands on the next pose. The old scheme (locomotion at
+  `speedFactor · maxSpeed`, position snapped back after drifting 1 m) was the
+  rubber-banding.
+- The sender's `rotY` is the facing angle (`Character::GetFacingDir`); it used to
+  carry `heading.y` (the vertical component of a direction vector, ~0).
 - Continuous fields (position, `rotY` over the shortest arc, `vehYaw`) are
   blended; discrete ones (flags, locomotion inputs, states) come from the nearer
   sample. Locomotion fields drive the puppet's `LocomotionDriver` in game.

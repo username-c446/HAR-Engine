@@ -189,6 +189,8 @@ void NetworkMatchManager::AttachSession()
         m_pendingEvents.push_back(ev);
     });
     AttachMissionChannel();
+    // Players stream at 20 Hz: receivers interpolate two periods behind.
+    s->SetStateSendIntervalMs(50);
 
     // Replicated world: every authoritative decision goes to both services
     // (each ignores what is not its own: static ids vs. dynamic entities).

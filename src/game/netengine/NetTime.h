@@ -135,10 +135,23 @@ namespace net
         bool Sample(uint32_t renderTime, uint32_t maxExtrapolateMs,
                     const T*& from, const T*& to, float& alpha) const
         {
+            const Item* a = nullptr;
+            const Item* b = nullptr;
+            if (!SampleItems(renderTime, maxExtrapolateMs, a, b, alpha)) return false;
+            from = &a->value;
+            to = &b->value;
+            return true;
+        }
+
+        // Same, with the bracketing items (their times give the segment's
+        // duration, e.g. to derive a velocity).
+        bool SampleItems(uint32_t renderTime, uint32_t maxExtrapolateMs,
+                         const Item*& from, const Item*& to, float& alpha) const
+        {
             if (m_items.empty()) return false;
             if (m_items.size() == 1 || TimeDiff(renderTime, m_items.front().time) <= 0)
             {
-                from = to = &m_items.front().value;
+                from = to = &m_items.front();
                 alpha = 0.0f;
                 return true;
             }
@@ -149,8 +162,8 @@ namespace net
                 {
                     const Item& a = m_items[i - 1];
                     int32_t span = TimeDiff(b.time, a.time);
-                    from = &a.value;
-                    to = &b.value;
+                    from = &a;
+                    to = &b;
                     alpha = span > 0 ? static_cast<float>(TimeDiff(renderTime, a.time)) / span : 1.0f;
                     return true;
                 }
@@ -161,8 +174,8 @@ namespace net
             int32_t span = TimeDiff(b.time, a.time);
             int32_t past = TimeDiff(renderTime, b.time);
             if (past > static_cast<int32_t>(maxExtrapolateMs)) past = static_cast<int32_t>(maxExtrapolateMs);
-            from = &a.value;
-            to = &b.value;
+            from = &a;
+            to = &b;
             alpha = span > 0 ? 1.0f + static_cast<float>(past) / span : 1.0f;
             return true;
         }

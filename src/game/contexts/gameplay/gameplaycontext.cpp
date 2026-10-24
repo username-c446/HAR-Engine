@@ -205,9 +205,9 @@ namespace
         outState.teleportSeq = s_teleport.seq;
         outState.vehDamage = 0;
 
-        rmt::Vector heading;
-        avatar->GetHeading( heading );
-        outState.rotY = heading.y;
+        // Facing angle in radians (rotY used to carry heading.y — the vertical
+        // component of the direction vector, i.e. ~0).
+        outState.rotY = avatar->GetCharacter() != NULL ? avatar->GetCharacter()->GetFacingDir() : 0.0f;
 
         outState.inVehicle = avatar->IsInCar() ? 1 : 0;
 
@@ -406,67 +406,45 @@ namespace
         return c;
     }
 
-    void RemotePlayerMove( int playerId, void* handle, const PlayerNetworkState& state )
+    void RemotePlayerMove( int playerId, void* handle, const PlayerNetworkState& state, const RemoteMotion& motion )
     {
         (void)playerId;
         Character* c = static_cast<Character*>( handle );
         if ( c == NULL ) return;
-        rmt::Vector pos( state.x, state.y, state.z );
 
-// Drive locomotion so the remote character animates (walks/runs) rather
-        // than sliding in the bind pose. StateManager::Update / the action
-        // controller only run for NPCs when they are inside someone's frustum
-        // and even then only intermittently, so we cannot rely on
-        // WalkerLocomotionAction::DoSimulation to apply a desired speed. Instead
-        // feed the locomotion DRIVER directly (exactly what DoSimulation does),
-        // and let UpdatePuppet()->Advance() (run in PostSimUpdate for NPCs) turn
-        // that into a walk/run animation.
-        if ( c->GetStateManager() != NULL && c->GetStateManager()->GetState() == CharacterAi::LOCO )
+        // The puppet IS the interpolated network pose: placed exactly, every
+        // frame (this runs after the world physics update, so it is the last
+        // write before rendering). Locomotion only animates it — with the
+        // pose's measured velocity, so the animation's own advance matches the
+        // next interpolated pose and nothing has to be corrected. (Driving the
+        // position by locomotion at a guessed speed and snapping it back when
+        // it drifted was the rubber-banding.)
+        c->SetPosition( rmt::Vector( state.x, state.y, state.z ) );
+
+        CharacterAi::StateManager* sm = c->GetStateManager();
+        if ( sm == NULL || sm->GetState() != CharacterAi::LOCO ) return;
+        choreo::LocomotionDriver* driver = c->GetWalkerLocomotionAction()->GetDriver();
+        if ( driver == NULL ) return;
+
+        float facingRad = state.facingAngle / 1000.0f;
+        if ( state.characterState == static_cast<uint8_t>( CharacterAi::LOCO ) )
         {
-            choreo::LocomotionDriver* driver =
-                c->GetWalkerLocomotionAction()->GetDriver();
-            if ( driver != NULL )
-            {
-                // Use the reported continuous-locomotion fields directly. Only
-                // when characterState says the sender is LOCO (walking/running)
-                // do we drive the pose with these; otherwise we leave the remote
-                // character sitting in whatever its current action is.
-                if ( state.characterState == static_cast<uint8_t>(CharacterAi::LOCO) )
-                {
-                    float motionRad = state.motionAngle / 1000.0f;
-                    float facingRad = state.facingAngle / 1000.0f;
-
-                    // Scale the 0..255 fraction by the sender-consistent max
-                    // speed. GetMaxSpeed() already folds turbo in; a remote turbo
-                    // bumper is mirrored by also raising the clamp here.
-                    float maxSpeed = c->GetMaxSpeed();
-                    if ( ( state.flags & PlayerNetworkState::FLAG_LOCO_TURBO )
-                         && !c->IsTurbo() )
-                    {
-                        maxSpeed = CharacterTune::sfMaxSpeed + CharacterTune::sfDashBurstMax;
-                    }
-                    float speed = ( state.speedFactor / 255.0f ) * maxSpeed;
-
-                    driver->SetDesiredMotionAngle( motionRad );
-                    driver->SetDesiredFacingAngle( facingRad );
-                    driver->SetDesiredVelocity( speed );
-                    c->SetFacingDir( facingRad );
-                    c->SetDesiredDir( motionRad );
-                }
-            }
+            const float kStillSpeed = 0.15f; // m/s: below this the player stands
+            float speed = motion.HorizontalSpeed();
+            float motionRad = speed > kStillSpeed ? choreo::GetWorldAngle( motion.vx, motion.vz )
+                                                  : facingRad;
+            driver->SetDesiredMotionAngle( motionRad );
+            driver->SetDesiredFacingAngle( facingRad );
+            driver->SetDesiredVelocity( speed > kStillSpeed ? speed : 0.0f );
+            c->SetFacingDir( facingRad );
+            c->SetDesiredDir( motionRad );
         }
-
-        // Snap the world position only when the locomotion position drifts too
-        // far from the authoritative network position (otherwise we fight the
-        // locomotion every frame and cause jitter).
-        rmt::Vector cur;
-        c->GetPosition( &cur );
-        rmt::Vector delta = pos - cur;
-        if ( delta.MagnitudeSqr() > 1.0f )
+        else
         {
-            c->SetPosition( pos );
+            // Not walking (an action, getting in/out): stand still in place.
+            driver->SetDesiredVelocity( 0.0f );
         }
-}
+    }
 
     // The remote player's appearance changed (costume, character): swap the
     // puppet's model and animation bank in place.

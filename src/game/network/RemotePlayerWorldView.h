@@ -25,7 +25,8 @@ public:
     // playerId matches the network client id. Returns an opaque handle that is
     // passed back unmodified to later Move/Despawn calls.
     typedef void* (*SpawnFn)(int playerId);
-    typedef void  (*MoveFn)(int playerId, void* handle, const PlayerNetworkState& state);
+    // `motion`: the pose's world velocity (0 for untimed input).
+    typedef void  (*MoveFn)(int playerId, void* handle, const PlayerNetworkState& state, const RemoteMotion& motion);
     typedef void  (*JumpFn)(int playerId, void* handle); // rising edge of a remote jump
     typedef void  (*ActionFn)(int playerId, void* handle, uint8_t actionId); // new one-shot ACTION_* id (sequence bits stripped)
     typedef void  (*DespawnFn)(int playerId, void* handle);
@@ -61,12 +62,12 @@ public:
     }
 
     // Called every frame with the authoritative set of remote players. Spawns
-    // new players, records new samples (and fires jump / action edges),
-    // despawns removed ones.
+    // new players, records new samples, despawns removed ones.
     void Sync(const RemotePlayerManager& players);
 
     // Called every frame (after Sync): moves each remote player to its
-    // interpolated pose. Nothing moves between spawns without Update().
+    // interpolated pose and fires the jump / action edges the shown state
+    // reaches. Nothing moves between spawns without Update().
     void Update(float dt);
 
     // Despawn everything (e.g. on leaving the match).
@@ -83,11 +84,13 @@ private:
         void*            handle = nullptr;   // null while outside our context
         uint32_t         appearanceVersion = 0;
         RemoteStateTrack track;
+        bool             edgesPrimed = false; // first shown state seen (no replay)
         uint8_t          lastActionEvent = 0; // fires the action sink only on change
         bool             jumping = false;     // FLAG_JUMPING / FLAG_IN_AIR rising edge
     };
 
     void UpdatePresence(int playerId, Entry& entry, const PlayerNetworkState& state);
+    void FireEdges(int playerId, Entry& entry, const PlayerNetworkState& shown);
 
     Sink m_sink;
     RemoteStateTrack::Timing m_timing;

@@ -39,26 +39,23 @@ void RemotePlayerWorldView::Sync(const RemotePlayerManager& players)
 
 void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& state, uint32_t serverTimeMs)
 {
-    const bool jumpingNow = (state.flags & (PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR)) != 0;
-
-    auto it = m_entries.find(playerId);
-    if (it == m_entries.end())
-    {
-        Entry& entry = m_entries[playerId];
-        entry.lastActionEvent = state.actionEvent; // a held action is not replayed
-        entry.jumping = jumpingNow;
-        entry.track.Push(serverTimeMs, state);
-        UpdatePresence(playerId, entry, state);
-        return;
-    }
-
-    Entry& entry = it->second;
-    bool fresh = entry.track.Push(serverTimeMs, state);
+    Entry& entry = m_entries[playerId];
+    entry.track.Push(serverTimeMs, state);
     UpdatePresence(playerId, entry, state);
-    if (!fresh || entry.handle == nullptr) // the same packet again / not shown
+}
+
+void RemotePlayerWorldView::FireEdges(int playerId, Entry& entry, const PlayerNetworkState& shown)
+{
+    // Edges are taken from the RENDERED state, so a jump / clip starts when
+    // the shown pose reaches it — not one interpolation delay early.
+    const bool jumpingNow = (shown.flags & (PlayerNetworkState::FLAG_JUMPING | PlayerNetworkState::FLAG_IN_AIR)) != 0;
+    if (!entry.edgesPrimed)
     {
+        // First shown state (spawn / reappearance): a held action or an
+        // ongoing jump is not replayed.
+        entry.edgesPrimed = true;
         entry.jumping = jumpingNow;
-        entry.lastActionEvent = state.actionEvent;
+        entry.lastActionEvent = shown.actionEvent;
         return;
     }
 
@@ -68,12 +65,12 @@ void RemotePlayerWorldView::SyncOne(int playerId, const PlayerNetworkState& stat
 
     // A changed one-shot action byte ([seq|id], held by the sender) is a new
     // action; a repeat of the same action differs by its sequence bits.
-    if (state.actionEvent != entry.lastActionEvent && m_sink.action)
+    if (shown.actionEvent != entry.lastActionEvent && m_sink.action)
     {
-        uint8_t id = PlayerNetworkState::ActionId(state.actionEvent);
+        uint8_t id = PlayerNetworkState::ActionId(shown.actionEvent);
         if (id != PlayerNetworkState::ACTION_NONE) m_sink.action(playerId, entry.handle, id);
     }
-    entry.lastActionEvent = state.actionEvent;
+    entry.lastActionEvent = shown.actionEvent;
 }
 
 void RemotePlayerWorldView::UpdatePresence(int playerId, Entry& entry, const PlayerNetworkState& state)
@@ -83,6 +80,7 @@ void RemotePlayerWorldView::UpdatePresence(int playerId, Entry& entry, const Pla
     {
         if (entry.handle != nullptr && m_sink.despawn) m_sink.despawn(playerId, entry.handle);
         entry.handle = nullptr;
+        entry.edgesPrimed = false;
         return;
     }
     uint32_t version = m_appearance ? m_appearance(playerId) : 0;
@@ -92,7 +90,7 @@ void RemotePlayerWorldView::UpdatePresence(int playerId, Entry& entry, const Pla
         // current appearance.
         entry.handle = m_sink.spawn ? m_sink.spawn(playerId) : nullptr;
         entry.appearanceVersion = version;
-        if (entry.handle != nullptr && m_sink.move) m_sink.move(playerId, entry.handle, state);
+        if (entry.handle != nullptr && m_sink.move) m_sink.move(playerId, entry.handle, state, RemoteMotion());
         return;
     }
     if (version != entry.appearanceVersion)
@@ -105,12 +103,15 @@ void RemotePlayerWorldView::UpdatePresence(int playerId, Entry& entry, const Pla
 void RemotePlayerWorldView::Update(float dt)
 {
     (void)dt; // poses come from the server clock, not from frame time
-    if (!m_sink.move) return;
     for (auto& kv : m_entries)
     {
-        if (kv.second.handle == nullptr) continue;
+        Entry& entry = kv.second;
+        if (entry.handle == nullptr) continue;
         PlayerNetworkState s;
-        if (kv.second.track.Render(m_timing, s)) m_sink.move(kv.first, kv.second.handle, s);
+        RemoteMotion motion;
+        if (!entry.track.Render(m_timing, s, &motion)) continue;
+        if (m_sink.move) m_sink.move(kv.first, entry.handle, s, motion);
+        FireEdges(kv.first, entry, s);
     }
 }
 

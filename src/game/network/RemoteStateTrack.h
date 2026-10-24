@@ -17,6 +17,14 @@
 //
 // Untimed input (time 0: no clock, e.g. unit tests) degrades to "show the
 // newest state".
+// World velocity of the rendered pose (m/s), from the bracketing samples.
+// Receivers drive animation with it (walk/run cycle matches the real motion).
+struct RemoteMotion
+{
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    float HorizontalSpeed() const { return std::sqrt(vx * vx + vz * vz); }
+};
+
 class RemoteStateTrack
 {
 public:
@@ -25,7 +33,7 @@ public:
     struct Timing
     {
         ClockFn  clock;
-        uint32_t interpolationDelayMs = 150; // ~1.5 send periods at 10 Hz
+        uint32_t interpolationDelayMs = 100; // two send periods at 20 Hz
         uint32_t maxExtrapolationMs   = 250;
     };
 
@@ -53,9 +61,10 @@ public:
 
     const PlayerNetworkState& Newest() const { return m_buffer.Newest().value; }
 
-    // The state to show now. False if nothing was received yet.
-    bool Render(const Timing& timing, PlayerNetworkState& out)
+    // The state to show now (and its velocity). False if nothing was received.
+    bool Render(const Timing& timing, PlayerNetworkState& out, RemoteMotion* motion = nullptr)
     {
+        if (motion) *motion = RemoteMotion();
         if (m_buffer.Empty()) return false;
         if (!timing.clock || m_lastTime == 0)
         {
@@ -63,11 +72,20 @@ public:
             return true;
         }
         uint32_t renderTime = timing.clock() - timing.interpolationDelayMs;
-        const PlayerNetworkState* a = nullptr;
-        const PlayerNetworkState* b = nullptr;
+        typedef net::SnapshotBuffer<PlayerNetworkState>::Item Item;
+        const Item* a = nullptr;
+        const Item* b = nullptr;
         float t = 0.0f;
-        if (!m_buffer.Sample(renderTime, timing.maxExtrapolationMs, a, b, t)) return false;
-        out = Blend(*a, *b, t);
+        if (!m_buffer.SampleItems(renderTime, timing.maxExtrapolationMs, a, b, t)) return false;
+        out = Blend(a->value, b->value, t);
+        int32_t spanMs = net::TimeDiff(b->time, a->time);
+        if (motion && spanMs > 0)
+        {
+            float inv = 1000.0f / static_cast<float>(spanMs);
+            motion->vx = (b->value.x - a->value.x) * inv;
+            motion->vy = (b->value.y - a->value.y) * inv;
+            motion->vz = (b->value.z - a->value.z) * inv;
+        }
         m_buffer.DiscardBefore(renderTime);
         return true;
     }

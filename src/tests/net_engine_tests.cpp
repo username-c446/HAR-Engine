@@ -589,7 +589,7 @@ namespace NetworkTests
     {
         int g_pvSpawns = 0, g_pvDespawns = 0, g_pvRestyles = 0;
         void* PvSpawn(int id) { ++g_pvSpawns; return reinterpret_cast<void*>(static_cast<size_t>(0x3000 + id)); }
-        void PvMove(int, void*, const PlayerNetworkState&) {}
+        void PvMove(int, void*, const PlayerNetworkState&, const RemoteMotion&) {}
         void PvDespawn(int, void*) { ++g_pvDespawns; }
         void PvRestyle(int, void*) { ++g_pvRestyles; }
     }

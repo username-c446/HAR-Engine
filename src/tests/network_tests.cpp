@@ -822,6 +822,16 @@ namespace NetworkTests
             (void)handle;
             g_fakeWorld.lastMoves[playerId] = state;
         }
+        // On-foot view sink (also receives the pose's velocity).
+        RemoteMotion g_lastMotion;
+        int g_jumps = 0;
+        void FakeMove(int playerId, void* handle, const PlayerNetworkState& state, const RemoteMotion& motion)
+        {
+            (void)handle;
+            g_fakeWorld.lastMoves[playerId] = state;
+            g_lastMotion = motion;
+        }
+        void FakeJump(int, void*) { ++g_jumps; }
         void FakeAction(int playerId, void* handle, uint8_t actionEvent)
         {
             (void)playerId;
@@ -1082,6 +1092,47 @@ namespace NetworkTests
             view.Clear();
         }
 
+        TEST_METHOD(JumpStartsWhenTheShownPoseReachesItAndCarriesVelocity)
+        {
+            g_fakeWorld.lastMoves.clear();
+            g_jumps = 0;
+            RemotePlayerWorldView view;
+            RemotePlayerWorldView::Sink sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.spawn = &FakeSpawn;
+            sink.move = &FakeMove;
+            sink.jump = &FakeJump;
+            sink.despawn = &FakeDespawn;
+            view.SetSink(sink);
+            RemoteStateTrack::Timing timing;
+            timing.clock = []() -> uint32_t { return g_fakeClock; };
+            timing.interpolationDelayMs = 100;
+            view.SetTiming(timing);
+
+            RemotePlayerManager players;
+            PlayerNetworkState p;
+            memset(&p, 0, sizeof(p));
+            players.UpdatePlayer(3, p, 1000);
+            view.Sync(players);
+            p.x = 0.5f; // running 5 m/s
+            players.UpdatePlayer(3, p, 1100);
+            view.Sync(players);
+            p.x = 1.0f;
+            p.flags = PlayerNetworkState::FLAG_JUMPING; // takes off at 1200
+            players.UpdatePlayer(3, p, 1200);
+            view.Sync(players);
+
+            g_fakeClock = 1150; view.Update(0.016f); // shows 1050: priming frame
+            g_fakeClock = 1240; view.Update(0.016f); // shows 1140: still running
+            Assert::AreEqual(0, g_jumps, L"The newest sample jumps, the shown pose does not yet.");
+            Assert::AreEqual(5.0f, g_lastMotion.vx, 0.01f, L"The pose carries its real velocity.");
+            g_fakeClock = 1300; view.Update(0.016f); // shows 1200: takes off
+            Assert::AreEqual(1, g_jumps, L"The jump fires with the shown pose.");
+            view.Update(0.016f);
+            Assert::AreEqual(1, g_jumps, L"Once.");
+            view.Clear();
+        }
+
         TEST_METHOD(RemotePoseAppliesLocomotionDriver)
         {
             // A remote state reporting LOCO + a non-zero speed factor must reach
@@ -1162,35 +1213,35 @@ namespace NetworkTests
             p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
             p.actionEvent = PlayerNetworkState::ACTION_NONE;
             players.UpdatePlayer(6, p);
-            view.Sync(players); // spawn with none
+            view.Sync(players); view.Update(0.0f); // spawn with none
             Assert::AreEqual(0, g_fakeWorld.actionCount, L"Spawn with ACTION_NONE must not fire.");
 
             // First non-zero action -> fires once.
             p.actionEvent = PlayerNetworkState::ACTION_JUMP;
             players.UpdatePlayer(6, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(1, g_fakeWorld.actionCount, L"Action rising edge must fire once.");
             Assert::AreEqual(static_cast<int>(PlayerNetworkState::ACTION_JUMP),
                 static_cast<int>(g_fakeWorld.lastActions[0]));
 
             // Same action stays non-zero on the next packet -> must NOT re-fire.
-            view.Sync(players);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(1, g_fakeWorld.actionCount, L"Continuous non-zero action must not re-fire.");
 
             // A different action id is a new rising edge -> fires again.
             p.actionEvent = PlayerNetworkState::ACTION_DODGE; // reserved id passes through transport
             players.UpdatePlayer(6, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(2, g_fakeWorld.actionCount, L"A different action id is a new rising edge.");
 
             // Back to none, then the same jump again -> fires a fresh rising edge.
             p.actionEvent = PlayerNetworkState::ACTION_NONE;
             players.UpdatePlayer(6, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             p.actionEvent = PlayerNetworkState::ACTION_JUMP;
             players.UpdatePlayer(6, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(3, g_fakeWorld.actionCount, L"Returning to a cleared action re-arms the edge.");
 
             view.Clear();
@@ -1245,20 +1296,20 @@ namespace NetworkTests
             p.x = 0.0f; p.y = 0.0f; p.z = 0.0f;
             p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_CELEB_BIG, 5);
             players.UpdatePlayer(9, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(0, g_fakeWorld.actionCount, L"Spawning with a held action must not replay it.");
 
             p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_DODGE, 6);
             players.UpdatePlayer(9, p);
-            view.Sync(players);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(1, g_fakeWorld.actionCount, L"New action fires once even when held.");
             Assert::AreEqual((int)PlayerNetworkState::ACTION_DODGE, (int)g_fakeWorld.lastActions.back(),
                 L"Sink receives the bare id (sequence bits stripped).");
 
             p.actionEvent = PlayerNetworkState::MakeActionEvent(PlayerNetworkState::ACTION_DODGE, 7);
             players.UpdatePlayer(9, p);
-            view.Sync(players);
+            view.Sync(players); view.Update(0.0f);
             Assert::AreEqual(2, g_fakeWorld.actionCount, L"Same action with a new sequence fires again.");
 
             view.Clear();
