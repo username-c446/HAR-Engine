@@ -7,9 +7,11 @@
 //
 // Usage:
 //   har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...
-//              [--pvp] [--cheats] [--game-version <n>] [--seed <n>]
+//              [--no-pvp] [--cheats] [--game-version <n>] [--seed <n>]
 //              [--no-interest] [--stats <seconds>] [--log <file>] [--verbose]
 //
+// PvP (players knock each other down / ram each other) is on by default;
+// --no-pvp turns it off (--pvp is accepted and keeps it on).
 // --stats prints the traffic every N seconds: total and per packet id, and
 // what interest management kept off the wire. --no-interest sends every
 // stream sample to every player (for comparison).
@@ -35,7 +37,7 @@ namespace
     void Usage()
     {
         printf("usage: har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...\n"
-               "                  [--pvp] [--cheats] [--game-version <n>] [--seed <n>]\n"
+               "                  [--no-pvp] [--cheats] [--game-version <n>] [--seed <n>]\n"
                "                  [--no-interest] [--stats <seconds>] [--log <file>] [--verbose]\n"
                "  default port 3737; an empty password = open session\n");
     }
@@ -167,6 +169,7 @@ int main(int argc, char** argv)
         else if (strcmp(a, "--stats") == 0 && hasValue) statsSeconds = static_cast<unsigned>(atoi(argv[++i]));
         else if (strcmp(a, "--no-interest") == 0) options.interest.enabled = false;
         else if (strcmp(a, "--pvp") == 0) options.pvp = true;
+        else if (strcmp(a, "--no-pvp") == 0) options.pvp = false;
         else if (strcmp(a, "--cheats") == 0) options.allowEconomyCheats = true;
         else if (strcmp(a, "--verbose") == 0) verbose = true;
         else if (a[0] >= '0' && a[0] <= '9') port = static_cast<uint16_t>(atoi(a));

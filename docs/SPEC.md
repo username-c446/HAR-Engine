@@ -337,7 +337,7 @@ It is the same server a hosting game embeds.
 
 ```
 har_server [port] [--password <pw>] [--max <players>] [--mod <lua>]...
-           [--pvp] [--cheats] [--game-version <n>] [--seed <n>]
+           [--no-pvp] [--cheats] [--game-version <n>] [--seed <n>]
            [--no-interest] [--stats <seconds>] [--log <file>] [--verbose]
 ```
 - `--stats` / `--no-interest`: traffic report and interest management off (§18.11).
@@ -837,7 +837,8 @@ announcing a new entity). Traffic is announced with `WSF_RELEASE_ON_OWNER_LEAVE`
 
 ### 18.7 PvP as a session option
 `SO_PVP` in the session options (WELCOME / `PID_SESSION_INFO`, changeable live:
-`GameServer::SetPvp`, `NetworkMatchManager::SetHostPvp`, `har_server --pvp`). The
+`GameServer::SetPvp`, `NetworkMatchManager::SetHostPvp`; ON by default since
+§18.16, `har_server --no-pvp` turns it off). The
 server relays `PID_PLAYER_EVENT` to the victim only with PvP on. Kinds
 (`NetworkMatchManager::PlayerEventKind`, payload `NetEntityHit`):
 `PE_VEHICLE_HIT` (our car hit the victim's ghost machine → the victim's car gets
@@ -1035,6 +1036,23 @@ releasing side — ~1500 constructions in a few idle minutes.
   ghosts can never overflow it.
 Idle test (2 games + server, 5 min in the background): 25 / 24 vehicles built
 (the level's own), none afterwards, no asserts.
+
+### 18.16 Air moves of the puppet; PvP by default
+- A remote jump kick sank the puppet into the ground after landing: the clip was
+  overlaid on the puppet (`Puppet::PlayAnimation`) beside its jump action, kept
+  playing after the landing and moved the root. Air moves now go through the
+  puppet's own `JumpAction`, as for the local player (it owns the clip and stops
+  it on landing): `ACTION_JUMPKICK` / `ACTION_SLAM` → the `Attack` intention
+  (`NetworkPuppetController::RequestAirAttack`), the jump action plays the jump
+  kick or, after a double jump, the stomp; a double jump is now reported
+  (`ACTION_JUMP` from `JumpAction::TestForJumpAgain`) and replayed as the `Jump`
+  intention while in the air.
+- `Character::Kick` does nothing on a network puppet (its kick is the owner's:
+  what it hits reaches us as world / entity / player events), and a vehicle hit
+  never drops a puppet into simulation.
+- PvP is on by default (`GameServer::Options::pvp = true`, the hosting game
+  included): a kick knocks another player down (`PE_KNOCKDOWN`), a car hits its
+  car (`PE_VEHICLE_HIT`); `har_server --no-pvp` turns it off.
 
 ### 18.10 Still open
 - Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).

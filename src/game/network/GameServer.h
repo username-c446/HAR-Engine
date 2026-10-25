@@ -29,7 +29,7 @@ public:
     struct Options
     {
         bool allowEconomyCheats = false;
-        bool pvp = false;
+        bool pvp = true;  // players can knock each other down / ram each other
         std::vector<std::string> modScripts;          // server Lua mods to load
         PlayerMovementValidator::Limits movement;
         PlayerInterestPolicy::Config interest;

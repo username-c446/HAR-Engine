@@ -549,18 +549,21 @@ namespace
         Character* c = static_cast<Character*>( handle );
         if ( c == NULL || c->GetActionController() == NULL ) return;
 
+        NetworkPuppetController* ctrl = PuppetControllerOf( c );
+        JumpAction* jump = c->GetJumpLocomotionAction();
+        const bool inJump = jump != NULL && jump->IsInJump();
         switch ( actionId )
         {
-        case PlayerNetworkState::ACTION_JUMP:
-            RemotePlayerJump( playerId, handle );
+        // Airborne moves go through the puppet's own jump action, as for the
+        // local player: it owns the clip and stops it on landing (an overlaid
+        // clip kept playing after the landing and sank the puppet into the
+        // ground until it ended).
+        case PlayerNetworkState::ACTION_JUMP: // double jump
+            if ( ctrl != NULL && inJump ) ctrl->RequestJump();
             break;
-        // Airborne moves: the remote is mid-JumpAction, whose sequence would hold
-        // a queued clip until landing, so overlay the clip on the puppet directly.
         case PlayerNetworkState::ACTION_JUMPKICK:
-            if ( c->GetPuppet() != NULL ) c->GetPuppet()->PlayAnimation( "jump_kick" );
-            break;
         case PlayerNetworkState::ACTION_SLAM:
-            if ( c->GetPuppet() != NULL ) c->GetPuppet()->PlayAnimation( "stomp_in_air" );
+            if ( ctrl != NULL && inJump ) ctrl->RequestAirAttack();
             break;
         case PlayerNetworkState::ACTION_DODGE:       RemotePlayClip( c, "dodge", false ); break;
         case PlayerNetworkState::ACTION_CRINGE:      RemotePlayClip( c, "cringe", false ); break;

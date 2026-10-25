@@ -707,6 +707,12 @@ void Character::Kick()
     {
         return;
     }
+    // A network puppet only shows its owner's kick: what the kick hits is
+    // decided by the owner's game (and reaches us as world / entity events).
+    if( mNetworkPuppet )
+    {
+        return;
+    }
 
     // Fetch the current character position
     rmt::Vector position;
@@ -2742,7 +2748,9 @@ sim::Solving_Answer Character::PreReactToCollision( sim::SimState* pCollidedObj,
         float vSpeedMps = v->mSpeed;
 
         float speedThreshold = 1.0f;
-        if( vSpeedMps > speedThreshold )
+        // A network puppet is never knocked into simulation here: the hit goes
+        // to its owner (PvP) and the owner's stream shows the result.
+        if( vSpeedMps > speedThreshold && !mNetworkPuppet )
         {
             if( mpSimStateObj->mAIRefIndex == PhysicsAIRef::NPCharacter )
             {

@@ -2114,6 +2114,7 @@ void JumpAction::TestForJumpAgain( const rmt::Vector& currentPos, float fUpVeloc
             Reset(CharacterTune::sfDoubleJumpHeight);
             mbJumpAgain = true;
             mJumpState = PreJump;
+            ReportLocalNetAction( mpCharacter, PlayerNetworkState::ACTION_JUMP ); // double jump
             GetEventManager()->TriggerEvent( EVENT_DOUBLEJUMP, mpCharacter );
         }
         else

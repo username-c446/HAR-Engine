@@ -25,8 +25,12 @@ public:
     void SetMotion( float vx, float vz, float maxSpeed, bool turbo, bool jumping, bool airborne );
     bool IsJumping( void ) const { return mJumping; }
     bool IsAirborne( void ) const { return mAirborne; }
-    // The sender took off: Loco starts the jump action on the next sequence.
+    // The sender took off: Loco starts the jump action on the next sequence
+    // (in the air, the jump action reads it as a double jump).
     void RequestJump( void );
+    // An attack in the air: the jump action plays the jump kick (or, after a
+    // double jump, the stomp) itself, so the clip ends when it lands.
+    void RequestAirAttack( void );
 
     virtual void  Update( float seconds );
     virtual void  GetDirection( rmt::Vector& outDirection );

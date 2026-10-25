@@ -38,6 +38,11 @@ void NetworkPuppetController::RequestJump( void )
     SetIntention( CharacterController::Jump );
 }
 
+void NetworkPuppetController::RequestAirAttack( void )
+{
+    SetIntention( CharacterController::Attack );
+}
+
 void NetworkPuppetController::Update( float seconds )
 {
     (void)seconds; // no paths, panic or dodging: the network decides

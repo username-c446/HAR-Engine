@@ -437,6 +437,7 @@ namespace NetworkTests
             net::Session host;
             GameServer rules;
             GameServer::Options opt;
+            Assert::IsTrue(opt.pvp, L"PvP is on unless the server turns it off.");
             opt.pvp = false;
             rules.Attach(host.GetServerCore(), opt);
             Assert::IsTrue(host.StartHost(port, 1));
