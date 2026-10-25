@@ -165,7 +165,7 @@ void NetEntityManager::RemoveLocal(void* handle)
     {
         // Hand over instead of deleting when another player can see it.
         net::NetEntityMotion m;
-        bool sampled = m_sample && m_sample(handle, m);
+        bool sampled = m_sample && m_sample(handle, l.spawn.kind, m);
         if (sampled && net::IsMigratableKind(l.spawn.kind) && m_remoteNear
             && m_remoteNear(m.x, m.z, m_handoverRadius))
         {
@@ -218,7 +218,7 @@ void NetEntityManager::OnEntityEvent(net::PeerId from, uint64_t entity, uint8_t 
     for (auto& kv : m_localByHandle)
         if (kv.second.id == entity)
         {
-            m_sink.hit(kv.first, hit);
+            m_sink.hit(kv.first, kv.second.spawn.kind, hit);
             return;
         }
 }
@@ -447,7 +447,7 @@ void NetEntityManager::StreamOwned()
     {
         if (kv.second.id == 0) continue;
         net::NetEntityMotion m;
-        if (!m_sample(kv.first, m)) continue;
+        if (!m_sample(kv.first, kv.second.spawn.kind, m)) continue;
         net::EntityStateRecord rec;
         m.Encode(rec, kv.second.id);
         out.push_back(rec);

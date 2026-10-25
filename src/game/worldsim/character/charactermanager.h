@@ -49,6 +49,8 @@ public:
     // Create a new character and add it to the manager
     //
     Character* AddCharacter( CharacterType, const char* characterName, const char* modelName, const char* choreoPuppet, const char* location = NULL);
+    // Character slots an NPC can still take (AddCharacter asserts when none).
+    int NumFreeNPCSlots() const;
     Character* AddCharacterDeferedLoad( CharacterType, const char* characterName, const char* modelName, const char* choreoPuppet, const char* location = NULL);
 
     // preload data for a character

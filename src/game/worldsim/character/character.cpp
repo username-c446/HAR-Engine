@@ -781,6 +781,18 @@ void Character::Kick()
                 {
                     break;
                 }
+                // Another player's pedestrian (a ghost): its owner simulates it,
+                // so the kick goes there and the owner's stream shows the result.
+                if( networld::IsRemoteEntity( static_cast< Character* >( (NPCharacter*)objectHit ) ) )
+                {
+                    net::NetEntityHit hit;
+                    hit.ix = kickdir.x * CharacterTune::sfKickingForce;
+                    hit.iy = kickdir.y * CharacterTune::sfKickingForce;
+                    hit.iz = kickdir.z * CharacterTune::sfKickingForce;
+                    networld::ReportEntityHit( static_cast< Character* >( (NPCharacter*)objectHit ), hit );
+                    GetEventManager()->TriggerEvent( EVENT_KICK_NPC_SOUND, (NPCharacter*)objectHit );
+                    break;
+                }
                 // We kicked an NPC. Send some events
                 NPCharacter* ch = (NPCharacter*)objectHit;
                 GetEventManager()->TriggerEvent( EVENT_KICK_NPC, ch );

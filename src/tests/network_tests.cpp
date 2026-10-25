@@ -2936,7 +2936,7 @@ namespace NetworkTests
         ++g_ghostDespawns;
         for (size_t i = 0; i < g_ghosts.size(); ++i) if (g_ghosts[i] == h) { delete g_ghosts[i]; g_ghosts.erase(g_ghosts.begin() + i); break; }
     }
-    static bool SampleCar(void* h, net::NetEntityMotion& m) { (void)h; m.x = 1.0f; m.z = 2.0f; m.speedKmh = 30; return true; }
+    static bool SampleCar(void* h, uint8_t, net::NetEntityMotion& m) { (void)h; m.x = 1.0f; m.z = 2.0f; m.speedKmh = 30; return true; }
 
     TEST_CLASS(NetEntityManagerTests)
     {

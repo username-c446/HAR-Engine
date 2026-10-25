@@ -1054,6 +1054,35 @@ Idle test (2 games + server, 5 min in the background): 25 / 24 vehicles built
   included): a kick knocks another player down (`PE_KNOCKDOWN`), a car hits its
   car (`PE_VEHICLE_HIT`); `har_server --no-pvp` turns it off.
 
+### 18.17 Pedestrians as entities
+Each game's pedestrians (`PedestrianManager`, a pool of 7) are owner-simulated
+entities `NEK_PEDESTRIAN`, so every player sees the same crowd and a kick on
+someone else's pedestrian reaches it.
+- Owner: `ActivatePed` announces the pedestrian (`networld::AddLocalEntity`, model
+  and pose), `DeactivatePed` removes it. The sampler (`NetEntitySample`, now told
+  the entity's kind; `SampleFn(handle, kind, out)`) sends pose, facing and speed,
+  and `MF_KNOCKED` while the pedestrian is in simulation or out of locomotion.
+- `AddPeds` counts other players' pedestrians near the add centre against the
+  same budget (`MAX_PEDESTRIANS`), so two players in one street do not double the
+  crowd.
+- A pedestrian is not handed over (`IsMigratableKind` = traffic only): it goes
+  with its owner, like a pedestrian leaving the player's range.
+- Others: a puppet character (`MakeNetworkPuppet`, shared with remote players:
+  `NetworkPuppetController` + network grounding) of the pedestrian's model if it
+  is in our ped groups (`PedestrianManager::IsModelRegistered`), else `npd`; it
+  is placed at the interpolated pose every frame and its walk cycle follows the
+  shown pose's measured speed; `MF_KNOCKED` rising plays `flail`. It is only
+  created while more than 12 NPC character slots are free
+  (`CharacterManager::NumFreeNPCSlots`; `AddCharacter` asserts when none are),
+  otherwise retried.
+- Hits: `Character::Kick` on another player's pedestrian sends the kick
+  (`networld::ReportEntityHit`, the impulse) to its owner instead of knocking the
+  copy; the owner applies it as the game's own kick (`ApplyKickForce` in
+  locomotion, else `ApplyForce`) and its stream shows the result. The hit sink is
+  told the kind (`hit(handle, kind, hit)`). A car hitting a pedestrian needs no
+  message: the owner's game has the hitting car as a ghost and its own
+  collision does it.
+
 ### 18.10 Still open
-- Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
+- Actors (mission NPCs) as entities (`NEK_ACTOR` reserved).
 - No player identity across reconnects (T7).

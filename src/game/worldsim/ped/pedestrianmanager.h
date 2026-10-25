@@ -144,6 +144,8 @@ public:
     void SetModelGroup( int groupID, const ModelGroup& group );
 
     bool IsPed( Character* character );
+    // A model of the current ped model groups (loaded, usable by a ghost).
+    bool IsModelRegistered( const char* name ) { return name != NULL && GetModelIDByName( name ) != -1; }
 
     void SwitchModelGroup( int toGroupID );
 

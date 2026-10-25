@@ -15,6 +15,7 @@
 // Foundation Tech
 #include <raddebug.hpp>
 #include <radtime.hpp>
+#include <map>
 #include <raddebugwatch.hpp>
 
 //========================================
@@ -378,6 +379,28 @@ namespace
         }
     }
 
+    // A character that shows something another player's game simulates (its
+    // player, its pedestrians): in the world scene, driven by the owner's
+    // replicated motion through NetworkPuppetController and animated by the
+    // game's own locomotion (walk / run / jump exactly like the local player).
+    void MakeNetworkPuppet( Character* c )
+    {
+        // AddCharacter does NOT put NPCs into the world scene (only PCs get
+        // AddToWorldScene there), so an NPC would exist but never render; in
+        // its default state an NPC is static (the bind / "T" pose): LOCO runs
+        // its locomotion drivers.
+        c->AddToWorldScene();
+        NetworkPuppetController* ctrl = new( GMA_LEVEL_OTHER ) NetworkPuppetController;
+        c->SetController( ctrl );
+        ctrl->SetCharacter( c );
+        c->SetNetworkPuppet( true );
+        CharacterAi::StateManager* sm = c->GetStateManager();
+        if ( sm != NULL && sm->GetState() != CharacterAi::LOCO )
+        {
+            sm->SetState<CharacterAi::Loco>();
+        }
+    }
+
     // World sink for remote players: spawn/move/despawn lightweight NPCs that
     // mirror what other network players report through their PlayerNetworkState.
     void* RemotePlayerSpawn( int playerId )
@@ -394,23 +417,7 @@ namespace
             rReleasePrintf( "net: could not spawn remote player %d\n", playerId );
             return NULL;
         }
-        // AddCharacter does NOT put NPCs into the world scene (only PCs get
-        // AddToWorldScene there), so an NPC would exist but never render.
-        // Also, an NPC in its default state is static: locomotion is not driven
-        // so the skeleton stays in the bind pose (the "T pose"). Put it into the
-        // LOCO state so its walk/jump locomotion drivers run and animate it.
-        c->AddToWorldScene();
-        // Driven by the owner's replicated input, animated by the game's own
-        // locomotion (walk / run / jump exactly like the local player).
-        NetworkPuppetController* ctrl = new( GMA_LEVEL_OTHER ) NetworkPuppetController;
-        c->SetController( ctrl );
-        ctrl->SetCharacter( c );
-        c->SetNetworkPuppet( true );
-        CharacterAi::StateManager* sm = c->GetStateManager();
-        if ( sm != NULL && sm->GetState() != CharacterAi::LOCO )
-        {
-            sm->SetState<CharacterAi::Loco>();
-        }
+        MakeNetworkPuppet( c );
         return c;
     }
 
@@ -681,8 +688,103 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
 
     // ---- remote-owned dynamic entities (NetEntityManager sink) -------------
 
+    // Another player's pedestrian: a puppet character of its model (or the
+    // stand-in "npd" if that model is not in our ped groups), moved by the
+    // owner's stream; its walk cycle follows the measured speed of the shown
+    // pose. Kept apart from the ped manager's own pool.
+    struct PedGhost
+    {
+        rmt::Vector  last;
+        unsigned int lastMs;
+        bool         primed;
+        bool         knocked;
+    };
+    std::map<Character*, PedGhost> s_pedGhosts;
+
+    void* NetEntitySpawnPedestrian( uint64_t id, const net::NetEntitySpawn& spawn )
+    {
+        // Leave room for the characters missions and the ped manager add.
+        const int kReservedSlots = 12;
+        if ( GetCharacterManager()->NumFreeNPCSlots() <= kReservedSlots ) return NULL; // retried later
+        const char* model = PedestrianManager::GetInstance()->IsModelRegistered( spawn.model ) ? spawn.model : "npd";
+        char name[32];
+        sprintf( name, "mp_ped_%08x", static_cast<unsigned int>( id ^ ( id >> 32 ) ) );
+        Character* c = GetCharacterManager()->AddCharacter( CharacterManager::NPC, name, model, "npd", NULL );
+        if ( c == NULL ) return NULL;
+        MakeNetworkPuppet( c );
+        c->SetPosition( rmt::Vector( spawn.x, spawn.y, spawn.z ) );
+        c->SetFacingDir( spawn.yaw );
+        PedGhost g;
+        g.last.Set( spawn.x, spawn.y, spawn.z );
+        g.lastMs = radTimeGetMilliseconds();
+        g.primed = false;
+        g.knocked = false;
+        s_pedGhosts[ c ] = g;
+        return c;
+    }
+
+    void NetEntityMovePedestrian( Character* c, PedGhost& g, const net::NetEntityMotion& m )
+    {
+        rmt::Vector pos( m.x, m.y, m.z );
+        c->SetPosition( pos );
+        const bool knocked = ( m.flags & net::NetEntityMotion::MF_KNOCKED ) != 0;
+        if ( knocked && !g.knocked )
+        {
+            RemotePlayClip( c, "flail", true ); // the owner's ped was sent flying
+        }
+        g.knocked = knocked;
+
+        // Velocity of the shown (interpolated) pose between two frames.
+        unsigned int now = radTimeGetMilliseconds();
+        float dt = static_cast<float>( now - g.lastMs ) / 1000.0f;
+        float vx = 0.0f, vz = 0.0f;
+        if ( g.primed && dt > 0.0001f && dt < 0.5f )
+        {
+            vx = ( pos.x - g.last.x ) / dt;
+            vz = ( pos.z - g.last.z ) / dt;
+        }
+        g.last = pos;
+        g.lastMs = now;
+        g.primed = true;
+
+        c->SetNetworkAirborne( knocked );
+        NetworkPuppetController* ctrl = PuppetControllerOf( c );
+        if ( ctrl == NULL ) return;
+        if ( knocked ) { vx = 0.0f; vz = 0.0f; }
+        ctrl->SetMotion( vx, vz, c->GetMaxSpeed(), false, false, knocked );
+        if ( vx * vx + vz * vz < 0.15f * 0.15f )
+        {
+            c->SetFacingDir( m.yaw ); // standing: the owner's facing
+        }
+    }
+
+    // Samples one of OUR pedestrians: pose, facing / motion direction, speed,
+    // and whether it was knocked down (in simulation or out of locomotion).
+    bool NetEntitySamplePedestrian( Character* c, net::NetEntityMotion& out )
+    {
+        if ( c == NULL ) return false;
+        rmt::Vector p, v;
+        c->GetPosition( p );
+        c->GetVelocity( v );
+        out.x = p.x; out.y = p.y; out.z = p.z;
+        float speed = rmt::Sqrt( v.x * v.x + v.z * v.z );
+        out.yaw = c->GetFacingDir();
+        float kmh = speed * 3.6f;
+        out.speedKmh = static_cast<uint16_t>( kmh > 65535.0f ? 65535.0f : kmh );
+        out.steer = 0;
+        out.flags = 0;
+        bool inSim = c->GetSimState() != NULL && c->GetSimState()->GetControl() == sim::simSimulationCtrl;
+        CharacterAi::StateManager* sm = c->GetStateManager();
+        bool inLoco = sm != NULL && sm->GetState() == CharacterAi::LOCO;
+        if ( inSim || !inLoco ) out.flags |= net::NetEntityMotion::MF_KNOCKED;
+        out.damage = 0;
+        out.state = sm != NULL ? static_cast<uint8_t>( sm->GetState() ) : 0;
+        return true;
+    }
+
     void* NetEntitySpawnGhost( uint64_t id, const net::NetEntitySpawn& spawn )
     {
+        if ( spawn.kind == net::NEK_PEDESTRIAN ) return NetEntitySpawnPedestrian( id, spawn );
         // A parked car another player pushes: our own copy follows their stream.
         if ( spawn.kind == net::NEK_PARKED_CAR ) return ParkedCarManager::NetDriveBound( id );
         if ( spawn.kind != net::NEK_TRAFFIC_CAR ) return NULL;
@@ -696,6 +798,12 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
 
     void NetEntityMoveGhost( void* handle, const net::NetEntityMotion& m )
     {
+        std::map<Character*, PedGhost>::iterator ped = s_pedGhosts.find( static_cast<Character*>( handle ) );
+        if ( ped != s_pedGhosts.end() )
+        {
+            NetEntityMovePedestrian( ped->first, ped->second, m );
+            return;
+        }
         Vehicle* v = static_cast<Vehicle*>( handle );
         if ( v == NULL ) return;
         float steerRad = ( m.steer / 127.0f ) * 45.0f * ( rmt::PI / 180.0f );
@@ -708,8 +816,15 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
 
     void NetEntityDespawnGhost( void* handle, uint8_t kind )
     {
+        if ( handle == NULL ) return;
+        if ( kind == net::NEK_PEDESTRIAN )
+        {
+            Character* c = static_cast<Character*>( handle );
+            s_pedGhosts.erase( c );
+            GetCharacterManager()->RemoveCharacter( c );
+            return;
+        }
         Vehicle* v = static_cast<Vehicle*>( handle );
-        if ( v == NULL ) return;
         if ( kind == net::NEK_PARKED_CAR )
         {
             ParkedCarManager::NetReleaseBound( v ); // our car, back to our physics
@@ -734,15 +849,43 @@ void* RemoteVehicleSpawn( int playerId, const char* model, int netVehicleId )
         return adopted;
     }
 
-    // Another player's physics hit one of OUR traffic cars.
-    void NetEntityHitLocal( void* localHandle, const net::NetEntityHit& hit )
+    // Another player's game hit one of OUR entities: their car one of our
+    // cars, their kick one of our pedestrians (applied as the game's own kick).
+    void NetEntityHitLocal( void* localHandle, uint8_t kind, const net::NetEntityHit& hit )
     {
+        if ( localHandle == NULL ) return;
+        if ( kind == net::NEK_PEDESTRIAN )
+        {
+            NPCharacter* ped = static_cast<NPCharacter*>( static_cast<Character*>( localHandle ) );
+            rmt::Vector dir( hit.ix, hit.iy, hit.iz );
+            float force = dir.Magnitude();
+            if ( force <= 0.0f ) return;
+            dir.Scale( 1.0f / force );
+            ped->SetHasBeenHit( true );
+            if ( ped->GetStateManager()->GetState() == CharacterAi::LOCO )
+            {
+                ped->ApplyKickForce( dir, force );
+            }
+            else
+            {
+                ped->ApplyForce( dir, force );
+            }
+            return;
+        }
         Vehicle* v = static_cast<Vehicle*>( localHandle );
-        if ( v == NULL ) return;
         v->ApplyNetworkHit( rmt::Vector( hit.ix, hit.iy, hit.iz ), hit.damage / 255.0f );
     }
 
-    // Samples one of OUR traffic cars for the entity stream.
+    bool NetEntitySampleTraffic( void* handle, net::NetEntityMotion& out );
+
+    // Samples one of OUR entities for the stream.
+    bool NetEntitySample( void* handle, uint8_t kind, net::NetEntityMotion& out )
+    {
+        if ( kind == net::NEK_PEDESTRIAN ) return NetEntitySamplePedestrian( static_cast<Character*>( handle ), out );
+        return NetEntitySampleTraffic( handle, out ); // traffic, pushed parked cars
+    }
+
+    // Samples one of OUR cars for the entity stream.
     bool NetEntitySampleTraffic( void* handle, net::NetEntityMotion& out )
     {
         Vehicle* v = static_cast<Vehicle*>( handle );
@@ -977,7 +1120,7 @@ void GameplayContext::OnStart( ContextEnum previousContext )
         entitySink.adopt = &NetEntityAdoptGhost;
         entitySink.hit = &NetEntityHitLocal;
         NetworkMatchManager::Entities().SetSink( entitySink );
-        NetworkMatchManager::Entities().SetSampler( &NetEntitySampleTraffic );
+        NetworkMatchManager::Entities().SetSampler( &NetEntitySample );
         // Only entities around us need a ghost (collision areas are scarce).
         NetworkMatchManager::Entities().SetRelevanceRadius( 200.0f );
         // Migration: a released car is taken over by a player near it, within

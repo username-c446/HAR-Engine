@@ -45,7 +45,10 @@ namespace net
         NEK_ACTOR       = 4, // dynamic id (wasps, collectible actors, ...)
     };
 
-    inline bool IsMigratableKind(uint8_t kind) { return kind == NEK_TRAFFIC_CAR || kind == NEK_PEDESTRIAN; }
+    // Kinds another player takes over when the owner leaves them (traffic keeps
+    // driving). A pedestrian is not handed over: it goes with its owner, like
+    // the original game's pedestrians that leave the player's range.
+    inline bool IsMigratableKind(uint8_t kind) { return kind == NEK_TRAFFIC_CAR; }
 
     // Existence record value: u8 kind | char model[16] | f32 x,y,z,yaw  (33 bytes)
     struct NetEntitySpawn
@@ -117,13 +120,14 @@ public:
         // `motion`. Returns its handle (the ghost is consumed) or null to refuse.
         void* (*adopt)(uint64_t id, void* ghostHandle, const net::NetEntitySpawn& spawn,
                        const net::NetEntityMotion& motion);
-        // Someone hit our entity.
-        void  (*hit)(void* localHandle, const net::NetEntityHit& hit);
+        // Someone hit our entity of `kind`.
+        void  (*hit)(void* localHandle, uint8_t kind, const net::NetEntityHit& hit);
     };
     typedef std::function<bool(const net::WorldStateOp&)> SendOpFn;
     typedef std::function<bool(const std::vector<net::EntityStateRecord>&)> SendStatesFn;
     typedef std::function<bool(uint64_t entity, uint8_t kind, const uint8_t* data, uint16_t size)> SendEventFn;
-    typedef bool (*SampleFn)(void* handle, net::NetEntityMotion& out);
+    // Samples one of our entities of `kind` for the stream.
+    typedef bool (*SampleFn)(void* handle, uint8_t kind, net::NetEntityMotion& out);
     // Server clock (ms). Without one ghosts show the newest sample directly.
     typedef std::function<uint32_t()> ClockFn;
     // Presence for migration: our player's position / whether another player is near.

@@ -50,6 +50,7 @@
 #include <mission/gameplaymanager.h>
 
 #include <worldsim/vehiclecentral.h>
+#include <network/NetWorldHooks.h>
 
 // in meters, how much to translate spawn & remove radii forward 
 // in the direction of the camera lookat
@@ -550,6 +551,9 @@ void PedestrianManager::DeactivatePed( PedestrianStruct* pedStr )
     rAssert( pedStr != NULL );
     rAssert( pedStr->ped != NULL );
 
+    // No longer ours to show: the server erases it for everyone.
+    networld::RemoveLocalEntity( pedStr->ped->GetCharacter() );
+
     rAssert( 1 <= mNumActiveModels && mNumActiveModels <= PedestrianManager::MAX_MODELS_IN_USE );
 
     //rDebugPrintf( "*** Removing %s\n", pedStr->modelName );
@@ -868,6 +872,20 @@ bool PedestrianManager::ActivatePed( PathSegment* segment, rmt::Vector spawnPos 
 
     // set the ped's parameters
     pedStr->ped->Activate( path, segment, spawnPos, pedStr->modelName );
+
+    // Networked match: our pedestrian, shown to the other players (we stream
+    // its motion; a kick on their copy comes back to us).
+    {
+        Character* character = pedStr->ped->GetCharacter();
+        net::NetEntitySpawn spawn;
+        spawn.kind = net::NEK_PEDESTRIAN;
+        strncpy( spawn.model, pedStr->modelName, sizeof( spawn.model ) - 1 );
+        rmt::Vector p;
+        character->GetPosition( p );
+        spawn.x = p.x; spawn.y = p.y; spawn.z = p.z;
+        spawn.yaw = character->GetFacingDir();
+        networld::AddLocalEntity( character, spawn );
+    }
 
     // manage the ped manager's active/free list
     res = mFreePeds.Remove( pedStr->listIndex );
@@ -1328,6 +1346,14 @@ void PedestrianManager::AddPeds( rmt::Vector center, float addRadius )
 
     // if no more free pedestrians...
     if( mFreePeds.GetNumElems() <= 0 )
+    {
+        return;
+    }
+
+    // Other players' pedestrians around us count against the same crowd
+    // budget, so two players in one street do not double it.
+    if( mActivePeds.GetNumElems() +
+        networld::CountRemoteEntitiesNear( center.x, center.z, addRadius, net::NEK_PEDESTRIAN ) >= MAX_PEDESTRIANS )
     {
         return;
     }

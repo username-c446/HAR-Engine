@@ -1477,6 +1477,19 @@ Return:         bool
 
 =============================================================================
 */
+int CharacterManager::NumFreeNPCSlots() const
+{
+    int n = 0;
+    for ( int i = MAX_PLAYERS; i < MAX_CHARACTERS; i++ )
+    {
+        if ( mpCharacter[ i ] == 0 )
+        {
+            ++n;
+        }
+    }
+    return n;
+}
+
 int CharacterManager::AddCharacter( Character* pCharacter, CharacterType type )
 {
 	int i = 0;

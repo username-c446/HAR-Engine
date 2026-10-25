@@ -485,8 +485,10 @@ namespace NetworkTests
             ++g_adopted;
             return &g_adoptedCar;
         }
-        void MigHit(void*, const net::NetEntityHit& h) { if (h.damage == 99) ++g_hits; }
-        bool MigSample(void*, net::NetEntityMotion& m) { m.x = 50.0f; m.z = 0.0f; return true; }
+        uint8_t g_hitKind = 0;
+        void MigHit(void*, uint8_t kind, const net::NetEntityHit& h) { if (h.damage == 99) ++g_hits; g_hitKind = kind; }
+        uint8_t g_sampledKind = 0;
+        bool MigSample(void*, uint8_t kind, net::NetEntityMotion& m) { g_sampledKind = kind; m.x = 50.0f; m.z = 0.0f; return true; }
     }
 
     TEST_CLASS(EntityMigrationTests)
@@ -548,6 +550,7 @@ namespace NetworkTests
             uint16_t n = hit.Encode(buf, sizeof(buf));
             taker.OnEntityEvent(1, id, net::NEE_HIT, buf, n);
             Assert::AreEqual(1, g_hits);
+            Assert::AreEqual((int)net::NEK_TRAFFIC_CAR, (int)g_hitKind, L"The hit sink is told the entity's kind.");
         }
 
         TEST_METHOD(ClaimOnlyWhatWeWouldKeep)
@@ -583,6 +586,30 @@ namespace NetworkTests
             Assert::AreEqual((size_t)1, ops.size());
             Assert::AreEqual((int)net::WSO_CLAIM, (int)ops[0].kind);
             taker.OnMatchEnd();
+        }
+
+        TEST_METHOD(PedestrianGoesWithItsOwner)
+        {
+            // A pedestrian is not handed over: removing it erases it even with
+            // another player next to it; its samples carry its kind.
+            NetEntityManager owner;
+            std::vector<net::WorldStateOp> ops;
+            std::vector<net::EntityStateRecord> streamed;
+            owner.SetSenders([&](const net::WorldStateOp& op) { ops.push_back(op); return true; },
+                             [&](const std::vector<net::EntityStateRecord>& r) { streamed = r; return true; });
+            owner.SetSampler(&MigSample);
+            owner.SetPresence(NetEntityManager::LocalPlayerFn(),
+                              [](float, float, float) { return true; }, NetEntityManager::CanAdoptFn());
+            owner.OnWelcomed(1);
+            int ped = 0;
+            net::NetEntitySpawn sp; sp.kind = net::NEK_PEDESTRIAN; strcpy(sp.model, "boy1");
+            owner.AddLocal(&ped, sp);
+            Assert::AreEqual((int)net::WSF_ERASE_ON_OWNER_LEAVE, (int)ops[0].flags, L"Gone with its owner.");
+            owner.Update(1.0f);
+            Assert::AreEqual((size_t)1, streamed.size());
+            Assert::AreEqual((int)net::NEK_PEDESTRIAN, (int)g_sampledKind);
+            owner.RemoveLocal(&ped);
+            Assert::AreEqual((int)net::WSO_ERASE, (int)ops.back().kind, L"Erased, not released.");
         }
 
         TEST_METHOD(NobodyNearMeansErase)
