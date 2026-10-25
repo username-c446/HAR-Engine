@@ -130,7 +130,10 @@ public:
     typedef std::function<bool(float& x, float& z)> LocalPlayerFn;
     typedef std::function<bool(float x, float z, float radius)> RemotePlayerNearFn;
     // Whether we may take over one more entity of this kind (local budget).
-    typedef std::function<bool(uint8_t kind)> CanAdoptFn;
+    // Whether our game would keep simulating an entity of `kind` at (x,y,z)
+    // if we took it over (budget, and the same rules that would remove it
+    // again — otherwise two players hand it back and forth).
+    typedef std::function<bool(uint8_t kind, float x, float y, float z)> CanAdoptFn;
 
     void SetSink(const Sink& s) { m_sink = s; }
     void SetSenders(SendOpFn op, SendStatesFn states, SendEventFn events = SendEventFn())

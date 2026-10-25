@@ -1013,6 +1013,29 @@ with two changes, because an NPC is animated and grounded by its own AI:
   jump action runs. The position is still the interpolated network pose every
   frame; standing still takes the owner's facing.
 
+### 18.15 Traffic handover without ping-pong; ghost pool
+Two idle players next to each other crashed a client after a few minutes
+(`vehiclecentral.cpp:910`, the vehicle construction ring overflowed): SHAR
+removes traffic that has been out of view for 5 s or is outside the remove radius
+around a point ahead of the camera, so with the cameras facing different ways a
+car was released by A, claimed by B, removed by B's rules, released, claimed by
+A... and every turn built a ghost machine (vehicle + `.con` script) on the
+releasing side — ~1500 constructions in a few idle minutes.
+- `NetEntityManager::CanAdoptFn(kind, x, y, z)`: a released entity is claimed
+  only if our game would keep it there. Traffic answers with
+  `TrafficManager::WouldKeepNetworkTraffic(pos)` — the same rules that remove
+  traffic: budget, inside 0.9 × `REMOVE_RADIUS` of the traffic centre, and in the
+  player's view frustum.
+- `VehicleCentral` keeps up to `NETWORK_GHOST_POOL` (16) removed ghosts per model
+  (out of the scene and collision, ownership ref kept) and reuses one
+  (`Reset`, re-registered) instead of building a vehicle; a destroyed one is not
+  pooled; the pool is flushed on `Unload`.
+- `AddNetworkGhostVehicle` refuses (the network layer retries) while the
+  construction ring has fewer than 8 free slots (`NumUnderConstruction`), so
+  ghosts can never overflow it.
+Idle test (2 games + server, 5 min in the background): 25 / 24 vehicles built
+(the level's own), none afterwards, no asserts.
+
 ### 18.10 Still open
 - Pedestrians / actors as entities (`NEK_PEDESTRIAN`/`NEK_ACTOR` reserved).
 - No player identity across reconnects (T7).

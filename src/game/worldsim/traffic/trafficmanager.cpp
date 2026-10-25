@@ -1660,6 +1660,34 @@ void TrafficManager::RemoveTrafficVehicle( TrafficVehicle* tv )
     }
 }
 
+bool TrafficManager::WouldKeepNetworkTraffic( const rmt::Vector& pos )
+{
+    if( mNumTraffic >= GetMaxTraffic() )
+    {
+        return false;
+    }
+    Avatar* avatar = GetAvatarManager()->GetAvatarForPlayer( 0 );
+    SuperCam* cam = GetSuperCamManager()->GetSCC( 0 )->GetActiveSuperCam();
+    if( avatar == NULL || cam == NULL )
+    {
+        return false;
+    }
+    rmt::Vector pPos, camTarget;
+    avatar->GetPosition( pPos );
+    cam->GetHeadingNormalized( &camTarget );
+    rmt::Vector center = pPos + camTarget * TrafficManager::CENTER_OFFSET;
+    rmt::Vector d;
+    d.Sub( pos, center );
+    // A margin inside the remove radius, so a car at its edge is not taken
+    // only to be removed on the next sweep.
+    const float keepRadius = TrafficManager::REMOVE_RADIUS * 0.9f;
+    if( d.MagnitudeSqr() > keepRadius * keepRadius )
+    {
+        return false;
+    }
+    return GetGameplayManager()->TestPosInFrustrumOfPlayer( pos, 0 );
+}
+
 Vehicle* TrafficManager::AdoptNetworkTraffic( const char* model, const rmt::Vector& pos, float yaw, float speedMps )
 {
     if( model == NULL || model[0] == '\0' )

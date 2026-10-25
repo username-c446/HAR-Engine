@@ -433,7 +433,7 @@ void NetEntityManager::TryClaims()
         if (r.owner != 0 || r.claimSent || !net::IsMigratableKind(r.spawn.kind)) continue;
         float dx = r.visual.x - px, dz = r.visual.z - pz;
         if (dx * dx + dz * dz > r2) continue;
-        if (m_canAdopt && !m_canAdopt(r.spawn.kind)) continue;
+        if (m_canAdopt && !m_canAdopt(r.spawn.kind, r.visual.x, r.visual.y, r.visual.z)) continue;
         if (SendOp(kv.first, net::WSO_CLAIM, 0, nullptr)) r.claimSent = true;
     }
 }

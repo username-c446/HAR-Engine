@@ -97,6 +97,7 @@ VehicleCentral::VehicleCentral() :
     mCurrentVehicleUnderContructionHead( 0 ),
     mCurrentVehicleUnderConstructionTail( 0 ),
     mNumDeferredGhostReleases( 0 ),
+    mNumGhostPool( 0 ),
     mbVehicleTriggersActive(true),
     mSuppressedDriverCount(0)
 {
@@ -844,6 +845,9 @@ void VehicleCentral::PreLoad()
 //=============================================================================
 void VehicleCentral::Unload()
 {
+    // Pooled network ghosts go with the level.
+    FlushNetworkGhostPool();
+
     // empty out husk manager here also
     this->mHuskPool.Empty(); 
     
@@ -1275,6 +1279,32 @@ Vehicle* VehicleCentral::AddNetworkGhostVehicle( const char* name )
         return NULL;
     }
 
+    // A pooled ghost of this model: no new vehicle, no script load.
+    for( int i = 0; i < mNumGhostPool; ++i )
+    {
+        Vehicle* pooled = mGhostPool[ i ];
+        if( pooled->GetName() == NULL || strcmp( pooled->GetName(), name ) != 0 )
+        {
+            continue;
+        }
+        mGhostPool[ i ] = mGhostPool[ --mNumGhostPool ];
+        pooled->Reset( true );
+        GetRenderManager()->pWorldScene()->Add( (DynaPhysDSG*)pooled );
+        pooled->GetCollisionAreaIndexAndAddSelf();
+        pooled->SetRenderLayerEnum( (RenderEnums::LayerEnum)GetRenderManager()->rCurWorldRenderLayer() );
+        pooled->mVehicleCentralIndex = -1;
+        pooled->mNetworkGhost = true;
+        return pooled;
+    }
+
+    // Building one goes through the vehicle construction ring (its script
+    // loads asynchronously): keep room for the game's own vehicles.
+    const unsigned int kConstructionReserve = 8;
+    if( NumUnderConstruction() + kConstructionReserve >= MAX_ACTIVE_VEHICLES - 1 )
+    {
+        return NULL; // retried later by the network layer
+    }
+
     // Do NOT add to the active vehicle list: if the network ghost were registered
     // there (especially as VT_TRAFFIC), the regular vehicle managers could sweep,
     // recycle or free it under the network layer -> use-after-free/double-free.
@@ -1362,17 +1392,44 @@ bool VehicleCentral::RemoveNetworkGhostVehicle( Vehicle* vehicle )
 
     vehicle->mVehicleCentralIndex = -1;
 
+    // Keep it for the next ghost of this model (holding the ownership ref),
+    // unless it blew up or the pool is full.
+    if( !vehicle->mVehicleDestroyed && mNumGhostPool < NETWORK_GHOST_POOL )
+    {
+        mGhostPool[ mNumGhostPool++ ] = vehicle;
+        return true;
+    }
+    ReleaseNetworkGhost( vehicle );
+    return true;
+}
+
+void VehicleCentral::ReleaseNetworkGhost( Vehicle* vehicle )
+{
     // Balance the ownership AddRef from AddNetworkGhostVehicle. A ghost whose
     // vehicle script is still loading must outlive it (the script's hooks
     // write into the vehicle under construction): release it afterwards.
     if( IsCarUnderConstruction( vehicle ) && mNumDeferredGhostReleases < MAX_ACTIVE_VEHICLES )
     {
         mDeferredGhostRelease[ mNumDeferredGhostReleases++ ] = vehicle;
-        return true;
+        return;
     }
     vehicle->Release();
+}
 
-    return true;
+void VehicleCentral::FlushNetworkGhostPool()
+{
+    for( int i = 0; i < mNumGhostPool; ++i )
+    {
+        ReleaseNetworkGhost( mGhostPool[ i ] );
+        mGhostPool[ i ] = NULL;
+    }
+    mNumGhostPool = 0;
+}
+
+unsigned int VehicleCentral::NumUnderConstruction() const
+{
+    return ( mCurrentVehicleUnderConstructionTail + MAX_ACTIVE_VEHICLES - mCurrentVehicleUnderContructionHead )
+           % MAX_ACTIVE_VEHICLES;
 }
 
 void VehicleCentral::ReleaseDeferredNetworkGhosts()

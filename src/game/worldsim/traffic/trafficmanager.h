@@ -193,6 +193,10 @@ public:
     // new entity (the caller keeps the claimed id). NULL if no free car of that
     // model or no road there.
     Vehicle* AdoptNetworkTraffic( const char* model, const rmt::Vector& pos, float yaw, float speedMps );
+    // Whether a traffic car at `pos` would stay our traffic: within budget,
+    // inside the remove radius around the traffic centre and in view (the
+    // same rules that remove traffic). Network takeover asks this first.
+    bool WouldKeepNetworkTraffic( const rmt::Vector& pos );
 
 //MEMBERS
 private:

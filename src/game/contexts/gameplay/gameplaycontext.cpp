@@ -995,11 +995,10 @@ void GameplayContext::OnStart( ContextEnum previousContext )
                 NetworkMatchManager* m = NetworkMatchManager::GetInstance();
                 return m != NULL && m->IsRemotePlayerNear( x, z, radius );
             },
-            []( uint8_t kind ) -> bool
+            []( uint8_t kind, float x, float y, float z ) -> bool
             {
                 if ( kind != net::NEK_TRAFFIC_CAR ) return false;
-                TrafficManager* tm = TrafficManager::GetInstance();
-                return tm->GetNumTraffic() < tm->GetMaxTraffic();
+                return TrafficManager::GetInstance()->WouldKeepNetworkTraffic( rmt::Vector( x, y, z ) );
             } );
     }
     pMatchMgr->SetStateCorrectionHandler( &GameplayStateCorrection );

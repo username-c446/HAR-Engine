@@ -163,6 +163,15 @@ class VehicleCentral : public LoadingManager::ProcessRequestsCallback
         // loading: the script's console hooks write into the vehicle under
         // construction, so its final Release waits until construction ends.
         void ReleaseDeferredNetworkGhosts();
+        // Ghost machines are reused per model instead of being built (vehicle
+        // + .con script) for every appearance; flushed on Unload.
+        enum { NETWORK_GHOST_POOL = 16 };
+        Vehicle* mGhostPool[NETWORK_GHOST_POOL];
+        int      mNumGhostPool;
+        void     FlushNetworkGhostPool();
+        void     ReleaseNetworkGhost( Vehicle* vehicle );
+        // Vehicles whose .con script is still loading (the construction ring).
+        unsigned int NumUnderConstruction() const;
         Vehicle* mDeferredGhostRelease[MAX_ACTIVE_VEHICLES];
         int      mNumDeferredGhostReleases;
 

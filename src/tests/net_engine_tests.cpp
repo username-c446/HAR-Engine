@@ -507,7 +507,7 @@ namespace NetworkTests
                               NetEntityManager::CanAdoptFn());
             taker.SetPresence([](float& x, float& z) { x = 60.0f; z = 0.0f; return true; },
                               NetEntityManager::RemotePlayerNearFn(),
-                              [](uint8_t) { return true; });
+                              [](uint8_t, float, float, float) { return true; });
             owner.OnWelcomed(1);
             taker.OnWelcomed(2);
 
@@ -547,6 +547,41 @@ namespace NetworkTests
             uint16_t n = hit.Encode(buf, sizeof(buf));
             taker.OnEntityEvent(1, id, net::NEE_HIT, buf, n);
             Assert::AreEqual(1, g_hits);
+        }
+
+        TEST_METHOD(ClaimOnlyWhatWeWouldKeep)
+        {
+            // A released car is claimed only if our own game would keep it at
+            // its pose (otherwise two players hand it back and forth forever).
+            for (MigGhost* g : g_migGhosts) delete g;
+            g_migGhosts.clear();
+            NetEntityManager taker;
+            std::vector<net::WorldStateOp> ops;
+            taker.SetSenders([&](const net::WorldStateOp& op) { ops.push_back(op); return true; },
+                             NetEntityManager::SendStatesFn());
+            NetEntityManager::Sink s = { &MigSpawn, &MigMove, &MigDespawn, &MigAdopt, &MigHit };
+            taker.SetSink(s);
+            float askedX = -1.0f;
+            bool keep = false;
+            taker.SetPresence([](float& x, float& z) { x = 0.0f; z = 0.0f; return true; },
+                              NetEntityManager::RemotePlayerNearFn(),
+                              [&](uint8_t, float x, float, float) { askedX = x; return keep; });
+            taker.OnWelcomed(2);
+
+            net::NetEntitySpawn sp; sp.kind = net::NEK_TRAFFIC_CAR; strcpy(sp.model, "compactA"); sp.x = 40.0f;
+            net::WorldStateEntry e;
+            e.key.object = net::MakeDynamicEntityId(5, 1); e.key.channel = net::WS_CHANNEL_ENTITY;
+            e.owner = 0; e.policy = net::WSP_OWNER; e.flags = net::WSF_CLAIMABLE;
+            sp.Encode(e.value);
+            taker.OnAuthoritative(e, net::WSR_REMOTE);
+            taker.Update(0.016f);
+            Assert::AreEqual(40.0f, askedX, 0.01f, L"Asked with the car's pose.");
+            Assert::AreEqual((size_t)0, ops.size(), L"Not claimed: we would remove it again.");
+            keep = true;
+            taker.Update(0.016f);
+            Assert::AreEqual((size_t)1, ops.size());
+            Assert::AreEqual((int)net::WSO_CLAIM, (int)ops[0].kind);
+            taker.OnMatchEnd();
         }
 
         TEST_METHOD(NobodyNearMeansErase)
